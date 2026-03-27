@@ -137,14 +137,12 @@ def _compose_disconnected(
 
 def combine_graphs(
     frontier_graphs: List[Data],
-    goal_graph: Data,
+    goal_graph: Optional[Data],
     kind_of_data: str,
     action_ids: Optional[List[int]] = None,
 ) -> CombinedFrontierGraph:
     if not frontier_graphs:
         raise ValueError("Frontier cannot be empty.")
-    if goal_graph is None:
-        raise ValueError("Goal graph must be loaded from dataset Goal path.")
 
     n_frontier = len(frontier_graphs)
     if action_ids is None:
@@ -156,6 +154,9 @@ def combine_graphs(
         raise ValueError(f"Unsupported kind_of_data: {kind_of_data}")
 
     if kind_of_data == "merged":
+        # merged semantics:
+        # the goal structure is already embedded in each successor graph, so no
+        # separate goal graph is required or linked here.
         out = _compose_disconnected(
             graphs=frontier_graphs,
             membership_values=list(range(n_frontier)),
@@ -168,7 +169,13 @@ def combine_graphs(
             action_map=action_tensor,
         )
 
-    # separated: include goal graph explicitly and minimally link each frontier graph to goal
+    if goal_graph is None:
+        raise ValueError(
+            "Goal graph must be loaded from dataset Goal path for kind_of_data='separated'."
+        )
+
+    # separated semantics: include goal graph explicitly and minimally link each
+    # frontier graph to the goal anchor.
     all_graphs = frontier_graphs + [goal_graph]
     membership_values = list(range(n_frontier)) + [-1]
     out = _compose_disconnected(

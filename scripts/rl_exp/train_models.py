@@ -15,7 +15,14 @@ def find_training_data_folders(batch_root):
     return training_data_folders
 
 
-def run_training(training_data_folder, no_goal, dataset_type):
+def run_training(
+    training_data_folder,
+    no_goal,
+    dataset_type,
+    m_failed_state,
+    max_percentage_of_failure_states,
+    max_percentage_of_failure_states_test,
+):
     if not os.path.isdir(training_data_folder):
         print(f"[ERROR] Missing training folder: {training_data_folder}")
         return
@@ -43,6 +50,12 @@ def run_training(training_data_folder, no_goal, dataset_type):
         model_dir,
         "--dataset_type",
         dataset_type,
+        "--m-failed-state",
+        str(m_failed_state),
+        "--max-percentage-of-failure-states",
+        str(max_percentage_of_failure_states),
+        "--max-percentage-of-failure-states-test",
+        str(max_percentage_of_failure_states_test),
     ]
     if no_goal:
         cmd.extend(["--kind-of-data", "separated"])
@@ -74,6 +87,9 @@ def main():
     parser.add_argument("batch_root")
     parser.add_argument("--no_goal", action="store_true")
     parser.add_argument("--dataset_type", choices=["MAPPED", "HASHED", "BITMASK"], default="HASHED")
+    parser.add_argument("--m-failed-state", type=int, default=100000)
+    parser.add_argument("--max-percentage-of-failure-states", type=float, default=0.1)
+    parser.add_argument("--max-percentage-of-failure-states-test", type=float, default=0.2)
     args = parser.parse_args()
 
     folders = find_training_data_folders(args.batch_root)
@@ -84,7 +100,15 @@ def main():
     max_workers = min(multiprocessing.cpu_count(), len(folders))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = [
-            pool.submit(run_training, folder, args.no_goal, args.dataset_type)
+            pool.submit(
+                run_training,
+                folder,
+                args.no_goal,
+                args.dataset_type,
+                args.m_failed_state,
+                args.max_percentage_of_failure_states,
+                args.max_percentage_of_failure_states_test,
+            )
             for folder in folders
         ]
         for future in concurrent.futures.as_completed(futures):

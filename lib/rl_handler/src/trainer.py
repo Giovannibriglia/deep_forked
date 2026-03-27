@@ -44,6 +44,7 @@ class RLFrontierTrainer:
         weight_decay: float = 0.0,
         device: str | torch.device | None = None,
         reward_formulation: str = "negative_distance",
+        m_failed_state: float = 100000.0,
     ):
         self.device = (
             torch.device(device)
@@ -55,6 +56,7 @@ class RLFrontierTrainer:
             self.model.parameters(), lr=lr, weight_decay=weight_decay
         )
         self.reward_formulation = reward_formulation
+        self.m_failed_state = float(m_failed_state)
 
     def _move_to_device(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         out = {}
@@ -117,6 +119,8 @@ class RLFrontierTrainer:
             "eval_regret": [],
             "eval_regret_std": [],
             "eval_oracle_accuracy": [],
+            "eval_failure_choice_rate": [],
+            "eval_failure_avoidance_accuracy": [],
             "eval_chosen_distance": [],
             "eval_chosen_distance_std": [],
             "eval_oracle_distance": [],
@@ -152,6 +156,10 @@ class RLFrontierTrainer:
                 history["eval_regret"].append(metrics["regret_mean"])
                 history["eval_regret_std"].append(metrics["regret_std"])
                 history["eval_oracle_accuracy"].append(metrics["oracle_accuracy"])
+                history["eval_failure_choice_rate"].append(metrics["failure_choice_rate"])
+                history["eval_failure_avoidance_accuracy"].append(
+                    metrics["failure_avoidance_accuracy"]
+                )
                 history["eval_chosen_distance"].append(metrics["mean_chosen_distance"])
                 history["eval_chosen_distance_std"].append(
                     metrics["std_chosen_distance"]
@@ -173,11 +181,31 @@ class RLFrontierTrainer:
                         "regret_mean": metrics["regret_mean"],
                         "regret_std": metrics["regret_std"],
                         "oracle_accuracy": metrics["oracle_accuracy"],
+                        "n_failure_choices": metrics["n_failure_choices"],
+                        "failure_choice_rate": metrics["failure_choice_rate"],
+                        "n_failure_frontiers": metrics["n_failure_frontiers"],
+                        "failure_frontier_rate": metrics["failure_frontier_rate"],
+                        "n_failure_oracle_choices": metrics["n_failure_oracle_choices"],
+                        "failure_avoidance_accuracy": metrics["failure_avoidance_accuracy"],
+                        "n_failure_avoidance_applicable": metrics[
+                            "n_failure_avoidance_applicable"
+                        ],
+                        "n_failure_avoidance_success": metrics[
+                            "n_failure_avoidance_success"
+                        ],
+                        "n_only_failure_frontiers": metrics["n_only_failure_frontiers"],
                         "chosen_rewards": metrics["chosen_rewards"],
                         "chosen_distances": metrics["chosen_distances"],
                         "oracle_distances": metrics["oracle_distances"],
                         "regrets": metrics["regrets"],
                         "oracle_matches": metrics["oracle_matches"],
+                        "chosen_is_failure": metrics["chosen_is_failure"],
+                        "oracle_is_failure": metrics["oracle_is_failure"],
+                        "frontier_has_failure": metrics["frontier_has_failure"],
+                        "frontier_has_safe": metrics["frontier_has_safe"],
+                        "failure_avoided_when_possible": metrics[
+                            "failure_avoided_when_possible"
+                        ],
                         "frontier_sizes": metrics["frontier_sizes"],
                         "oracle_ranks": metrics["oracle_ranks"],
                         "oracle_probabilities": metrics["oracle_probabilities"],
@@ -217,12 +245,19 @@ class RLFrontierTrainer:
         oracle_distances: List[float] = []
         regrets: List[float] = []
         oracle_matches: List[int] = []
+        oracle_ranks: List[int] = []
+        oracle_probabilities: List[float] = []
 
         chosen_indices: List[int] = []
         oracle_indices_local: List[int] = []
         chosen_actions: List[int] = []
         oracle_actions: List[int] = []
         frontier_sizes: List[int] = []
+        chosen_is_failure: List[int] = []
+        oracle_is_failure: List[int] = []
+        frontier_has_failure: List[int] = []
+        frontier_has_safe: List[int] = []
+        failure_avoided_when_possible: List[int] = []
 
         error_details: List[Dict[str, object]] = []
         all_details: List[Dict[str, object]] = []
@@ -275,6 +310,34 @@ class RLFrontierTrainer:
                     probs = torch.softmax(frontier_logits, dim=0)
                     chosen_prob = float(probs[chosen_local].item())
                     oracle_prob = float(probs[oracle_local].item())
+                    ranking = torch.argsort(frontier_logits, descending=True)
+                    oracle_rank = int((ranking == oracle_local).nonzero(as_tuple=False)[0].item()) + 1
+
+                    is_chosen_failure = int(
+                        torch.isclose(
+                            frontier_distances[chosen_local],
+                            torch.tensor(self.m_failed_state, device=frontier_distances.device),
+                            rtol=0.0,
+                            atol=1e-9,
+                        ).item()
+                    )
+                    is_oracle_failure = int(
+                        torch.isclose(
+                            frontier_distances[oracle_local],
+                            torch.tensor(self.m_failed_state, device=frontier_distances.device),
+                            rtol=0.0,
+                            atol=1e-9,
+                        ).item()
+                    )
+                    candidate_is_failure = torch.isclose(
+                        frontier_distances,
+                        torch.tensor(self.m_failed_state, device=frontier_distances.device),
+                        rtol=0.0,
+                        atol=1e-9,
+                    )
+                    has_failure = int(candidate_is_failure.any().item())
+                    has_safe = int((~candidate_is_failure).any().item())
+                    avoided_failure_if_possible = int((has_safe == 0) or (is_chosen_failure == 0))
 
                     detail = {
                         "frontier_id_in_batch": i,
@@ -293,10 +356,19 @@ class RLFrontierTrainer:
                         "action_match": bool(action_match),
                         "chosen_prob": chosen_prob,
                         "oracle_prob": oracle_prob,
+                        "oracle_rank": oracle_rank,
                         "frontier_distances": [float(x) for x in frontier_distances.detach().cpu().tolist()],
                         "frontier_actions": [int(x) for x in frontier_actions.detach().cpu().tolist()],
                         "frontier_logits": [float(x) for x in frontier_logits.detach().cpu().tolist()],
                         "frontier_probs": [float(x) for x in probs.detach().cpu().tolist()],
+                        # Failure frontier: contains at least one failure candidate.
+                        "chosen_is_failure": bool(is_chosen_failure),
+                        "oracle_is_failure": bool(is_oracle_failure),
+                        "frontier_has_failure": bool(has_failure),
+                        "frontier_has_safe_candidate": bool(has_safe),
+                        "failure_avoided_when_possible": bool(
+                            (has_safe == 0) or (is_chosen_failure == 0)
+                        ),
                     }
                     all_details.append(detail)
 
@@ -311,6 +383,13 @@ class RLFrontierTrainer:
                     chosen_actions.append(chosen_action)
                     oracle_actions.append(oracle_action)
                     frontier_sizes.append(frontier_size)
+                    chosen_is_failure.append(is_chosen_failure)
+                    oracle_is_failure.append(is_oracle_failure)
+                    frontier_has_failure.append(has_failure)
+                    frontier_has_safe.append(has_safe)
+                    failure_avoided_when_possible.append(avoided_failure_if_possible)
+                    oracle_ranks.append(oracle_rank)
+                    oracle_probabilities.append(oracle_prob)
 
                     if not oracle_match:
                         error_details.append(detail)
@@ -325,13 +404,37 @@ class RLFrontierTrainer:
                 "mean_oracle_distance": 0.0,
                 "std_oracle_distance": 0.0,
                 "regret": 0.0,
+                "regret_mean": 0.0,
                 "regret_std": 0.0,
+                "oracle_accuracy": 0.0,
                 "oracle_accuracy (exact match with best candidate)": 0.0,
                 "n_frontiers": 0,
                 "n_errors": 0,
                 "error_rate": 0.0,
                 "n_action_errors": 0,
                 "action_error_rate": 0.0,
+                "n_failure_choices": 0,
+                "failure_choice_rate": 0.0,
+                "n_failure_frontiers": 0,
+                "failure_frontier_rate": 0.0,
+                "n_failure_oracle_choices": 0,
+                "n_failure_avoidance_applicable": 0,
+                "n_failure_avoidance_success": 0,
+                "failure_avoidance_accuracy": 0.0,
+                "n_only_failure_frontiers": 0,
+                "chosen_rewards": [],
+                "chosen_distances": [],
+                "oracle_distances": [],
+                "regrets": [],
+                "oracle_matches": [],
+                "chosen_is_failure": [],
+                "oracle_is_failure": [],
+                "frontier_has_failure": [],
+                "frontier_has_safe": [],
+                "failure_avoided_when_possible": [],
+                "frontier_sizes": [],
+                "oracle_ranks": [],
+                "oracle_probabilities": [],
                 "details": [],
                 "errors": [],
             }
@@ -346,6 +449,26 @@ class RLFrontierTrainer:
 
         n_errors = int((oracle_match_t == 0).sum().item())
         n_action_errors = int((chosen_action_t != oracle_action_t).sum().item())
+        chosen_failure_t = torch.tensor(chosen_is_failure, dtype=torch.float32)
+        oracle_failure_t = torch.tensor(oracle_is_failure, dtype=torch.float32)
+        frontier_has_failure_t = torch.tensor(frontier_has_failure, dtype=torch.float32)
+        frontier_has_safe_t = torch.tensor(frontier_has_safe, dtype=torch.float32)
+        n_failure_choices = int(chosen_failure_t.sum().item())
+        n_failure_frontiers = int(frontier_has_failure_t.sum().item())
+        n_failure_oracle_choices = int(oracle_failure_t.sum().item())
+        n_failure_avoidance_applicable = int(frontier_has_safe_t.sum().item())
+        n_failure_avoidance_success = int(
+            (
+                (frontier_has_safe_t == 1.0)
+                & (chosen_failure_t == 0.0)
+            ).sum().item()
+        )
+        n_only_failure_frontiers = int((frontier_has_safe_t == 0.0).sum().item())
+        failure_avoidance_accuracy = (
+            float(n_failure_avoidance_success / n_failure_avoidance_applicable)
+            if n_failure_avoidance_applicable > 0
+            else 0.0
+        )
 
         metrics: Dict[str, object] = {
             "mean_reward": float(reward_t.mean().item()),
@@ -355,18 +478,43 @@ class RLFrontierTrainer:
             "mean_oracle_distance": float(oracle_dist_t.mean().item()),
             "std_oracle_distance": float(oracle_dist_t.std(unbiased=False).item()),
             "regret": float(regret_t.mean().item()),
+            "regret_mean": float(regret_t.mean().item()),
             "regret_std": float(regret_t.std(unbiased=False).item()),
             "oracle_accuracy": float(oracle_match_t.mean().item()),
+            "oracle_accuracy (exact match with best candidate)": float(
+                oracle_match_t.mean().item()
+            ),
             "n_frontiers": n_frontiers,
             "n_errors": n_errors,
             "error_rate": float(n_errors / n_frontiers),
             "n_action_errors": n_action_errors,
             "action_error_rate": float(n_action_errors / n_frontiers),
+            "n_failure_choices": n_failure_choices,
+            "failure_choice_rate": float(n_failure_choices / n_frontiers),
+            "n_failure_frontiers": n_failure_frontiers,
+            "failure_frontier_rate": float(n_failure_frontiers / n_frontiers),
+            "n_failure_oracle_choices": n_failure_oracle_choices,
+            "n_failure_avoidance_applicable": n_failure_avoidance_applicable,
+            "n_failure_avoidance_success": n_failure_avoidance_success,
+            "failure_avoidance_accuracy": failure_avoidance_accuracy,
+            "n_only_failure_frontiers": n_only_failure_frontiers,
+            "chosen_rewards": chosen_rewards,
+            "chosen_distances": chosen_distances,
+            "oracle_distances": oracle_distances,
+            "regrets": regrets,
+            "oracle_matches": oracle_matches,
             "chosen_indices": chosen_indices,
             "oracle_indices": oracle_indices_local,
             "chosen_actions": chosen_actions,
             "oracle_actions": oracle_actions,
+            "chosen_is_failure": chosen_is_failure,
+            "oracle_is_failure": oracle_is_failure,
+            "frontier_has_failure": frontier_has_failure,
+            "frontier_has_safe": frontier_has_safe,
+            "failure_avoided_when_possible": failure_avoided_when_possible,
             "frontier_sizes": frontier_sizes,
+            "oracle_ranks": oracle_ranks,
+            "oracle_probabilities": oracle_probabilities,
             "details": all_details,
             "errors": error_details,
         }
@@ -377,6 +525,10 @@ class RLFrontierTrainer:
             print(f"errors              : {metrics['n_errors']}/{metrics['n_frontiers']} ({100.0 * metrics['error_rate']:.2f}%) (agent ≠ oracle index)")
             print(f"action errors       : {metrics['n_action_errors']}/{metrics['n_frontiers']} ({100.0 * metrics['action_error_rate']:.2f}%) (planner action mismatch)")
             print(f"oracle accuracy     : {metrics['oracle_accuracy']:.4f} (exact match with best candidate)")
+            print(f"failure choices     : {metrics['n_failure_choices']}/{metrics['n_frontiers']} ({100.0 * metrics['failure_choice_rate']:.2f}%)")
+            print(f"failure frontiers   : {metrics['n_failure_frontiers']}/{metrics['n_frontiers']} ({100.0 * metrics['failure_frontier_rate']:.2f}%)")
+            print(f"failure avoidance   : {metrics['failure_avoidance_accuracy']:.4f} on {metrics['n_failure_avoidance_applicable']} applicable frontiers")
+            print(f"only-failure fronts : {metrics['n_only_failure_frontiers']} (not counted against failure avoidance)")
             print(f"mean reward         : {metrics['mean_reward']:.4f} ± {metrics['std_reward']:.4f} (expected policy reward)")
             print(f"chosen distance     : {metrics['mean_chosen_distance']:.4f} ± {metrics['std_chosen_distance']:.4f} (distance of selected candidate)")
             print(f"oracle distance     : {metrics['mean_oracle_distance']:.4f} ± {metrics['std_oracle_distance']:.4f} (best achievable distance)")
@@ -504,6 +656,17 @@ class RLFrontierTrainer:
         plt.close()
 
     @staticmethod
+    def _save_placeholder_plot(out_path: Path, message: str, title: str = "") -> None:
+        plt.figure(figsize=(6, 4), dpi=300)
+        if title:
+            plt.title(title)
+        plt.text(0.5, 0.5, message, ha="center", va="center", wrap=True)
+        plt.axis("off")
+        plt.tight_layout()
+        plt.savefig(out_path)
+        plt.close()
+
+    @staticmethod
     def _plot_frontier_size_histogram(
         out_path: Path,
         train_sizes: Sequence[int],
@@ -527,6 +690,8 @@ class RLFrontierTrainer:
         plt.figure(figsize=(6, 4), dpi=300)
         if regrets:
             plt.hist(regrets, bins=min(30, max(1, int(len(regrets) ** 0.5))), alpha=0.8)
+        else:
+            plt.text(0.5, 0.5, "No regret data available", ha="center", va="center")
         plt.xlabel("Regret")
         plt.ylabel("Frontier Count")
         plt.tight_layout()
@@ -569,6 +734,122 @@ class RLFrontierTrainer:
         fig.savefig(out_path)
         plt.close(fig)
 
+    @staticmethod
+    def _plot_failure_distribution_last(
+        out_path: Path,
+        chosen_is_failure: Sequence[int],
+    ) -> None:
+        n_failure = int(sum(int(x) for x in chosen_is_failure))
+        n_non_failure = int(len(chosen_is_failure) - n_failure)
+        plt.figure(figsize=(6, 4), dpi=300)
+        if not chosen_is_failure:
+            plt.text(0.5, 0.5, "No evaluation decisions available", ha="center", va="center")
+        else:
+            plt.bar(["Chosen Failure", "Chosen Non-Failure"], [n_failure, n_non_failure], alpha=0.85)
+        plt.ylabel("Count")
+        plt.tight_layout()
+        plt.savefig(out_path)
+        plt.close()
+
+    @staticmethod
+    def _plot_action_outcome_heatmap_last(
+        out_path: Path,
+        oracle_matches: Sequence[int],
+        chosen_is_failure: Sequence[int],
+    ) -> None:
+        if not oracle_matches or not chosen_is_failure or len(oracle_matches) != len(chosen_is_failure):
+            RLFrontierTrainer._save_placeholder_plot(
+                out_path,
+                "No valid data available for action-outcome heatmap.",
+                title="Action Outcome Heatmap",
+            )
+            return
+
+        # Rows: correct / incorrect action. Columns: failure / non-failure chosen outcome.
+        matrix = torch.zeros((2, 2), dtype=torch.int32)
+        for m, f in zip(oracle_matches, chosen_is_failure):
+            row = 0 if int(m) == 1 else 1
+            col = 0 if int(f) == 1 else 1
+            matrix[row, col] += 1
+
+        plt.figure(figsize=(6, 4), dpi=300)
+        im = plt.imshow(matrix.numpy(), cmap="Blues")
+        plt.colorbar(im, fraction=0.046, pad=0.04)
+        plt.xticks([0, 1], ["Failure", "Non-Failure"])
+        plt.yticks([0, 1], ["Correct", "Incorrect"])
+        plt.xlabel("Chosen Outcome")
+        plt.ylabel("Action Correctness")
+        for i in range(2):
+            for j in range(2):
+                plt.text(j, i, int(matrix[i, j].item()), ha="center", va="center")
+        plt.tight_layout()
+        plt.savefig(out_path)
+        plt.close()
+
+    @staticmethod
+    def _plot_failure_by_frontier_size(
+        out_path: Path,
+        frontier_sizes: Sequence[int],
+        chosen_is_failure: Sequence[int],
+    ) -> None:
+        if not frontier_sizes or not chosen_is_failure or len(frontier_sizes) != len(chosen_is_failure):
+            RLFrontierTrainer._save_placeholder_plot(
+                out_path,
+                "No valid data available for failure rate by frontier size.",
+                title="Failure by Frontier Size",
+            )
+            return
+        by_size_total: Dict[int, int] = defaultdict(int)
+        by_size_failure: Dict[int, int] = defaultdict(int)
+        for size, is_failure in zip(frontier_sizes, chosen_is_failure):
+            s = int(size)
+            by_size_total[s] += 1
+            by_size_failure[s] += int(is_failure)
+        sizes = sorted(by_size_total.keys())
+        rates = [
+            float(by_size_failure[s] / by_size_total[s]) if by_size_total[s] > 0 else 0.0
+            for s in sizes
+        ]
+        plt.figure(figsize=(6, 4), dpi=300)
+        if sizes:
+            plt.plot(sizes, rates, marker="o")
+        else:
+            plt.text(0.5, 0.5, "No frontier-size data available", ha="center", va="center")
+        plt.xlabel("Frontier Size")
+        plt.ylabel("Failure Choice Rate")
+        plt.tight_layout()
+        plt.savefig(out_path)
+        plt.close()
+
+    @staticmethod
+    def _plot_failure_gap_distribution(
+        out_path: Path,
+        regrets: Sequence[float],
+        chosen_is_failure: Sequence[int],
+    ) -> None:
+        if not regrets or not chosen_is_failure or len(regrets) != len(chosen_is_failure):
+            RLFrontierTrainer._save_placeholder_plot(
+                out_path,
+                "No valid data available for failure-regret distribution.",
+                title="Failure Regret Distribution",
+            )
+            return
+        failure_regrets = [float(r) for r, is_failure in zip(regrets, chosen_is_failure) if int(is_failure) == 1]
+        plt.figure(figsize=(6, 4), dpi=300)
+        if failure_regrets:
+            plt.hist(
+                failure_regrets,
+                bins=min(30, max(1, int(len(failure_regrets) ** 0.5))),
+                alpha=0.8,
+            )
+            plt.xlabel("Regret (Failure Choices Only)")
+            plt.ylabel("Frontier Count")
+        else:
+            plt.text(0.5, 0.5, "No failure choices in final evaluation", ha="center", va="center")
+        plt.tight_layout()
+        plt.savefig(out_path)
+        plt.close()
+
     def _save_metrics_summary(
         self,
         output_dir: Path,
@@ -589,6 +870,13 @@ class RLFrontierTrainer:
             "final_regret": final.get("regret_mean", 0.0),
             "final_regret_std": final.get("regret_std", 0.0),
             "final_oracle_accuracy": final.get("oracle_accuracy", 0.0),
+            "final_failure_choice_rate": final.get("failure_choice_rate", 0.0),
+            "final_failure_avoidance_accuracy": final.get("failure_avoidance_accuracy", 0.0),
+            "final_failure_frontier_rate": final.get("failure_frontier_rate", 0.0),
+            "final_n_failure_choices": final.get("n_failure_choices", 0),
+            "final_n_failure_frontiers": final.get("n_failure_frontiers", 0),
+            "final_n_failure_avoidance_applicable": final.get("n_failure_avoidance_applicable", 0),
+            "final_n_only_failure_frontiers": final.get("n_only_failure_frontiers", 0),
             "final_chosen_distance": final.get("mean_chosen_distance", 0.0),
             "final_chosen_distance_std": final.get("std_chosen_distance", 0.0),
             "final_oracle_distance": final.get("mean_oracle_distance", 0.0),
@@ -597,6 +885,7 @@ class RLFrontierTrainer:
             "num_eval_frontiers": len(eval_sizes),
             "mean_train_frontier_size": self._safe_mean(train_sizes),
             "mean_eval_frontier_size": self._safe_mean(eval_sizes),
+            "m_failed_state": self.m_failed_state,
         }
         with (output_dir / "metrics_summary.json").open("w", encoding="utf-8") as fh:
             json.dump(summary, fh, indent=2)
@@ -656,6 +945,34 @@ class RLFrontierTrainer:
             ylabel="Oracle Accuracy",
             label="Oracle Accuracy",
         )
+        self._plot_curve_with_band(
+            output_dir / "eval_failure_choice_rate.png",
+            x=eval_x,
+            y=history["eval_failure_choice_rate"],
+            y_std=None,
+            xlabel="Epoch",
+            ylabel="Failure Choice Rate",
+            label="Failure Choice Rate",
+        )
+
+        plt.figure(figsize=(6, 4), dpi=300)
+        if history["eval_oracle_accuracy"]:
+            plt.plot(eval_x, history["eval_oracle_accuracy"], label="Oracle Accuracy")
+        if history["eval_failure_avoidance_accuracy"]:
+            plt.plot(
+                eval_x,
+                history["eval_failure_avoidance_accuracy"],
+                label="Failure Avoidance Accuracy",
+            )
+        if history["eval_oracle_accuracy"] or history["eval_failure_avoidance_accuracy"]:
+            plt.legend(loc="best")
+        else:
+            plt.text(0.5, 0.5, "No evaluation snapshots available", ha="center", va="center")
+        plt.xlabel("Epoch")
+        plt.ylabel("Rate")
+        plt.tight_layout()
+        plt.savefig(output_dir / "eval_failure_vs_correctness.png")
+        plt.close()
 
         plt.figure(figsize=(6, 4), dpi=300)
         if history["eval_chosen_distance"]:
@@ -696,6 +1013,25 @@ class RLFrontierTrainer:
             frontier_sizes=final_snapshot.get("frontier_sizes", []),
             regrets=final_snapshot.get("regrets", []),
             oracle_matches=final_snapshot.get("oracle_matches", []),
+        )
+        self._plot_failure_distribution_last(
+            output_dir / "eval_failure_distribution_last.png",
+            chosen_is_failure=final_snapshot.get("chosen_is_failure", []),
+        )
+        self._plot_action_outcome_heatmap_last(
+            output_dir / "eval_action_outcome_heatmap_last.png",
+            oracle_matches=final_snapshot.get("oracle_matches", []),
+            chosen_is_failure=final_snapshot.get("chosen_is_failure", []),
+        )
+        self._plot_failure_by_frontier_size(
+            output_dir / "eval_failure_by_frontier_size.png",
+            frontier_sizes=final_snapshot.get("frontier_sizes", []),
+            chosen_is_failure=final_snapshot.get("chosen_is_failure", []),
+        )
+        self._plot_failure_gap_distribution(
+            output_dir / "eval_failure_gap_distribution_last.png",
+            regrets=final_snapshot.get("regrets", []),
+            chosen_is_failure=final_snapshot.get("chosen_is_failure", []),
         )
 
         self._save_metrics_summary(

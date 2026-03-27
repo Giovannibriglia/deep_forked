@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import os
 import random
 from dataclasses import dataclass
@@ -46,6 +47,10 @@ def _safe_float(v: str, default: float = 0.0) -> float:
         return float(v)
     except (TypeError, ValueError):
         return default
+
+
+def _is_failure_candidate(distance: float, m_failed_state: float) -> bool:
+    return math.isclose(float(distance), float(m_failed_state), rel_tol=0.0, abs_tol=1e-9)
 
 
 def _to_action_id(action_value: str, fallback: int) -> int:
@@ -116,6 +121,112 @@ def split_frontiers(
     return train_samples, eval_samples
 
 
+def _sample_failure_frontier_indices(
+    samples: Sequence[Dict[str, Any]],
+    test_size: float,
+    seed: int,
+    m_failed_state: float,
+    max_percentage_of_failure_states: float,
+    max_percentage_of_failure_states_test: float,
+) -> Tuple[List[int], List[int], Dict[str, Any]]:
+    rng = random.Random(seed)
+    max_percentage_of_failure_states = min(
+        1.0, max(0.0, float(max_percentage_of_failure_states))
+    )
+    max_percentage_of_failure_states_test = min(
+        1.0, max(0.0, float(max_percentage_of_failure_states_test))
+    )
+
+    failure_indices: List[int] = []
+    non_failure_indices: List[int] = []
+    for idx, sample in enumerate(samples):
+        distances = [float(d) for d in sample.get("distances", [])]
+        has_failure = any(_is_failure_candidate(d, m_failed_state) for d in distances)
+        if has_failure:
+            failure_indices.append(idx)
+        else:
+            non_failure_indices.append(idx)
+
+    # Keep non-failure splitting unchanged ("as usual"), with deterministic seed.
+    if len(non_failure_indices) <= 1:
+        train_non_failure_indices = list(non_failure_indices)
+        eval_non_failure_indices = []
+    else:
+        non_failure_shuffled = list(non_failure_indices)
+        rng.shuffle(non_failure_shuffled)
+        n_eval_non_failure = max(1, int(round(len(non_failure_shuffled) * test_size)))
+        eval_non_failure_set = set(non_failure_shuffled[:n_eval_non_failure])
+        train_non_failure_indices = [
+            i for i in non_failure_indices if i not in eval_non_failure_set
+        ]
+        eval_non_failure_indices = [i for i in non_failure_indices if i in eval_non_failure_set]
+
+    rng.shuffle(failure_indices)
+    total_failure = len(failure_indices)
+    n_failure_train_target = min(
+        total_failure,
+        max(0, int(total_failure * max_percentage_of_failure_states)),
+    )
+    n_failure_eval_target = min(
+        total_failure,
+        max(0, int(total_failure * max_percentage_of_failure_states_test)),
+    )
+
+    train_failure_indices = failure_indices[:n_failure_train_target]
+    remaining_failure_indices = failure_indices[n_failure_train_target:]
+
+    eval_failure_indices = remaining_failure_indices[:n_failure_eval_target]
+    needed = n_failure_eval_target - len(eval_failure_indices)
+    reused_train_failure_indices: List[int] = []
+    if needed > 0:
+        reused_train_failure_indices = train_failure_indices[:needed]
+        eval_failure_indices.extend(reused_train_failure_indices)
+
+    train_indices = train_non_failure_indices + train_failure_indices
+    eval_indices = eval_non_failure_indices + eval_failure_indices
+
+    # Keep dataset usable in degenerate settings (e.g., all-failure data with very low
+    # requested train percentage that rounds to zero).
+    if samples and not train_indices:
+        fallback_idx = failure_indices[0] if failure_indices else 0
+        train_indices.append(fallback_idx)
+        eval_indices = [i for i in eval_indices if i != fallback_idx]
+        if fallback_idx in failure_indices and fallback_idx not in train_failure_indices:
+            train_failure_indices.append(fallback_idx)
+
+    train_failure_set = set(train_failure_indices)
+    eval_failure_set = set(eval_failure_indices)
+    overlap_failure = train_failure_set.intersection(eval_failure_set)
+    disjoint_eval_failure_count = len(eval_failure_set - train_failure_set)
+    achieved_train_failure_pct = (
+        len(train_failure_indices) / total_failure if total_failure else 0.0
+    )
+    achieved_eval_failure_pct = (
+        len(eval_failure_indices) / total_failure if total_failure else 0.0
+    )
+
+    split_summary = {
+        "m_failed_state": float(m_failed_state),
+        "test_size": float(test_size),
+        "requested_max_percentage_of_failure_states_train": float(max_percentage_of_failure_states),
+        "requested_max_percentage_of_failure_states_eval": float(max_percentage_of_failure_states_test),
+        "num_frontiers_total": len(samples),
+        "num_frontiers_train": len(train_indices),
+        "num_frontiers_eval": len(eval_indices),
+        "num_failure_frontiers_total": total_failure,
+        "num_failure_frontiers_train": len(train_failure_indices),
+        "num_failure_frontiers_eval": len(eval_failure_indices),
+        "achieved_failure_percentage_train": float(achieved_train_failure_pct),
+        "achieved_failure_percentage_eval": float(achieved_eval_failure_pct),
+        "num_disjoint_eval_failure_frontiers": int(disjoint_eval_failure_count),
+        "num_reused_training_failure_frontiers_in_eval": int(len(overlap_failure)),
+        "num_failure_overlap_train_eval": int(len(overlap_failure)),
+        # Failure frontier == frontier containing at least one failure candidate.
+        "failure_frontier_definition": "contains at least one candidate with Distance From Goal == m_failed_state",
+    }
+    return train_indices, eval_indices, split_summary
+
+
 def build_frontier_samples(
     folder_data: str,
     list_subset_train: Sequence[str],
@@ -123,6 +234,9 @@ def build_frontier_samples(
     dataset_type: str,
     test_size: float,
     seed: int,
+    m_failed_state: int = 100000,
+    max_percentage_of_failure_states: float = 0.1,
+    max_percentage_of_failure_states_test: float = 0.2,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
     root = Path(folder_data)
     bitmask = dataset_type == "BITMASK"
@@ -138,13 +252,32 @@ def build_frontier_samples(
             rows = read_frontier_csv(csv_path)
             all_frontiers.extend(group_frontiers(rows))
 
-    train_meta, eval_meta = split_frontiers(all_frontiers, test_size=test_size, seed=seed)
+    train_idx, eval_idx, split_summary = _sample_failure_frontier_indices(
+        samples=all_frontiers,
+        test_size=test_size,
+        seed=seed,
+        m_failed_state=float(m_failed_state),
+        max_percentage_of_failure_states=max_percentage_of_failure_states,
+        max_percentage_of_failure_states_test=max_percentage_of_failure_states_test,
+    )
+    train_meta = [all_frontiers[i] for i in train_idx]
+    eval_meta = [all_frontiers[i] for i in eval_idx]
     train_samples = [
-        _materialize_frontier(frontier, kind_of_data=kind_of_data, bitmask=bitmask)
+        _materialize_frontier(
+            frontier,
+            kind_of_data=kind_of_data,
+            bitmask=bitmask,
+            m_failed_state=float(m_failed_state),
+        )
         for frontier in tqdm(train_meta, desc="Building train frontiers")
     ]
     eval_samples = [
-        _materialize_frontier(frontier, kind_of_data=kind_of_data, bitmask=bitmask)
+        _materialize_frontier(
+            frontier,
+            kind_of_data=kind_of_data,
+            bitmask=bitmask,
+            m_failed_state=float(m_failed_state),
+        )
         for frontier in tqdm(eval_meta, desc="Building eval frontiers")
     ]
     params = {
@@ -156,6 +289,10 @@ def build_frontier_samples(
         "num_frontiers_eval": len(eval_samples),
         "seed": seed,
         "test_size": test_size,
+        "m_failed_state": float(m_failed_state),
+        "max_percentage_of_failure_states": float(max_percentage_of_failure_states),
+        "max_percentage_of_failure_states_test": float(max_percentage_of_failure_states_test),
+        "split_summary": split_summary,
     }
     return train_samples, eval_samples, params
 
@@ -164,9 +301,18 @@ def _materialize_frontier(
     frontier: Dict[str, Any],
     kind_of_data: str,
     bitmask: bool,
+    m_failed_state: float,
 ) -> Dict[str, Any]:
     successor_graphs = [load_pyg_graph(p, bitmask=bitmask) for p in frontier["successor_paths"]]
-    goal_graph = load_pyg_graph(frontier["goal_path"], bitmask=bitmask)
+    goal_graph = None
+    if kind_of_data == "separated":
+        if not frontier.get("goal_path"):
+            raise ValueError(
+                "Missing Goal path for kind_of_data='separated'. "
+                "Each frontier row must provide a valid Goal graph path."
+            )
+        goal_graph = load_pyg_graph(frontier["goal_path"], bitmask=bitmask)
+    # merged semantics: goal is embedded in successor graphs, Goal CSV path is ignored.
 
     action_ids = [_to_action_id(a, idx) for idx, a in enumerate(frontier["actions"])]
     combined = combine_graphs(
@@ -179,6 +325,7 @@ def _materialize_frontier(
     distances = torch.tensor(frontier["distances"], dtype=torch.float32)
     rewards = -distances
     best_idx = int(torch.argmin(distances).item())
+    frontier_has_failure = any(_is_failure_candidate(float(d), m_failed_state) for d in frontier["distances"])
     return {
         "node_features": combined.node_features,
         "edge_index": combined.edge_index,
@@ -191,6 +338,7 @@ def _materialize_frontier(
         "oracle_reward": rewards[best_idx].clone(),
         "goal_path": frontier["goal_path"],
         "predecessor_path": frontier["predecessor_path"],
+        "frontier_has_failure": bool(frontier_has_failure),
     }
 
 

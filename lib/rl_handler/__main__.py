@@ -39,8 +39,41 @@ def parse_args():
     parser.add_argument("--model-name", type=str, default="frontier_policy")
 
     parser.add_argument("--dataset_type", choices=["MAPPED", "HASHED", "BITMASK"], default="HASHED")
-    parser.add_argument("--kind-of-data", choices=["merged", "separated"], default="merged")
+    parser.add_argument(
+        "--kind-of-data",
+        choices=["merged", "separated"],
+        default="merged",
+        help=(
+            "Graph composition mode. "
+            "'merged': goal already embedded in each state graph, Goal CSV path is ignored. "
+            "'separated': goal graph is loaded from Goal CSV path and linked to each frontier candidate."
+        ),
+    )
     parser.add_argument("--test-size", type=float, default=0.2)
+    parser.add_argument(
+        "--m-failed-state",
+        type=int,
+        default=100000,
+        help="Distance From Goal value treated as failure state.",
+    )
+    parser.add_argument(
+        "--max-percentage-of-failure-states",
+        type=float,
+        default=0.1,
+        help=(
+            "Maximum fraction of failure frontiers included in train split "
+            "(failure frontier = contains at least one candidate with Distance From Goal == m_failed_state)."
+        ),
+    )
+    parser.add_argument(
+        "--max-percentage-of-failure-states-test",
+        type=float,
+        default=0.2,
+        help=(
+            "Maximum fraction of failure frontiers included in eval split "
+            "(failure frontier = contains at least one candidate with Distance From Goal == m_failed_state)."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--n-train-epochs", type=int, default=200)
     parser.add_argument("--eval-every", type=int, default=10)
@@ -86,6 +119,9 @@ def _build_or_load_samples(args):
             dataset_type=args.dataset_type,
             test_size=args.test_size,
             seed=args.seed,
+            m_failed_state=args.m_failed_state,
+            max_percentage_of_failure_states=args.max_percentage_of_failure_states,
+            max_percentage_of_failure_states_test=args.max_percentage_of_failure_states_test,
         )
         save_samples(samples_path, train_samples, eval_samples, params=params)
     payload = load_saved_samples(samples_path)
@@ -125,6 +161,7 @@ def main(args):
     trainer = RLFrontierTrainer(
         model=model,
         reward_formulation=args.reward_formulation,
+        m_failed_state=float(args.m_failed_state),
     )
 
     _, model_root = _paths(args)
@@ -160,11 +197,33 @@ def main(args):
                     "error_rate": metrics["error_rate"],
                     "n_action_errors": metrics["n_action_errors"],
                     "action_error_rate": metrics["action_error_rate"],
+                    "n_failure_choices": metrics["n_failure_choices"],
+                    "failure_choice_rate": metrics["failure_choice_rate"],
+                    "n_failure_frontiers": metrics["n_failure_frontiers"],
+                    "failure_frontier_rate": metrics["failure_frontier_rate"],
+                    "failure_avoidance_accuracy": metrics["failure_avoidance_accuracy"],
                     "errors": metrics["errors"],
                 },
                 fh,
                 indent=2,
             )
+
+    params = payload.get("params", {})
+    split_summary = params.get("split_summary")
+    if not split_summary:
+        split_summary = {
+            "num_frontiers_train": len(train_samples),
+            "num_frontiers_eval": len(eval_samples),
+            "m_failed_state": float(args.m_failed_state),
+            "requested_max_percentage_of_failure_states_train": float(
+                args.max_percentage_of_failure_states
+            ),
+            "requested_max_percentage_of_failure_states_eval": float(
+                args.max_percentage_of_failure_states_test
+            ),
+        }
+    with (model_root / "dataset_split_summary.json").open("w", encoding="utf-8") as fh:
+        json.dump(split_summary, fh, indent=2)
 
     if args.export_onnx:
         trainer.to_onnx(onnx_path, node_input_dim=node_input_dim)
