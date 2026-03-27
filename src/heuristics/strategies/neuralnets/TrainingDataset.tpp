@@ -786,7 +786,7 @@ template <StateRepresentation StateRepr>
 void TrainingDataset<StateRepr>::add_to_dataset(
     const std::string &base_filename, const size_t depth, const int score,
     const std::string &predecessor, const std::string &action) {
-  constexpr bool minimized_dataset = true;
+  constexpr bool minimized_dataset = false;
 
   if (minimized_dataset && score >= m_failed_state) {
     return;
