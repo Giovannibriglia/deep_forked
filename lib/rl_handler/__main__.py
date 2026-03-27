@@ -148,10 +148,23 @@ def main(args):
         raise FileNotFoundError(f"Missing checkpoint: {model_ckpt}")
 
     if args.evaluate:
-        metrics = trainer.evaluate(eval_loader)
+        metrics = trainer.evaluate(eval_loader, verbose=True)
         with (model_root / f"{args.model_name}_eval.json").open("w", encoding="utf-8") as fh:
             json.dump(metrics, fh, indent=2)
-        print("Evaluation:", metrics)
+
+        with (model_root / f"{args.model_name}_eval_errors.json").open("w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "n_frontiers": metrics["n_frontiers"],
+                    "n_errors": metrics["n_errors"],
+                    "error_rate": metrics["error_rate"],
+                    "n_action_errors": metrics["n_action_errors"],
+                    "action_error_rate": metrics["action_error_rate"],
+                    "errors": metrics["errors"],
+                },
+                fh,
+                indent=2,
+            )
 
     if args.export_onnx:
         trainer.to_onnx(onnx_path, node_input_dim=node_input_dim)
