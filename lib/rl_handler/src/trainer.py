@@ -223,6 +223,7 @@ class RLFrontierTrainer:
                     train_reward=f"{mean_train_reward:.4f}",
                     eval_reward=f"{metrics['mean_reward']:.4f}",
                     regret=f"{metrics['regret_mean']:.4f}",
+                    oracle_accuracy=f"{metrics['oracle_accuracy']:.4f}",
                 )
             else:
                 epoch_pbar.set_postfix(train_reward=f"{mean_train_reward:.4f}")
