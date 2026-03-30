@@ -45,8 +45,8 @@ def parse_args():
         default="merged",
         help=(
             "Graph composition mode. "
-            "'merged': goal already embedded in each state graph, Goal CSV path is ignored. "
-            "'separated': goal graph is loaded from Goal CSV path and linked to each frontier candidate."
+            "'merged': frontier is one combined graph with shared central goal already embedded; Goal CSV path is ignored. "
+            "'separated': frontier candidates stay disconnected and goal graph is loaded separately from Goal CSV path."
         ),
     )
     parser.add_argument("--test-size", type=float, default=0.2)
@@ -86,6 +86,21 @@ def parse_args():
     parser.add_argument("--pooling-type", choices=["mean", "sum", "max"], default="mean")
     parser.add_argument("--use-global-context", type=str2bool, default=True)
     parser.add_argument("--mlp-depth", type=int, default=2)
+    parser.add_argument(
+        "--use-goal-separate-input",
+        type=str2bool,
+        default=None,
+        help=(
+            "Enable separate goal input branch. Recommended for kind-of-data='separated'; "
+            "for 'merged' the model ignores missing goal tensors."
+        ),
+    )
+    parser.add_argument(
+        "--track-rank-correlation",
+        type=str2bool,
+        default=True,
+        help="Track reward rank correlation (Spearman) between logits and rewards during evaluation.",
+    )
     parser.add_argument("--reward-formulation", type=str, default="negative_distance")
 
     parser.add_argument("--build-data", type=str2bool, default=True)
@@ -149,6 +164,12 @@ def main(args):
     )
 
     node_input_dim = int(train_samples[0]["node_features"].size(1))
+    use_goal_separate_input = (
+        args.kind_of_data == "separated"
+        if args.use_goal_separate_input is None
+        else bool(args.use_goal_separate_input)
+    )
+
     model = FrontierPolicyNetwork(
         node_input_dim=node_input_dim,
         hidden_dim=args.hidden_dim,
@@ -157,11 +178,14 @@ def main(args):
         pooling_type=args.pooling_type,
         use_global_context=args.use_global_context,
         mlp_depth=args.mlp_depth,
+        use_goal_separate_input=use_goal_separate_input,
     )
     trainer = RLFrontierTrainer(
         model=model,
         reward_formulation=args.reward_formulation,
         m_failed_state=float(args.m_failed_state),
+        kind_of_data=args.kind_of_data,
+        track_rank_correlation=args.track_rank_correlation,
     )
 
     _, model_root = _paths(args)

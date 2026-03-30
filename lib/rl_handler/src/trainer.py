@@ -36,6 +36,37 @@ class OnnxFrontierPolicyWrapper(nn.Module):
         )
 
 
+class OnnxFrontierPolicySeparatedWrapper(nn.Module):
+    def __init__(self, core: FrontierPolicyNetwork):
+        super().__init__()
+        self.core = core
+
+    def forward(
+        self,
+        node_features: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+        membership: torch.Tensor,
+        goal_node_features: torch.Tensor,
+        goal_edge_index: torch.Tensor,
+        goal_edge_attr: torch.Tensor,
+        goal_batch: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.core(
+            node_features=node_features,
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+            membership=membership,
+            candidate_batch=None,
+            mask=mask,
+            goal_node_features=goal_node_features,
+            goal_edge_index=goal_edge_index,
+            goal_edge_attr=goal_edge_attr,
+            goal_batch=goal_batch,
+        )
+
+
 class RLFrontierTrainer:
     def __init__(
         self,
@@ -45,6 +76,8 @@ class RLFrontierTrainer:
         device: str | torch.device | None = None,
         reward_formulation: str = "negative_distance",
         m_failed_state: float = 100000.0,
+        kind_of_data: str = "merged",
+        track_rank_correlation: bool = True,
     ):
         self.device = (
             torch.device(device)
@@ -57,6 +90,8 @@ class RLFrontierTrainer:
         )
         self.reward_formulation = reward_formulation
         self.m_failed_state = float(m_failed_state)
+        self.kind_of_data = kind_of_data
+        self.track_rank_correlation = bool(track_rank_correlation)
 
     def _move_to_device(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         out = {}
@@ -76,14 +111,56 @@ class RLFrontierTrainer:
             chunks.append(logits[s:e])
         return chunks
 
+    @staticmethod
+    def _average_ranks(values: torch.Tensor) -> torch.Tensor:
+        sorted_vals, sorted_idx = torch.sort(values)
+        n = int(values.numel())
+        ranks = torch.zeros(n, dtype=torch.float32, device=values.device)
+        i = 0
+        while i < n:
+            j = i + 1
+            while j < n and bool(
+                torch.isclose(sorted_vals[j], sorted_vals[i], rtol=0.0, atol=1e-12).item()
+            ):
+                j += 1
+            avg_rank = 0.5 * (float(i) + float(j - 1))
+            ranks[sorted_idx[i:j]] = avg_rank
+            i = j
+        return ranks
+
+    @classmethod
+    def _spearman_rank_corr(cls, logits: torch.Tensor, rewards: torch.Tensor) -> float:
+        if logits.numel() < 2:
+            return 0.0
+        rank_logits = cls._average_ranks(logits.detach())
+        rank_rewards = cls._average_ranks(rewards.detach())
+        x = rank_logits - rank_logits.mean()
+        y = rank_rewards - rank_rewards.mean()
+        denom = torch.sqrt((x * x).sum()) * torch.sqrt((y * y).sum())
+        if float(denom.item()) <= 1e-12:
+            return 0.0
+        return float(((x * y).sum() / denom).item())
+
+    def _build_model_kwargs(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        kwargs: Dict[str, torch.Tensor] = {
+            "node_features": batch["node_features"],
+            "edge_index": batch["edge_index"],
+            "edge_attr": batch["edge_attr"],
+            "membership": batch["membership"],
+            "candidate_batch": batch["candidate_batch"],
+        }
+        if "pool_node_index" in batch and "pool_membership" in batch:
+            kwargs["pool_node_index"] = batch["pool_node_index"]
+            kwargs["pool_membership"] = batch["pool_membership"]
+        if "goal_node_features" in batch:
+            kwargs["goal_node_features"] = batch["goal_node_features"]
+            kwargs["goal_edge_index"] = batch["goal_edge_index"]
+            kwargs["goal_edge_attr"] = batch["goal_edge_attr"]
+            kwargs["goal_batch"] = batch["goal_batch"]
+        return kwargs
+
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        logits = self.model(
-            node_features=batch["node_features"],
-            edge_index=batch["edge_index"],
-            edge_attr=batch["edge_attr"],
-            membership=batch["membership"],
-            candidate_batch=batch["candidate_batch"],
-        )
+        logits = self.model(**self._build_model_kwargs(batch))
         frontier_ptr = batch["frontier_ptr"]
         rewards = batch["rewards"]
 
@@ -125,6 +202,8 @@ class RLFrontierTrainer:
             "eval_chosen_distance_std": [],
             "eval_oracle_distance": [],
             "eval_oracle_distance_std": [],
+            "eval_reward_top1_accuracy": [],
+            "eval_reward_rank_correlation": [],
         }
         eval_snapshots: List[Dict[str, object]] = []
 
@@ -168,6 +247,10 @@ class RLFrontierTrainer:
                 history["eval_oracle_distance_std"].append(
                     metrics["std_oracle_distance"]
                 )
+                history["eval_reward_top1_accuracy"].append(metrics["reward_top1_accuracy"])
+                history["eval_reward_rank_correlation"].append(
+                    metrics["reward_rank_correlation"]
+                )
 
                 eval_snapshots.append(
                     {
@@ -209,6 +292,10 @@ class RLFrontierTrainer:
                         "frontier_sizes": metrics["frontier_sizes"],
                         "oracle_ranks": metrics["oracle_ranks"],
                         "oracle_probabilities": metrics["oracle_probabilities"],
+                        "reward_top1_matches": metrics["reward_top1_matches"],
+                        "reward_rank_correlations": metrics["reward_rank_correlations"],
+                        "reward_top1_accuracy": metrics["reward_top1_accuracy"],
+                        "reward_rank_correlation": metrics["reward_rank_correlation"],
                     }
                 )
 
@@ -224,6 +311,7 @@ class RLFrontierTrainer:
                     eval_reward=f"{metrics['mean_reward']:.4f}",
                     regret=f"{metrics['regret_mean']:.4f}",
                     oracle_accuracy=f"{metrics['oracle_accuracy']:.4f}",
+                    reward_top1=f"{metrics['reward_top1_accuracy']:.4f}",
                 )
             else:
                 epoch_pbar.set_postfix(train_reward=f"{mean_train_reward:.4f}")
@@ -248,6 +336,8 @@ class RLFrontierTrainer:
         oracle_matches: List[int] = []
         oracle_ranks: List[int] = []
         oracle_probabilities: List[float] = []
+        reward_top1_matches: List[int] = []
+        reward_rank_correlations: List[float] = []
 
         chosen_indices: List[int] = []
         oracle_indices_local: List[int] = []
@@ -267,13 +357,7 @@ class RLFrontierTrainer:
             for raw_batch in loader:
                 batch = self._move_to_device(raw_batch)
 
-                logits = self.model(
-                    node_features=batch["node_features"],
-                    edge_index=batch["edge_index"],
-                    edge_attr=batch["edge_attr"],
-                    membership=batch["membership"],
-                    candidate_batch=batch["candidate_batch"],
-                )
+                logits = self.model(**self._build_model_kwargs(batch))
 
                 frontier_ptr = batch["frontier_ptr"]
                 rewards = batch["rewards"]
@@ -313,6 +397,12 @@ class RLFrontierTrainer:
                     oracle_prob = float(probs[oracle_local].item())
                     ranking = torch.argsort(frontier_logits, descending=True)
                     oracle_rank = int((ranking == oracle_local).nonzero(as_tuple=False)[0].item()) + 1
+                    reward_best_local = int(torch.argmax(frontier_rewards).item())
+                    reward_top1_match = int(chosen_local == reward_best_local)
+                    if self.track_rank_correlation:
+                        reward_rank_corr = self._spearman_rank_corr(frontier_logits, frontier_rewards)
+                    else:
+                        reward_rank_corr = 0.0
 
                     is_chosen_failure = int(
                         torch.isclose(
@@ -358,6 +448,9 @@ class RLFrontierTrainer:
                         "chosen_prob": chosen_prob,
                         "oracle_prob": oracle_prob,
                         "oracle_rank": oracle_rank,
+                        "reward_best_index_local": reward_best_local,
+                        "reward_top1_match": bool(reward_top1_match),
+                        "reward_rank_correlation": float(reward_rank_corr),
                         "frontier_distances": [float(x) for x in frontier_distances.detach().cpu().tolist()],
                         "frontier_actions": [int(x) for x in frontier_actions.detach().cpu().tolist()],
                         "frontier_logits": [float(x) for x in frontier_logits.detach().cpu().tolist()],
@@ -391,6 +484,8 @@ class RLFrontierTrainer:
                     failure_avoided_when_possible.append(avoided_failure_if_possible)
                     oracle_ranks.append(oracle_rank)
                     oracle_probabilities.append(oracle_prob)
+                    reward_top1_matches.append(reward_top1_match)
+                    reward_rank_correlations.append(float(reward_rank_corr))
 
                     if not oracle_match:
                         error_details.append(detail)
@@ -436,6 +531,10 @@ class RLFrontierTrainer:
                 "frontier_sizes": [],
                 "oracle_ranks": [],
                 "oracle_probabilities": [],
+                "reward_top1_matches": [],
+                "reward_rank_correlations": [],
+                "reward_top1_accuracy": 0.0,
+                "reward_rank_correlation": 0.0,
                 "details": [],
                 "errors": [],
             }
@@ -454,6 +553,7 @@ class RLFrontierTrainer:
         oracle_failure_t = torch.tensor(oracle_is_failure, dtype=torch.float32)
         frontier_has_failure_t = torch.tensor(frontier_has_failure, dtype=torch.float32)
         frontier_has_safe_t = torch.tensor(frontier_has_safe, dtype=torch.float32)
+        reward_top1_t = torch.tensor(reward_top1_matches, dtype=torch.float32)
         n_failure_choices = int(chosen_failure_t.sum().item())
         n_failure_frontiers = int(frontier_has_failure_t.sum().item())
         n_failure_oracle_choices = int(oracle_failure_t.sum().item())
@@ -516,6 +616,10 @@ class RLFrontierTrainer:
             "frontier_sizes": frontier_sizes,
             "oracle_ranks": oracle_ranks,
             "oracle_probabilities": oracle_probabilities,
+            "reward_top1_matches": reward_top1_matches,
+            "reward_rank_correlations": reward_rank_correlations,
+            "reward_top1_accuracy": float(reward_top1_t.mean().item()),
+            "reward_rank_correlation": self._safe_mean(reward_rank_correlations),
             "details": all_details,
             "errors": error_details,
         }
@@ -526,6 +630,8 @@ class RLFrontierTrainer:
             print(f"errors              : {metrics['n_errors']}/{metrics['n_frontiers']} ({100.0 * metrics['error_rate']:.2f}%) (agent ≠ oracle index)")
             print(f"action errors       : {metrics['n_action_errors']}/{metrics['n_frontiers']} ({100.0 * metrics['action_error_rate']:.2f}%) (planner action mismatch)")
             print(f"oracle accuracy     : {metrics['oracle_accuracy']:.4f} (exact match with best candidate)")
+            print(f"reward top1 acc     : {metrics['reward_top1_accuracy']:.4f} (argmax(logits) vs argmax(reward))")
+            print(f"reward rank corr    : {metrics['reward_rank_correlation']:.4f} (Spearman across candidates)")
             print(f"failure choices     : {metrics['n_failure_choices']}/{metrics['n_frontiers']} ({100.0 * metrics['failure_choice_rate']:.2f}%)")
             print(f"failure frontiers   : {metrics['n_failure_frontiers']}/{metrics['n_frontiers']} ({100.0 * metrics['failure_frontier_rate']:.2f}%)")
             print(f"failure avoidance   : {metrics['failure_avoidance_accuracy']:.4f} on {metrics['n_failure_avoidance_applicable']} applicable frontiers")
@@ -559,6 +665,7 @@ class RLFrontierTrainer:
                 "pooling_type": self.model.pooling_type,
                 "use_global_context": self.model.use_global_context,
                 "mlp_depth": (len(self.model.policy_head) - 1) // 2,
+                "use_goal_separate_input": self.model.use_goal_separate_input,
             },
             "metrics": metrics or {},
         }
@@ -576,16 +683,68 @@ class RLFrontierTrainer:
     def to_onnx(self, out_path: str | Path, node_input_dim: int) -> None:
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        wrapper = OnnxFrontierPolicyWrapper(self.model).eval().cpu()
-
         n_nodes, n_edges, n_candidates = 8, 12, 4
-        dummy_inputs = (
-            torch.zeros((n_nodes, node_input_dim), dtype=torch.float32),
-            torch.zeros((2, n_edges), dtype=torch.int64),
-            torch.zeros((n_edges, 1), dtype=torch.float32),
-            torch.arange(n_nodes, dtype=torch.int64) % n_candidates,
-            torch.ones((n_candidates,), dtype=torch.bool),
-        )
+        if self.kind_of_data == "separated" and self.model.use_goal_separate_input:
+            wrapper = OnnxFrontierPolicySeparatedWrapper(self.model).eval().cpu()
+            n_goal_nodes, n_goal_edges = 6, 8
+            dummy_inputs = (
+                torch.zeros((n_nodes, node_input_dim), dtype=torch.float32),
+                torch.zeros((2, n_edges), dtype=torch.int64),
+                torch.zeros((n_edges, 1), dtype=torch.float32),
+                torch.arange(n_nodes, dtype=torch.int64) % n_candidates,
+                torch.zeros((n_goal_nodes, node_input_dim), dtype=torch.float32),
+                torch.zeros((2, n_goal_edges), dtype=torch.int64),
+                torch.zeros((n_goal_edges, 1), dtype=torch.float32),
+                torch.zeros((n_goal_nodes,), dtype=torch.int64),
+                torch.ones((n_candidates,), dtype=torch.bool),
+            )
+            input_names = [
+                "node_features",
+                "edge_index",
+                "edge_attr",
+                "membership",
+                "goal_node_features",
+                "goal_edge_index",
+                "goal_edge_attr",
+                "goal_batch",
+                "mask",
+            ]
+            dynamic_axes = {
+                "node_features": {0: "N"},
+                "edge_index": {1: "E"},
+                "edge_attr": {0: "E"},
+                "membership": {0: "N"},
+                "goal_node_features": {0: "GN"},
+                "goal_edge_index": {1: "GE"},
+                "goal_edge_attr": {0: "GE"},
+                "goal_batch": {0: "GN"},
+                "mask": {0: "F"},
+                "logits": {0: "F"},
+            }
+        else:
+            wrapper = OnnxFrontierPolicyWrapper(self.model).eval().cpu()
+            dummy_inputs = (
+                torch.zeros((n_nodes, node_input_dim), dtype=torch.float32),
+                torch.zeros((2, n_edges), dtype=torch.int64),
+                torch.zeros((n_edges, 1), dtype=torch.float32),
+                torch.arange(n_nodes, dtype=torch.int64) % n_candidates,
+                torch.ones((n_candidates,), dtype=torch.bool),
+            )
+            input_names = [
+                "node_features",
+                "edge_index",
+                "edge_attr",
+                "membership",
+                "mask",
+            ]
+            dynamic_axes = {
+                "node_features": {0: "N"},
+                "edge_index": {1: "E"},
+                "edge_attr": {0: "E"},
+                "membership": {0: "N"},
+                "mask": {0: "F"},
+                "logits": {0: "F"},
+            }
 
         torch.onnx.export(
             wrapper,
@@ -593,22 +752,9 @@ class RLFrontierTrainer:
             out_path.as_posix(),
             opset_version=18,
             dynamo=False,
-            input_names=[
-                "node_features",
-                "edge_index",
-                "edge_attr",
-                "membership",
-                "mask",
-            ],
+            input_names=input_names,
             output_names=["logits"],
-            dynamic_axes={
-                "node_features": {0: "N"},
-                "edge_index": {1: "E"},
-                "edge_attr": {0: "E"},
-                "membership": {0: "N"},
-                "mask": {0: "F"},
-                "logits": {0: "F"},
-            },
+            dynamic_axes=dynamic_axes,
             do_constant_folding=False,
         )
 
@@ -882,6 +1028,8 @@ class RLFrontierTrainer:
             "final_chosen_distance_std": final.get("std_chosen_distance", 0.0),
             "final_oracle_distance": final.get("mean_oracle_distance", 0.0),
             "final_oracle_distance_std": final.get("std_oracle_distance", 0.0),
+            "final_reward_top1_accuracy": final.get("reward_top1_accuracy", 0.0),
+            "final_reward_rank_correlation": final.get("reward_rank_correlation", 0.0),
             "num_train_frontiers": len(train_sizes),
             "num_eval_frontiers": len(eval_sizes),
             "mean_train_frontier_size": self._safe_mean(train_sizes),
@@ -954,6 +1102,24 @@ class RLFrontierTrainer:
             xlabel="Epoch",
             ylabel="Failure Choice Rate",
             label="Failure Choice Rate",
+        )
+        self._plot_curve_with_band(
+            output_dir / "eval_reward_top1_accuracy.png",
+            x=eval_x,
+            y=history["eval_reward_top1_accuracy"],
+            y_std=None,
+            xlabel="Epoch",
+            ylabel="Reward Top-1 Accuracy",
+            label="Reward Top-1 Accuracy",
+        )
+        self._plot_curve_with_band(
+            output_dir / "eval_reward_rank_correlation.png",
+            x=eval_x,
+            y=history["eval_reward_rank_correlation"],
+            y_std=None,
+            xlabel="Epoch",
+            ylabel="Reward Rank Correlation",
+            label="Reward Rank Correlation",
         )
 
         plt.figure(figsize=(6, 4), dpi=300)

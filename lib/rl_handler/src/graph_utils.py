@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import networkx as nx
 import pydot
@@ -18,6 +18,8 @@ class CombinedFrontierGraph:
     edge_attr: torch.Tensor
     membership: torch.Tensor
     action_map: torch.Tensor
+    pool_node_index: Optional[torch.Tensor] = None
+    pool_membership: Optional[torch.Tensor] = None
 
 
 def _load_dot(path: Path) -> nx.DiGraph:
@@ -135,6 +137,95 @@ def _compose_disconnected(
     }
 
 
+def _node_keys(graph: Data) -> List[Tuple[float, ...]]:
+    names = getattr(graph, "node_names", None)
+    if names is None:
+        names = graph.node_features
+    names = names.detach().cpu()
+    if names.dim() == 1:
+        return [(float(v.item()),) for v in names]
+    return [tuple(float(x.item()) for x in row) for row in names]
+
+
+def _edge_attr_tuple(edge_attr: torch.Tensor, idx: int) -> Tuple[float, ...]:
+    row = edge_attr[idx].detach().cpu().view(-1)
+    return tuple(float(v.item()) for v in row)
+
+
+def _compose_merged_shared_goal(graphs: List[Data]) -> Dict[str, torch.Tensor]:
+    # Nodes are merged by stable identity (node_names when available). If two
+    # graphs share central goal nodes, they map to the same merged node.
+    node_features_rows: List[torch.Tensor] = []
+    key_to_index: Dict[Tuple[float, ...], int] = {}
+    # Membership keeps one owner candidate per merged node to stay compatible
+    # with the existing model input contract (single membership tensor).
+    owner_membership: List[int] = []
+    pool_node_index: List[int] = []
+    pool_membership: List[int] = []
+    edge_rows: List[List[int]] = []
+    edge_attr_rows: List[torch.Tensor] = []
+    edge_seen = set()
+
+    for member_value, graph in enumerate(graphs):
+        keys = _node_keys(graph)
+        local_to_global: List[int] = []
+
+        for local_idx, key in enumerate(keys):
+            g_idx = key_to_index.get(key)
+            if g_idx is None:
+                g_idx = len(node_features_rows)
+                key_to_index[key] = g_idx
+                node_features_rows.append(graph.node_features[local_idx].detach().clone())
+                owner_membership.append(member_value)
+            local_to_global.append(g_idx)
+            pool_node_index.append(g_idx)
+            pool_membership.append(member_value)
+
+        if graph.edge_index.numel() == 0:
+            continue
+        edge_index = graph.edge_index.detach().cpu()
+        for e_idx in range(edge_index.size(1)):
+            src_local = int(edge_index[0, e_idx].item())
+            dst_local = int(edge_index[1, e_idx].item())
+            src = local_to_global[src_local]
+            dst = local_to_global[dst_local]
+            attr_key = _edge_attr_tuple(graph.edge_attr, e_idx)
+            edge_key = (src, dst, attr_key)
+            if edge_key in edge_seen:
+                continue
+            edge_seen.add(edge_key)
+            edge_rows.append([src, dst])
+            edge_attr_rows.append(graph.edge_attr[e_idx].detach().clone().to(torch.float32))
+
+    if not node_features_rows:
+        raise ValueError("Cannot compose an empty list of graphs.")
+
+    node_features = torch.stack(node_features_rows, dim=0)
+    membership = torch.tensor(owner_membership, dtype=torch.long)
+    if edge_rows:
+        edge_index = torch.tensor(edge_rows, dtype=torch.long).t().contiguous()
+        edge_attr = torch.stack(edge_attr_rows, dim=0)
+    else:
+        edge_index = torch.zeros((2, 0), dtype=torch.long)
+        edge_attr = torch.zeros((0, 1), dtype=torch.float32)
+
+    return {
+        "node_features": node_features,
+        "edge_index": edge_index,
+        "edge_attr": edge_attr,
+        "membership": membership,
+        "pool_node_index": torch.tensor(pool_node_index, dtype=torch.long),
+        "pool_membership": torch.tensor(pool_membership, dtype=torch.long),
+    }
+
+
+def _compose_separated_disconnected(graphs: List[Data]) -> Dict[str, torch.Tensor]:
+    return _compose_disconnected(
+        graphs=graphs,
+        membership_values=list(range(len(graphs))),
+    )
+
+
 def combine_graphs(
     frontier_graphs: List[Data],
     goal_graph: Optional[Data],
@@ -154,19 +245,17 @@ def combine_graphs(
         raise ValueError(f"Unsupported kind_of_data: {kind_of_data}")
 
     if kind_of_data == "merged":
-        # merged semantics:
-        # the goal structure is already embedded in each successor graph, so no
-        # separate goal graph is required or linked here.
-        out = _compose_disconnected(
-            graphs=frontier_graphs,
-            membership_values=list(range(n_frontier)),
-        )
+        # Goal is embedded in successors; compose into one graph by shared node/edge
+        # identity. If no overlap exists, this naturally falls back to concatenation.
+        out = _compose_merged_shared_goal(frontier_graphs)
         return CombinedFrontierGraph(
             node_features=out["node_features"],
             edge_index=out["edge_index"],
             edge_attr=out["edge_attr"],
             membership=out["membership"],
             action_map=action_tensor,
+            pool_node_index=out["pool_node_index"],
+            pool_membership=out["pool_membership"],
         )
 
     if goal_graph is None:
@@ -174,43 +263,13 @@ def combine_graphs(
             "Goal graph must be loaded from dataset Goal path for kind_of_data='separated'."
         )
 
-    # separated semantics: include goal graph explicitly and minimally link each
-    # frontier graph to the goal anchor.
-    all_graphs = frontier_graphs + [goal_graph]
-    membership_values = list(range(n_frontier)) + [-1]
-    out = _compose_disconnected(
-        graphs=all_graphs,
-        membership_values=membership_values,
-    )
-
-    n_goal_nodes = int(goal_graph.node_features.size(0))
-    goal_start = int(out["node_features"].size(0) - n_goal_nodes)
-    goal_anchor = goal_start
-
-    root_indices = []
-    cursor = 0
-    for g in frontier_graphs:
-        root_indices.append(cursor)
-        cursor += int(g.node_features.size(0))
-
-    link_edges = []
-    for src in root_indices:
-        link_edges.append([src, goal_anchor])
-        link_edges.append([goal_anchor, src])
-    link_edge_index = torch.tensor(link_edges, dtype=torch.long).t().contiguous()
-    link_edge_attr = torch.zeros((link_edge_index.size(1), 1), dtype=torch.float32)
-
-    edge_index = (
-        torch.cat([out["edge_index"], link_edge_index], dim=1)
-        if out["edge_index"].numel() > 0
-        else link_edge_index
-    )
-    edge_attr = torch.cat([out["edge_attr"], link_edge_attr], dim=0)
-
+    # Separated semantics: keep frontier candidates disconnected and pass goal
+    # as a separate graph branch to the model.
+    out = _compose_separated_disconnected(frontier_graphs)
     return CombinedFrontierGraph(
         node_features=out["node_features"],
-        edge_index=edge_index,
-        edge_attr=edge_attr,
+        edge_index=out["edge_index"],
+        edge_attr=out["edge_attr"],
         membership=out["membership"],
         action_map=action_tensor,
     )

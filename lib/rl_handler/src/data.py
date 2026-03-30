@@ -303,6 +303,9 @@ def _materialize_frontier(
     bitmask: bool,
     m_failed_state: float,
 ) -> Dict[str, Any]:
+    if kind_of_data not in {"merged", "separated"}:
+        raise ValueError(f"Unsupported kind_of_data: {kind_of_data}")
+
     successor_graphs = [load_pyg_graph(p, bitmask=bitmask) for p in frontier["successor_paths"]]
     goal_graph = None
     if kind_of_data == "separated":
@@ -326,7 +329,7 @@ def _materialize_frontier(
     rewards = -distances
     best_idx = int(torch.argmin(distances).item())
     frontier_has_failure = any(_is_failure_candidate(float(d), m_failed_state) for d in frontier["distances"])
-    return {
+    sample = {
         "node_features": combined.node_features,
         "edge_index": combined.edge_index,
         "edge_attr": combined.edge_attr,
@@ -340,6 +343,12 @@ def _materialize_frontier(
         "predecessor_path": frontier["predecessor_path"],
         "frontier_has_failure": bool(frontier_has_failure),
     }
+    if goal_graph is not None:
+        sample["goal_node_features"] = goal_graph.node_features
+        sample["goal_edge_index"] = goal_graph.edge_index
+        sample["goal_edge_attr"] = goal_graph.edge_attr
+
+    return sample
 
 
 class FrontierDataset(Dataset):
@@ -365,9 +374,15 @@ def frontier_collate_fn(batch: Sequence[Dict[str, Any]], pad_frontiers: bool = T
     oracle_reward_parts: List[torch.Tensor] = []
     candidate_batch_parts: List[torch.Tensor] = []
     frontier_ptr = [0]
+    goal_node_parts: List[torch.Tensor] = []
+    goal_edge_index_parts: List[torch.Tensor] = []
+    goal_edge_attr_parts: List[torch.Tensor] = []
+    goal_batch_parts: List[torch.Tensor] = []
+    has_goal_parts = [("goal_node_features" in item) for item in batch]
 
     node_offset = 0
     membership_offset = 0
+    goal_node_offset = 0
     for batch_idx, item in enumerate(batch):
         n_nodes = int(item["node_features"].size(0))
         n_candidates = int(item["rewards"].size(0))
@@ -388,6 +403,15 @@ def frontier_collate_fn(batch: Sequence[Dict[str, Any]], pad_frontiers: bool = T
         oracle_parts.append(item["oracle_index"].view(1) + membership_offset)
         oracle_reward_parts.append(item["oracle_reward"].view(1))
         candidate_batch_parts.append(torch.full((n_candidates,), batch_idx, dtype=torch.long))
+
+        if has_goal_parts[batch_idx]:
+            goal_nodes = item["goal_node_features"]
+            goal_node_parts.append(goal_nodes)
+            goal_batch_parts.append(torch.full((goal_nodes.size(0),), batch_idx, dtype=torch.long))
+            if item["goal_edge_index"].numel() > 0:
+                goal_edge_index_parts.append(item["goal_edge_index"] + goal_node_offset)
+                goal_edge_attr_parts.append(item["goal_edge_attr"].to(torch.float32))
+            goal_node_offset += int(goal_nodes.size(0))
 
         frontier_ptr.append(frontier_ptr[-1] + n_candidates)
         node_offset += n_nodes
@@ -414,6 +438,21 @@ def frontier_collate_fn(batch: Sequence[Dict[str, Any]], pad_frontiers: bool = T
         "candidate_batch": torch.cat(candidate_batch_parts, dim=0),
         "frontier_ptr": torch.tensor(frontier_ptr, dtype=torch.long),
     }
+    if any(has_goal_parts) and not all(has_goal_parts):
+        raise ValueError("Mixed batches with and without goal tensors are not supported.")
+    if all(has_goal_parts) and goal_node_parts:
+        out["goal_node_features"] = torch.cat(goal_node_parts, dim=0)
+        out["goal_edge_index"] = (
+            torch.cat(goal_edge_index_parts, dim=1)
+            if goal_edge_index_parts
+            else torch.zeros((2, 0), dtype=torch.long)
+        )
+        out["goal_edge_attr"] = (
+            torch.cat(goal_edge_attr_parts, dim=0)
+            if goal_edge_attr_parts
+            else torch.zeros((0, 1), dtype=torch.float32)
+        )
+        out["goal_batch"] = torch.cat(goal_batch_parts, dim=0)
 
     if pad_frontiers:
         max_n = max(x.size(0) for x in reward_parts)
