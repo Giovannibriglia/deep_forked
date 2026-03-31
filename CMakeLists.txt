@@ -154,7 +154,12 @@ elseif(CMAKE_BUILD_TYPE MATCHES "^[Rr][Ee][Ll][Ee][Aa][Ss][Ee]$")
 endif()
 
 # === Link libraries ===
-target_link_libraries(deep PRIVATE pthread rt CLI11::CLI11)
+find_package(Threads REQUIRED)
+target_link_libraries(deep PRIVATE Threads::Threads CLI11::CLI11)
+# librt exists only on Linux
+if(UNIX AND NOT APPLE)
+    target_link_libraries(deep PRIVATE rt)
+endif()
 
 # === Output directories ===
 set_target_properties(deep PROPERTIES

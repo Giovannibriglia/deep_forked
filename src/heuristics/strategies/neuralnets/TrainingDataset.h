@@ -165,7 +165,8 @@ private:
   // --- Node and search statistics ---
   size_t m_current_nodes = 0;                   ///< Current number of nodes
   size_t m_threshold_node_generation = 100000;  ///< Node generation threshold
-  size_t m_max_threshold_node_creation = 25000; ///< MAX Node creation threshold
+    size_t m_threshold_failures_print_modulo = 500;  ///< Number of failures before next failures print
+    size_t m_max_threshold_node_creation = 25000; ///< MAX Node creation threshold
   size_t m_min_threshold_node_creation = 10;    ///< min Node creation threshold
   size_t m_added_to_dataset = 0; ///< Number of nodes added to dataset
 

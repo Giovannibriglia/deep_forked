@@ -786,13 +786,21 @@ template <StateRepresentation StateRepr>
 void TrainingDataset<StateRepr>::add_to_dataset(
     const std::string &base_filename, const size_t depth, const int score,
     const std::string &predecessor, const std::string &action) {
-  constexpr bool minimized_dataset = true;
+  constexpr bool minimized_dataset = false;
 
   if (minimized_dataset && score >= m_failed_state) {
     return;
   }
 
-  m_added_to_dataset++;
+  if (score >= m_failed_state) {
+    auto m_total_failures = m_current_nodes - m_added_to_dataset;
+    if (m_total_failures%m_threshold_failures_print_modulo != 0) {
+      return;
+    }
+  }
+  else {
+    m_added_to_dataset++;
+  }
 
   std::stringstream ss;
 
