@@ -117,21 +117,64 @@ class FrontierPolicyNetwork(nn.Module):
         membership: torch.Tensor,
         pool_node_index: Optional[torch.Tensor] = None,
         pool_membership: Optional[torch.Tensor] = None,
+        expected_size: Optional[int] = None,
     ) -> torch.Tensor:
+        if membership.dim() != 1:
+            raise ValueError(f"membership must be 1D, got shape {tuple(membership.shape)}")
+        if expected_size is not None and int(expected_size) < 0:
+            raise ValueError(f"expected_size must be non-negative, got {expected_size}")
+
+        if (pool_node_index is None) != (pool_membership is None):
+            raise ValueError(
+                "pool_node_index and pool_membership must be provided together."
+            )
         if pool_node_index is not None and pool_membership is not None:
+            if pool_node_index.dim() != 1 or pool_membership.dim() != 1:
+                raise ValueError(
+                    "pool_node_index and pool_membership must be 1D tensors."
+                )
+            if pool_node_index.numel() != pool_membership.numel():
+                raise ValueError(
+                    "pool_node_index and pool_membership must have identical lengths."
+                )
+            if pool_node_index.numel() > 0:
+                if int(pool_node_index.min().item()) < 0:
+                    raise ValueError("pool_node_index contains negative indices.")
+                if int(pool_node_index.max().item()) >= int(node_embeddings.size(0)):
+                    raise ValueError(
+                        f"pool_node_index out of bounds: max={int(pool_node_index.max().item())} "
+                        f"n_nodes={int(node_embeddings.size(0))}"
+                    )
+            if pool_membership.numel() > 0 and int(pool_membership.min().item()) < 0:
+                raise ValueError("pool_membership contains negative indices.")
             x = node_embeddings[pool_node_index]
             m = pool_membership
         else:
             mask = membership >= 0
             x = node_embeddings[mask]
             m = membership[mask]
+        if m.dim() != 1:
+            raise ValueError(f"pool membership vector must be 1D, got shape {tuple(m.shape)}")
+        if x.size(0) != m.numel():
+            raise ValueError(
+                f"Pooled tensor and membership mismatch: x.size(0)={x.size(0)} m.numel()={m.numel()}"
+            )
+
+        size = int(expected_size) if expected_size is not None else None
         if self.pooling_type == "mean":
-            return global_mean_pool(x, m)
-        if self.pooling_type == "sum":
-            return global_add_pool(x, m)
-        if self.pooling_type == "max":
-            return global_max_pool(x, m)
-        raise ValueError(f"Unsupported pooling_type: {self.pooling_type}")
+            pooled = global_mean_pool(x, m, size=size)
+        elif self.pooling_type == "sum":
+            pooled = global_add_pool(x, m, size=size)
+        elif self.pooling_type == "max":
+            pooled = global_max_pool(x, m, size=size)
+        else:
+            raise ValueError(f"Unsupported pooling_type: {self.pooling_type}")
+        if expected_size is not None and pooled.size(0) != int(expected_size):
+            raise AssertionError(
+                f"Pooled candidate size mismatch: pooled.size(0)={pooled.size(0)} "
+                f"expected_size={int(expected_size)}"
+            )
+        return pooled
 
     def _pool_goal(
         self,
@@ -156,7 +199,30 @@ class FrontierPolicyNetwork(nn.Module):
         if candidate_batch is None:
             ctx = z.mean(dim=0, keepdim=True).expand_as(z)
             return torch.cat([z, ctx], dim=-1)
-        ctx_per_frontier = global_mean_pool(z, candidate_batch)
+        if candidate_batch.dim() != 1:
+            raise ValueError(
+                f"candidate_batch must be 1D, got shape {tuple(candidate_batch.shape)}"
+            )
+        if candidate_batch.numel() > 0 and int(candidate_batch.min().item()) < 0:
+            raise ValueError("candidate_batch contains negative frontier indices.")
+
+        assert z.size(0) == candidate_batch.numel(), (
+            f"Mismatch before global_mean_pool: "
+            f"z.size(0)={z.size(0)} candidate_batch.numel()={candidate_batch.numel()} "
+            f"candidate_batch.min()={int(candidate_batch.min()) if candidate_batch.numel() > 0 else 'NA'} "
+            f"candidate_batch.max()={int(candidate_batch.max()) if candidate_batch.numel() > 0 else 'NA'}"
+        )
+
+        if candidate_batch.numel() == 0:
+            ctx = z.new_zeros(z.shape)
+            return torch.cat([z, ctx], dim=-1)
+        n_frontiers = int(candidate_batch.max().item()) + 1
+        ctx_per_frontier = global_mean_pool(z, candidate_batch, size=n_frontiers)
+        if int(candidate_batch.max().item()) >= ctx_per_frontier.size(0):
+            raise ValueError(
+                f"candidate_batch index out of range: max={int(candidate_batch.max().item())} "
+                f"n_frontiers={ctx_per_frontier.size(0)}"
+            )
         ctx = ctx_per_frontier[candidate_batch]
         return torch.cat([z, ctx], dim=-1)
 
@@ -176,11 +242,15 @@ class FrontierPolicyNetwork(nn.Module):
         pool_membership: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         node_emb = self.encoder(node_features, edge_index, edge_attr)
+        expected_num_candidates = (
+            int(candidate_batch.numel()) if candidate_batch is not None else None
+        )
         z = self._pool_nodes(
             node_emb,
             membership,
             pool_node_index=pool_node_index,
             pool_membership=pool_membership,
+            expected_size=expected_num_candidates,
         )
         h = self._contextualize(z, candidate_batch)
         if self.use_goal_separate_input:

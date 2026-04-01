@@ -343,6 +343,9 @@ def _materialize_frontier(
         "predecessor_path": frontier["predecessor_path"],
         "frontier_has_failure": bool(frontier_has_failure),
     }
+    if combined.pool_node_index is not None and combined.pool_membership is not None:
+        sample["pool_node_index"] = combined.pool_node_index
+        sample["pool_membership"] = combined.pool_membership
     if goal_graph is not None:
         sample["goal_node_features"] = goal_graph.node_features
         sample["goal_edge_index"] = goal_graph.edge_index
@@ -374,6 +377,11 @@ def frontier_collate_fn(batch: Sequence[Dict[str, Any]], pad_frontiers: bool = T
     oracle_reward_parts: List[torch.Tensor] = []
     candidate_batch_parts: List[torch.Tensor] = []
     frontier_ptr = [0]
+    pool_node_index_parts: List[torch.Tensor] = []
+    pool_membership_parts: List[torch.Tensor] = []
+    has_pool_parts = [("pool_node_index" in item and "pool_membership" in item) for item in batch]
+    if any(("pool_node_index" in item) != ("pool_membership" in item) for item in batch):
+        raise ValueError("Each sample must include both pool_node_index and pool_membership, or neither.")
     goal_node_parts: List[torch.Tensor] = []
     goal_edge_index_parts: List[torch.Tensor] = []
     goal_edge_attr_parts: List[torch.Tensor] = []
@@ -403,6 +411,32 @@ def frontier_collate_fn(batch: Sequence[Dict[str, Any]], pad_frontiers: bool = T
         oracle_parts.append(item["oracle_index"].view(1) + membership_offset)
         oracle_reward_parts.append(item["oracle_reward"].view(1))
         candidate_batch_parts.append(torch.full((n_candidates,), batch_idx, dtype=torch.long))
+        if has_pool_parts[batch_idx]:
+            pool_node_index = item["pool_node_index"].to(torch.long)
+            pool_membership = item["pool_membership"].to(torch.long)
+            if pool_node_index.dim() != 1 or pool_membership.dim() != 1:
+                raise ValueError("pool_node_index and pool_membership must be 1D tensors.")
+            if pool_node_index.numel() != pool_membership.numel():
+                raise ValueError(
+                    "pool_node_index and pool_membership must have the same number of elements."
+                )
+            if pool_node_index.numel() > 0:
+                if int(pool_node_index.min().item()) < 0:
+                    raise ValueError("pool_node_index contains negative indices.")
+                if int(pool_node_index.max().item()) >= n_nodes:
+                    raise ValueError(
+                        f"pool_node_index out of bounds: max={int(pool_node_index.max().item())} n_nodes={n_nodes}"
+                    )
+            if pool_membership.numel() > 0:
+                if int(pool_membership.min().item()) < 0:
+                    raise ValueError("pool_membership contains negative indices.")
+                if int(pool_membership.max().item()) >= n_candidates:
+                    raise ValueError(
+                        f"pool_membership out of bounds: max={int(pool_membership.max().item())} "
+                        f"n_candidates={n_candidates}"
+                    )
+            pool_node_index_parts.append(pool_node_index + node_offset)
+            pool_membership_parts.append(pool_membership + membership_offset)
 
         if has_goal_parts[batch_idx]:
             goal_nodes = item["goal_node_features"]
@@ -438,6 +472,71 @@ def frontier_collate_fn(batch: Sequence[Dict[str, Any]], pad_frontiers: bool = T
         "candidate_batch": torch.cat(candidate_batch_parts, dim=0),
         "frontier_ptr": torch.tensor(frontier_ptr, dtype=torch.long),
     }
+    candidate_batch = out["candidate_batch"]
+    frontier_ptr_tensor = out["frontier_ptr"]
+    if candidate_batch.dim() != 1:
+        raise ValueError(f"candidate_batch must be 1D, got shape {tuple(candidate_batch.shape)}")
+    if frontier_ptr_tensor.dim() != 1:
+        raise ValueError(f"frontier_ptr must be 1D, got shape {tuple(frontier_ptr_tensor.shape)}")
+    if frontier_ptr_tensor.numel() != len(batch) + 1:
+        raise ValueError(
+            f"frontier_ptr length mismatch: got {frontier_ptr_tensor.numel()} expected {len(batch) + 1}"
+        )
+    if int(frontier_ptr_tensor[0].item()) != 0:
+        raise ValueError("frontier_ptr must start from 0.")
+    if bool((frontier_ptr_tensor[1:] < frontier_ptr_tensor[:-1]).any().item()):
+        raise ValueError("frontier_ptr must be non-decreasing.")
+    total_candidates = int(frontier_ptr_tensor[-1].item())
+    if candidate_batch.numel() != total_candidates:
+        raise ValueError(
+            f"candidate_batch size mismatch: numel={candidate_batch.numel()} total_candidates={total_candidates}"
+        )
+    if candidate_batch.numel() > 0:
+        if int(candidate_batch.min().item()) < 0:
+            raise ValueError("candidate_batch contains negative frontier indices.")
+        if int(candidate_batch.max().item()) >= len(batch):
+            raise ValueError(
+                f"candidate_batch frontier index out of range: max={int(candidate_batch.max().item())} "
+                f"batch_size={len(batch)}"
+            )
+
+    if any(has_pool_parts) and not all(has_pool_parts):
+        raise ValueError("Mixed batches with and without merged pool tensors are not supported.")
+    if all(has_pool_parts):
+        out["pool_node_index"] = (
+            torch.cat(pool_node_index_parts, dim=0)
+            if pool_node_index_parts
+            else torch.zeros((0,), dtype=torch.long)
+        )
+        out["pool_membership"] = (
+            torch.cat(pool_membership_parts, dim=0)
+            if pool_membership_parts
+            else torch.zeros((0,), dtype=torch.long)
+        )
+        pool_node_index = out["pool_node_index"]
+        pool_membership = out["pool_membership"]
+        if pool_node_index.dim() != 1 or pool_membership.dim() != 1:
+            raise ValueError("pool_node_index and pool_membership must be 1D after collation.")
+        if pool_node_index.numel() != pool_membership.numel():
+            raise ValueError(
+                "pool_node_index and pool_membership length mismatch after collation."
+            )
+        if pool_node_index.numel() > 0:
+            if int(pool_node_index.min().item()) < 0:
+                raise ValueError("pool_node_index contains negative values after collation.")
+            if int(pool_node_index.max().item()) >= int(out["node_features"].size(0)):
+                raise ValueError(
+                    f"pool_node_index out of bounds after collation: max={int(pool_node_index.max().item())} "
+                    f"n_nodes={int(out['node_features'].size(0))}"
+                )
+        if pool_membership.numel() > 0:
+            if int(pool_membership.min().item()) < 0:
+                raise ValueError("pool_membership contains negative values after collation.")
+            if int(pool_membership.max().item()) >= total_candidates:
+                raise ValueError(
+                    f"pool_membership out of bounds after collation: max={int(pool_membership.max().item())} "
+                    f"total_candidates={total_candidates}"
+                )
     if any(has_goal_parts) and not all(has_goal_parts):
         raise ValueError("Mixed batches with and without goal tensors are not supported.")
     if all(has_goal_parts) and goal_node_parts:
