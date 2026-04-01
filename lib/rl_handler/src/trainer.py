@@ -11,6 +11,17 @@ from torch import nn
 from tqdm import tqdm
 
 from src.models.frontier_policy import FrontierPolicyNetwork
+from src.reward_metrics import (
+    js_divergence,
+    js_normalized,
+    kl_divergence,
+    listwise_loss,
+    masked_mae,
+    masked_rmse,
+    masked_softmax,
+    pairwise_ranking_loss,
+    score_std_within_frontier,
+)
 
 
 class OnnxFrontierPolicyWrapper(nn.Module):
@@ -78,6 +89,10 @@ class RLFrontierTrainer:
         m_failed_state: float = 100000.0,
         kind_of_data: str = "merged",
         track_rank_correlation: bool = True,
+        reward_loss_weight: float = 1.0,
+        ranking_loss_weight: float = 0.0,
+        ranking_loss_type: str = "none",
+        reward_temperature: float = 0.5,
     ):
         self.device = (
             torch.device(device)
@@ -92,6 +107,17 @@ class RLFrontierTrainer:
         self.m_failed_state = float(m_failed_state)
         self.kind_of_data = kind_of_data
         self.track_rank_correlation = bool(track_rank_correlation)
+        self.reward_loss_weight = float(reward_loss_weight)
+        self.ranking_loss_weight = float(ranking_loss_weight)
+        self.ranking_loss_type = str(ranking_loss_type)
+        self.reward_temperature = float(reward_temperature)
+        if self.ranking_loss_type not in {"none", "pairwise", "listwise"}:
+            raise ValueError(
+                f"Unsupported ranking_loss_type={self.ranking_loss_type}. "
+                "Expected one of: none, pairwise, listwise."
+            )
+        if self.reward_temperature <= 0.0:
+            raise ValueError("reward_temperature must be > 0.")
 
     def _move_to_device(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         out = {}
@@ -159,7 +185,54 @@ class RLFrontierTrainer:
             kwargs["goal_batch"] = batch["goal_batch"]
         return kwargs
 
-    def compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    @staticmethod
+    def _build_padded_frontier_scores(
+        flat_scores: torch.Tensor,
+        frontier_ptr: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        padded = flat_scores.new_zeros(mask.shape, dtype=flat_scores.dtype)
+        for i in range(frontier_ptr.numel() - 1):
+            s = int(frontier_ptr[i].item())
+            e = int(frontier_ptr[i + 1].item())
+            n = int(e - s)
+            if n > 0:
+                padded[i, :n] = flat_scores[s:e]
+        return padded
+
+    @staticmethod
+    def _infer_frontier_mask(frontier_ptr: torch.Tensor) -> torch.Tensor:
+        batch_size = int(frontier_ptr.numel() - 1)
+        sizes = [
+            int(frontier_ptr[i + 1].item() - frontier_ptr[i].item())
+            for i in range(batch_size)
+        ]
+        max_n = max(sizes) if sizes else 0
+        mask = torch.zeros((batch_size, max_n), dtype=torch.bool, device=frontier_ptr.device)
+        for i, n in enumerate(sizes):
+            if n > 0:
+                mask[i, :n] = True
+        return mask
+
+    def _get_frontier_scores_rewards_mask(
+        self,
+        batch: Dict[str, torch.Tensor],
+        logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        frontier_ptr = batch["frontier_ptr"]
+        mask = batch.get("frontier_mask")
+        if mask is None:
+            mask = self._infer_frontier_mask(frontier_ptr)
+            rewards = self._build_padded_frontier_scores(batch["rewards"], frontier_ptr, mask)
+        else:
+            mask = mask.bool()
+            rewards = batch.get("padded_rewards")
+            if rewards is None:
+                rewards = self._build_padded_frontier_scores(batch["rewards"], frontier_ptr, mask)
+        pred_scores = self._build_padded_frontier_scores(logits, frontier_ptr, mask)
+        return pred_scores, rewards, mask
+
+    def compute_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         logits = self.model(**self._build_model_kwargs(batch))
         frontier_ptr = batch["frontier_ptr"]
         rewards = batch["rewards"]
@@ -172,7 +245,29 @@ class RLFrontierTrainer:
             frontier_rewards = rewards[s:e]
             terms.append((probs * frontier_rewards).sum())
         expected_reward = torch.stack(terms).mean()
-        return -expected_reward
+        reward_loss = -expected_reward
+
+        pred_scores, true_rewards, mask = self._get_frontier_scores_rewards_mask(batch, logits)
+        if self.ranking_loss_type == "pairwise":
+            rank_loss = pairwise_ranking_loss(pred_scores, true_rewards, mask)
+        elif self.ranking_loss_type == "listwise":
+            rank_loss = listwise_loss(
+                pred_scores, true_rewards, mask, self.reward_temperature
+            )
+        else:
+            rank_loss = reward_loss.new_tensor(0.0)
+
+        total_loss = (
+            self.reward_loss_weight * reward_loss
+            + self.ranking_loss_weight * rank_loss
+        )
+        return {
+            "total_loss": total_loss,
+            "reward_loss": reward_loss,
+            "ranking_loss": rank_loss,
+            "expected_reward": expected_reward,
+            "logits": logits,
+        }
 
     def train(
         self,
@@ -190,6 +285,9 @@ class RLFrontierTrainer:
         best_eval_epoch = -1
         history: Dict[str, List[float]] = {
             "train_reward": [],
+            "train_total_loss": [],
+            "train_reward_loss": [],
+            "train_ranking_loss": [],
             "eval_epochs": [],
             "eval_reward": [],
             "eval_reward_std": [],
@@ -204,6 +302,12 @@ class RLFrontierTrainer:
             "eval_oracle_distance_std": [],
             "eval_reward_top1_accuracy": [],
             "eval_reward_rank_correlation": [],
+            "eval_reward_kl": [],
+            "eval_reward_js": [],
+            "eval_reward_js_normalized": [],
+            "eval_reward_mae": [],
+            "eval_reward_rmse": [],
+            "eval_score_std_within_frontier": [],
         }
         eval_snapshots: List[Dict[str, object]] = []
 
@@ -211,20 +315,33 @@ class RLFrontierTrainer:
         for epoch in epoch_pbar:
             self.model.train()
             total_train_reward = 0.0
+            total_train_total_loss = 0.0
+            total_train_reward_loss = 0.0
+            total_train_ranking_loss = 0.0
             batches = 0
 
             for raw_batch in train_loader:
                 batch = self._move_to_device(raw_batch)
                 self.optimizer.zero_grad()
-                loss = self.compute_loss(batch)
+                loss_terms = self.compute_loss(batch)
+                loss = loss_terms["total_loss"]
                 loss.backward()
                 self.optimizer.step()
 
-                total_train_reward += -float(loss.detach().item())
+                total_train_reward += float(loss_terms["expected_reward"].detach().item())
+                total_train_total_loss += float(loss_terms["total_loss"].detach().item())
+                total_train_reward_loss += float(loss_terms["reward_loss"].detach().item())
+                total_train_ranking_loss += float(loss_terms["ranking_loss"].detach().item())
                 batches += 1
 
             mean_train_reward = total_train_reward / max(1, batches)
+            mean_train_total_loss = total_train_total_loss / max(1, batches)
+            mean_train_reward_loss = total_train_reward_loss / max(1, batches)
+            mean_train_ranking_loss = total_train_ranking_loss / max(1, batches)
             history["train_reward"].append(mean_train_reward)
+            history["train_total_loss"].append(mean_train_total_loss)
+            history["train_reward_loss"].append(mean_train_reward_loss)
+            history["train_ranking_loss"].append(mean_train_ranking_loss)
 
             if (epoch + 1) % eval_every == 0:
                 metrics = self.evaluate(eval_loader)
@@ -250,6 +367,16 @@ class RLFrontierTrainer:
                 history["eval_reward_top1_accuracy"].append(metrics["reward_top1_accuracy"])
                 history["eval_reward_rank_correlation"].append(
                     metrics["reward_rank_correlation"]
+                )
+                history["eval_reward_kl"].append(metrics["eval_reward_kl"])
+                history["eval_reward_js"].append(metrics["eval_reward_js"])
+                history["eval_reward_js_normalized"].append(
+                    metrics["eval_reward_js_normalized"]
+                )
+                history["eval_reward_mae"].append(metrics["eval_reward_mae"])
+                history["eval_reward_rmse"].append(metrics["eval_reward_rmse"])
+                history["eval_score_std_within_frontier"].append(
+                    metrics["eval_score_std_within_frontier"]
                 )
 
                 eval_snapshots.append(
@@ -296,6 +423,17 @@ class RLFrontierTrainer:
                         "reward_rank_correlations": metrics["reward_rank_correlations"],
                         "reward_top1_accuracy": metrics["reward_top1_accuracy"],
                         "reward_rank_correlation": metrics["reward_rank_correlation"],
+                        "reward_kl": metrics["eval_reward_kl"],
+                        "reward_js": metrics["eval_reward_js"],
+                        "reward_js_normalized": metrics["eval_reward_js_normalized"],
+                        "reward_mae": metrics["eval_reward_mae"],
+                        "reward_rmse": metrics["eval_reward_rmse"],
+                        "score_std_within_frontier": metrics[
+                            "eval_score_std_within_frontier"
+                        ],
+                        "failure_metrics_applicable": metrics[
+                            "failure_metrics_applicable"
+                        ],
                     }
                 )
 
@@ -308,13 +446,17 @@ class RLFrontierTrainer:
                     )
                 epoch_pbar.set_postfix(
                     train_reward=f"{mean_train_reward:.4f}",
+                    train_loss=f"{mean_train_total_loss:.4f}",
                     eval_reward=f"{metrics['mean_reward']:.4f}",
                     regret=f"{metrics['regret_mean']:.4f}",
                     oracle_accuracy=f"{metrics['oracle_accuracy']:.4f}",
                     reward_top1=f"{metrics['reward_top1_accuracy']:.4f}",
                 )
             else:
-                epoch_pbar.set_postfix(train_reward=f"{mean_train_reward:.4f}")
+                epoch_pbar.set_postfix(
+                    train_reward=f"{mean_train_reward:.4f}",
+                    train_loss=f"{mean_train_total_loss:.4f}",
+                )
 
         self._save_history_and_plots(
             history=history,
@@ -349,6 +491,12 @@ class RLFrontierTrainer:
         frontier_has_failure: List[int] = []
         frontier_has_safe: List[int] = []
         failure_avoided_when_possible: List[int] = []
+        reward_kl_values: List[float] = []
+        reward_js_values: List[float] = []
+        reward_js_norm_values: List[float] = []
+        reward_abs_errors: List[float] = []
+        reward_sq_errors: List[float] = []
+        score_std_values: List[float] = []
 
         error_details: List[Dict[str, object]] = []
         all_details: List[Dict[str, object]] = []
@@ -364,6 +512,32 @@ class RLFrontierTrainer:
                 distances = batch["distances"]
                 action_map = batch["action_map"]
                 oracle_index_global = batch["oracle_index"]
+                pred_scores_2d, true_rewards_2d, frontier_mask_2d = (
+                    self._get_frontier_scores_rewards_mask(batch, logits)
+                )
+                p_true = masked_softmax(
+                    true_rewards_2d, frontier_mask_2d, self.reward_temperature
+                )
+                p_pred = masked_softmax(
+                    pred_scores_2d, frontier_mask_2d, self.reward_temperature
+                )
+
+                # Single-candidate frontiers map to one-point distributions [1.0], so KL/JS are 0.
+                batch_reward_kl = kl_divergence(p_true, p_pred, frontier_mask_2d)
+                batch_reward_js = js_divergence(p_true, p_pred, frontier_mask_2d)
+                batch_reward_js_norm = js_normalized(p_true, p_pred, frontier_mask_2d)
+                reward_kl_values.extend([float(x) for x in batch_reward_kl.detach().cpu().tolist()])
+                reward_js_values.extend([float(x) for x in batch_reward_js.detach().cpu().tolist()])
+                reward_js_norm_values.extend(
+                    [float(x) for x in batch_reward_js_norm.detach().cpu().tolist()]
+                )
+                _ = masked_mae(pred_scores_2d, true_rewards_2d, frontier_mask_2d)
+                _ = masked_rmse(pred_scores_2d, true_rewards_2d, frontier_mask_2d)
+                valid_abs = (pred_scores_2d - true_rewards_2d).abs()[frontier_mask_2d]
+                valid_sq = ((pred_scores_2d - true_rewards_2d) ** 2)[frontier_mask_2d]
+                reward_abs_errors.extend([float(x) for x in valid_abs.detach().cpu().tolist()])
+                reward_sq_errors.extend([float(x) for x in valid_sq.detach().cpu().tolist()])
+                _ = score_std_within_frontier(pred_scores_2d, frontier_mask_2d)
 
                 for i in range(frontier_ptr.numel() - 1):
                     s = int(frontier_ptr[i].item())
@@ -477,6 +651,10 @@ class RLFrontierTrainer:
                     chosen_actions.append(chosen_action)
                     oracle_actions.append(oracle_action)
                     frontier_sizes.append(frontier_size)
+                    if frontier_size > 1:
+                        score_std_values.append(
+                            float(frontier_logits.std(unbiased=False).item())
+                        )
                     chosen_is_failure.append(is_chosen_failure)
                     oracle_is_failure.append(is_oracle_failure)
                     frontier_has_failure.append(has_failure)
@@ -535,6 +713,13 @@ class RLFrontierTrainer:
                 "reward_rank_correlations": [],
                 "reward_top1_accuracy": 0.0,
                 "reward_rank_correlation": 0.0,
+                "eval_reward_kl": 0.0,
+                "eval_reward_js": 0.0,
+                "eval_reward_js_normalized": 0.0,
+                "eval_reward_mae": 0.0,
+                "eval_reward_rmse": 0.0,
+                "eval_score_std_within_frontier": 0.0,
+                "failure_metrics_applicable": False,
                 "details": [],
                 "errors": [],
             }
@@ -570,6 +755,22 @@ class RLFrontierTrainer:
             if n_failure_avoidance_applicable > 0
             else 0.0
         )
+        failure_metrics_applicable = n_failure_frontiers > 0
+        eval_reward_mae = (
+            float(sum(reward_abs_errors) / len(reward_abs_errors))
+            if reward_abs_errors
+            else 0.0
+        )
+        eval_reward_rmse = (
+            float((sum(reward_sq_errors) / len(reward_sq_errors)) ** 0.5)
+            if reward_sq_errors
+            else 0.0
+        )
+        eval_score_std_within_frontier = (
+            float(sum(score_std_values) / len(score_std_values))
+            if score_std_values
+            else 0.0
+        )
 
         metrics: Dict[str, object] = {
             "mean_reward": float(reward_t.mean().item()),
@@ -578,7 +779,9 @@ class RLFrontierTrainer:
             "std_chosen_distance": float(chosen_dist_t.std(unbiased=False).item()),
             "mean_oracle_distance": float(oracle_dist_t.mean().item()),
             "std_oracle_distance": float(oracle_dist_t.std(unbiased=False).item()),
+            # Oracle accuracy is exact-match: chosen candidate index equals oracle-best index.
             "regret": float(regret_t.mean().item()),
+            # Mean regret is the average chosen-vs-oracle distance gap in this pipeline.
             "regret_mean": float(regret_t.mean().item()),
             "regret_std": float(regret_t.std(unbiased=False).item()),
             "oracle_accuracy": float(oracle_match_t.mean().item()),
@@ -598,6 +801,7 @@ class RLFrontierTrainer:
             "n_failure_avoidance_applicable": n_failure_avoidance_applicable,
             "n_failure_avoidance_success": n_failure_avoidance_success,
             "failure_avoidance_accuracy": failure_avoidance_accuracy,
+            "failure_metrics_applicable": failure_metrics_applicable,
             "n_only_failure_frontiers": n_only_failure_frontiers,
             "chosen_rewards": chosen_rewards,
             "chosen_distances": chosen_distances,
@@ -620,6 +824,12 @@ class RLFrontierTrainer:
             "reward_rank_correlations": reward_rank_correlations,
             "reward_top1_accuracy": float(reward_top1_t.mean().item()),
             "reward_rank_correlation": self._safe_mean(reward_rank_correlations),
+            "eval_reward_kl": self._safe_mean(reward_kl_values),
+            "eval_reward_js": self._safe_mean(reward_js_values),
+            "eval_reward_js_normalized": self._safe_mean(reward_js_norm_values),
+            "eval_reward_mae": eval_reward_mae,
+            "eval_reward_rmse": eval_reward_rmse,
+            "eval_score_std_within_frontier": eval_score_std_within_frontier,
             "details": all_details,
             "errors": error_details,
         }
@@ -632,14 +842,23 @@ class RLFrontierTrainer:
             print(f"oracle accuracy     : {metrics['oracle_accuracy']:.4f} (exact match with best candidate)")
             print(f"reward top1 acc     : {metrics['reward_top1_accuracy']:.4f} (argmax(logits) vs argmax(reward))")
             print(f"reward rank corr    : {metrics['reward_rank_correlation']:.4f} (Spearman across candidates)")
+            print(f"reward KL           : {metrics['eval_reward_kl']:.4f} (p_true || p_pred)")
+            print(f"reward JS           : {metrics['eval_reward_js']:.4f}")
+            print(f"reward JS norm      : {metrics['eval_reward_js_normalized']:.4f} (0..1)")
+            print(f"reward MAE          : {metrics['eval_reward_mae']:.4f}")
+            print(f"reward RMSE         : {metrics['eval_reward_rmse']:.4f}")
+            print(f"score std/frontier  : {metrics['eval_score_std_within_frontier']:.4f}")
             print(f"failure choices     : {metrics['n_failure_choices']}/{metrics['n_frontiers']} ({100.0 * metrics['failure_choice_rate']:.2f}%)")
             print(f"failure frontiers   : {metrics['n_failure_frontiers']}/{metrics['n_frontiers']} ({100.0 * metrics['failure_frontier_rate']:.2f}%)")
+            if not metrics["failure_metrics_applicable"]:
+                print("failure metrics     : not informative for this split (no failure frontiers)")
             print(f"failure avoidance   : {metrics['failure_avoidance_accuracy']:.4f} on {metrics['n_failure_avoidance_applicable']} applicable frontiers")
             print(f"only-failure fronts : {metrics['n_only_failure_frontiers']} (not counted against failure avoidance)")
             print(f"mean reward         : {metrics['mean_reward']:.4f} ± {metrics['std_reward']:.4f} (expected policy reward)")
             print(f"chosen distance     : {metrics['mean_chosen_distance']:.4f} ± {metrics['std_chosen_distance']:.4f} (distance of selected candidate)")
             print(f"oracle distance     : {metrics['mean_oracle_distance']:.4f} ± {metrics['std_oracle_distance']:.4f} (best achievable distance)")
             print(f"regret              : {metrics['regret']:.4f} ± {metrics['regret_std']:.4f} (distance gap to optimal)")
+            print("note                : oracle accuracy (exact match) and regret (magnitude gap) can disagree")
             if error_details:
                 print("\nFirst errors:")
                 for k, err in enumerate(error_details[:max_print_errors]):
@@ -1024,12 +1243,19 @@ class RLFrontierTrainer:
             "final_n_failure_frontiers": final.get("n_failure_frontiers", 0),
             "final_n_failure_avoidance_applicable": final.get("n_failure_avoidance_applicable", 0),
             "final_n_only_failure_frontiers": final.get("n_only_failure_frontiers", 0),
+            "failure_metrics_applicable": bool(final.get("failure_metrics_applicable", False)),
             "final_chosen_distance": final.get("mean_chosen_distance", 0.0),
             "final_chosen_distance_std": final.get("std_chosen_distance", 0.0),
             "final_oracle_distance": final.get("mean_oracle_distance", 0.0),
             "final_oracle_distance_std": final.get("std_oracle_distance", 0.0),
             "final_reward_top1_accuracy": final.get("reward_top1_accuracy", 0.0),
             "final_reward_rank_correlation": final.get("reward_rank_correlation", 0.0),
+            "final_reward_kl": final.get("reward_kl", 0.0),
+            "final_reward_js": final.get("reward_js", 0.0),
+            "final_reward_js_normalized": final.get("reward_js_normalized", 0.0),
+            "final_reward_mae": final.get("reward_mae", 0.0),
+            "final_reward_rmse": final.get("reward_rmse", 0.0),
+            "final_score_std_within_frontier": final.get("score_std_within_frontier", 0.0),
             "num_train_frontiers": len(train_sizes),
             "num_eval_frontiers": len(eval_sizes),
             "mean_train_frontier_size": self._safe_mean(train_sizes),
@@ -1120,6 +1346,33 @@ class RLFrontierTrainer:
             xlabel="Epoch",
             ylabel="Reward Rank Correlation",
             label="Reward Rank Correlation",
+        )
+        self._plot_curve_with_band(
+            output_dir / "eval_reward_js_normalized.png",
+            x=eval_x,
+            y=history["eval_reward_js_normalized"],
+            y_std=None,
+            xlabel="Epoch",
+            ylabel="Normalized JS",
+            label="Eval Reward JS (Normalized)",
+        )
+        self._plot_curve_with_band(
+            output_dir / "eval_reward_kl.png",
+            x=eval_x,
+            y=history["eval_reward_kl"],
+            y_std=None,
+            xlabel="Epoch",
+            ylabel="KL Divergence",
+            label="Eval Reward KL",
+        )
+        self._plot_curve_with_band(
+            output_dir / "eval_score_std_within_frontier.png",
+            x=eval_x,
+            y=history["eval_score_std_within_frontier"],
+            y_std=None,
+            xlabel="Epoch",
+            ylabel="Score Std Within Frontier",
+            label="Eval Score Std Within Frontier",
         )
 
         plt.figure(figsize=(6, 4), dpi=300)

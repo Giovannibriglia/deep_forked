@@ -102,6 +102,14 @@ def parse_args():
         help="Track reward rank correlation (Spearman) between logits and rewards during evaluation.",
     )
     parser.add_argument("--reward-formulation", type=str, default="negative_distance")
+    parser.add_argument("--reward-loss-weight", type=float, default=1.0)
+    parser.add_argument("--ranking-loss-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--ranking-loss-type",
+        choices=["none", "pairwise", "listwise"],
+        default="none",
+    )
+    parser.add_argument("--reward-temperature", type=float, default=0.5)
 
     parser.add_argument("--build-data", type=str2bool, default=True)
     parser.add_argument("--train", type=str2bool, default=True)
@@ -186,6 +194,10 @@ def main(args):
         m_failed_state=float(args.m_failed_state),
         kind_of_data=args.kind_of_data,
         track_rank_correlation=args.track_rank_correlation,
+        reward_loss_weight=args.reward_loss_weight,
+        ranking_loss_weight=args.ranking_loss_weight,
+        ranking_loss_type=args.ranking_loss_type,
+        reward_temperature=args.reward_temperature,
     )
 
     _, model_root = _paths(args)
@@ -225,7 +237,16 @@ def main(args):
                     "failure_choice_rate": metrics["failure_choice_rate"],
                     "n_failure_frontiers": metrics["n_failure_frontiers"],
                     "failure_frontier_rate": metrics["failure_frontier_rate"],
+                    "failure_metrics_applicable": metrics["failure_metrics_applicable"],
                     "failure_avoidance_accuracy": metrics["failure_avoidance_accuracy"],
+                    "eval_reward_kl": metrics["eval_reward_kl"],
+                    "eval_reward_js": metrics["eval_reward_js"],
+                    "eval_reward_js_normalized": metrics["eval_reward_js_normalized"],
+                    "eval_reward_mae": metrics["eval_reward_mae"],
+                    "eval_reward_rmse": metrics["eval_reward_rmse"],
+                    "eval_score_std_within_frontier": metrics[
+                        "eval_score_std_within_frontier"
+                    ],
                     "errors": metrics["errors"],
                 },
                 fh,

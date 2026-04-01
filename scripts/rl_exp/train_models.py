@@ -59,7 +59,7 @@ def run_training(
     ]
     if no_goal:
         cmd.extend(["--kind-of-data", "separated"])
-
+    print(" ".join(cmd))
     process = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
     )
