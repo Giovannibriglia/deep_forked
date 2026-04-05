@@ -10,6 +10,16 @@ import torch
 from torch_geometric.data import Data
 from torch_geometric.utils import from_networkx
 
+DATASET_TYPE_HASHED = "HASHED"
+DATASET_TYPE_MAPPED = "MAPPED"
+DATASET_TYPE_BITMASK = "BITMASK"
+VALID_DATASET_TYPES = {
+    DATASET_TYPE_HASHED,
+    DATASET_TYPE_MAPPED,
+    DATASET_TYPE_BITMASK,
+}
+TWO_48_MINUS_1 = float(2**48 - 1)
+
 
 @dataclass
 class CombinedFrontierGraph:
@@ -28,7 +38,32 @@ def _load_dot(path: Path) -> nx.DiGraph:
     return nx.nx_pydot.from_pydot(dot)
 
 
-def _nx_to_pyg(G: nx.DiGraph, bitmask: bool = False) -> Data:
+def _normalize_dataset_type(
+    dataset_type: Optional[str] = None,
+    bitmask: Optional[bool] = None,
+) -> str:
+    if dataset_type is not None:
+        dt = str(dataset_type).upper()
+        if dt not in VALID_DATASET_TYPES:
+            raise ValueError(
+                f"Unsupported dataset_type '{dataset_type}'. "
+                f"Expected one of {sorted(VALID_DATASET_TYPES)}."
+            )
+        return dt
+    if bool(bitmask):
+        return DATASET_TYPE_BITMASK
+    return DATASET_TYPE_HASHED
+
+
+def _parse_numeric_node_label(node_obj: object) -> float:
+    if isinstance(node_obj, (int, float)):
+        return float(node_obj)
+    if isinstance(node_obj, str):
+        return float(node_obj.strip())
+    raise TypeError(f"Unsupported node label type: {type(node_obj)}")
+
+
+def _nx_to_pyg(G: nx.DiGraph, dataset_type: str) -> Data:
     for _, data in G.nodes(data=True):
         data["shape"] = {"circle": 0, "doublecircle": 1}.get(
             data.get("shape", "circle"), 0
@@ -38,9 +73,9 @@ def _nx_to_pyg(G: nx.DiGraph, bitmask: bool = False) -> Data:
 
     data = from_networkx(G)
     data.edge_index = data.edge_index.long()
-    data.edge_attr = data.edge_label.view(-1, 1).float()
+    data.edge_attr = data.edge_label.view(-1, 1).to(torch.int64)
 
-    if bitmask:
+    if dataset_type == DATASET_TYPE_BITMASK:
         nodes = list(G.nodes())
 
         def _to_bits(node_obj: object, bit_len: int | None) -> list[int]:
@@ -74,21 +109,30 @@ def _nx_to_pyg(G: nx.DiGraph, bitmask: bool = False) -> Data:
         rows = [_to_bits(n, bit_len) for n in nodes]
         data.node_bits = torch.tensor(rows, dtype=torch.bool)
         data.node_names = data.node_bits.to(torch.float32)
-    else:
-        raw_ids = [int(n) for n in G.nodes()]
-        data.node_names = torch.tensor(raw_ids, dtype=torch.float32)
-
-    return data
-
-
-def load_pyg_graph(path: str, bitmask: bool = False) -> Data:
-    g = _load_dot(Path(path))
-    data = _nx_to_pyg(g, bitmask=bitmask)
-    if bitmask:
         data.node_features = data.node_bits.to(torch.float32)
     else:
-        data.node_features = data.node_names.view(-1, 1).to(torch.float32)
+        raw_ids = [_parse_numeric_node_label(n) for n in G.nodes()]
+        data.node_names = torch.tensor(raw_ids, dtype=torch.float32)
+        if dataset_type == DATASET_TYPE_HASHED:
+            # Keep raw IDs; HASHED normalization is handled in-model.
+            node_feats = data.node_names
+        elif dataset_type == DATASET_TYPE_MAPPED:
+            node_feats = data.node_names
+        else:
+            raise ValueError(f"Unsupported dataset_type: {dataset_type}")
+        data.node_features = node_feats.view(-1, 1).to(torch.float32)
+
     return data
+
+
+def load_pyg_graph(
+    path: str,
+    dataset_type: Optional[str] = None,
+    bitmask: Optional[bool] = None,
+) -> Data:
+    ds_type = _normalize_dataset_type(dataset_type=dataset_type, bitmask=bitmask)
+    g = _load_dot(Path(path))
+    return _nx_to_pyg(g, dataset_type=ds_type)
 
 
 def _compose_disconnected(
@@ -110,7 +154,7 @@ def _compose_disconnected(
 
         if graph.edge_index.numel() > 0:
             edge_index_parts.append(graph.edge_index + node_offset)
-            edge_attr_parts.append(graph.edge_attr.to(torch.float32))
+            edge_attr_parts.append(graph.edge_attr.to(torch.int64))
 
         node_offset += n_nodes
 
@@ -127,7 +171,7 @@ def _compose_disconnected(
     edge_attr = (
         torch.cat(edge_attr_parts, dim=0)
         if edge_attr_parts
-        else torch.zeros((0, 1), dtype=torch.float32)
+        else torch.zeros((0, 1), dtype=torch.int64)
     )
     return {
         "node_features": node_features,
@@ -147,9 +191,9 @@ def _node_keys(graph: Data) -> List[Tuple[float, ...]]:
     return [tuple(float(x.item()) for x in row) for row in names]
 
 
-def _edge_attr_tuple(edge_attr: torch.Tensor, idx: int) -> Tuple[float, ...]:
+def _edge_attr_tuple(edge_attr: torch.Tensor, idx: int) -> Tuple[int, ...]:
     row = edge_attr[idx].detach().cpu().view(-1)
-    return tuple(float(v.item()) for v in row)
+    return tuple(int(v.item()) for v in row)
 
 
 def _compose_merged_shared_goal(graphs: List[Data]) -> Dict[str, torch.Tensor]:
@@ -195,7 +239,7 @@ def _compose_merged_shared_goal(graphs: List[Data]) -> Dict[str, torch.Tensor]:
                 continue
             edge_seen.add(edge_key)
             edge_rows.append([src, dst])
-            edge_attr_rows.append(graph.edge_attr[e_idx].detach().clone().to(torch.float32))
+            edge_attr_rows.append(graph.edge_attr[e_idx].detach().clone().to(torch.int64))
 
     if not node_features_rows:
         raise ValueError("Cannot compose an empty list of graphs.")
@@ -207,7 +251,7 @@ def _compose_merged_shared_goal(graphs: List[Data]) -> Dict[str, torch.Tensor]:
         edge_attr = torch.stack(edge_attr_rows, dim=0)
     else:
         edge_index = torch.zeros((2, 0), dtype=torch.long)
-        edge_attr = torch.zeros((0, 1), dtype=torch.float32)
+        edge_attr = torch.zeros((0, 1), dtype=torch.int64)
 
     return {
         "node_features": node_features,

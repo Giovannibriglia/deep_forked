@@ -1,28 +1,50 @@
 from __future__ import annotations
 
 import csv
-import math
 import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from src.graph_utils import combine_graphs, load_pyg_graph
+from src.graph_utils import VALID_DATASET_TYPES, combine_graphs, load_pyg_graph
 
+CSV_FILE_PATH = "File Path"
+CSV_DEPTH = "Depth"
+CSV_DISTANCE = "Distance From Goal"
+CSV_GOAL = "Goal"
+CSV_PREDECESSOR = "File Path Predecessor"
 
-CSV_COLUMNS = [
-    "File Path",
-    "Depth",
-    "Distance From Goal",
-    "Goal",
-    "File Path Predecessor",
-    "Action",
+CSV_REQUIRED_BASE = [
+    CSV_FILE_PATH,
+    CSV_DEPTH,
+    CSV_DISTANCE,
+    CSV_PREDECESSOR,
 ]
+
+RANDOM_EVAL_FRONTIER_SIZES = [
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    15,
+    20,
+    25,
+    30,
+    40,
+    50,
+]
+
+FAILURE_EPS = 1e-9
 
 
 @dataclass
@@ -30,9 +52,8 @@ class FrontierRow:
     successor_path: str
     depth: int
     distance: float
-    goal_path: str
     predecessor_path: str
-    action: str
+    goal_path: str
 
 
 def _safe_int(v: str, default: int = 0) -> int:
@@ -49,59 +70,156 @@ def _safe_float(v: str, default: float = 0.0) -> float:
         return default
 
 
-def _is_failure_candidate(distance: float, m_failed_state: float) -> bool:
-    return math.isclose(float(distance), float(m_failed_state), rel_tol=0.0, abs_tol=1e-9)
+def _is_failure_reward(reward: float, failure_reward_value: float) -> bool:
+    return float(reward) <= float(failure_reward_value) + FAILURE_EPS
 
 
-def _to_action_id(action_value: str, fallback: int) -> int:
-    try:
-        return int(action_value)
-    except (TypeError, ValueError):
-        return fallback
+def normalize_distance_to_reward(
+    distance: float,
+    m_failed_state: Optional[float] = None,
+    max_regular_distance: float = 50.0,
+    failure_reward_value: float = -1.0,
+) -> float:
+    # m_failed_state is intentionally ignored. Reward/failure now depends only on
+    # max_regular_distance as requested by the user.
+    _ = m_failed_state
+    max_dist = max(1e-9, float(max_regular_distance))
+    dist = max(0.0, float(distance))
+    if dist > max_dist:
+        return float(failure_reward_value)
+    return -0.7 * (dist / max_dist)
 
 
-def read_frontier_csv(csv_path: Path) -> List[FrontierRow]:
+def refresh_frontier_sample_targets(
+    samples: Sequence[Dict[str, Any]],
+    m_failed_state: float,
+    max_regular_distance_for_reward: float,
+    failure_reward_value: float = -1.0,
+) -> None:
+    # m_failed_state is kept only for API compatibility.
+    _ = m_failed_state
+    for sample in samples:
+        distances = sample.get("distance_raw", sample.get("distances"))
+        if distances is None:
+            continue
+
+        if isinstance(distances, torch.Tensor):
+            distances_t = distances.to(torch.float32).view(-1)
+        else:
+            distances_t = torch.tensor(distances, dtype=torch.float32).view(-1)
+        if distances_t.numel() == 0:
+            continue
+
+        reward_targets = torch.tensor(
+            [
+                normalize_distance_to_reward(
+                    distance=float(d),
+                    max_regular_distance=float(max_regular_distance_for_reward),
+                    failure_reward_value=float(failure_reward_value),
+                )
+                for d in distances_t.tolist()
+            ],
+            dtype=torch.float32,
+        )
+        is_failure = torch.tensor(
+            [
+                _is_failure_reward(float(r), float(failure_reward_value))
+                for r in reward_targets.tolist()
+            ],
+            dtype=torch.bool,
+        )
+        best_idx = int(torch.argmax(reward_targets).item())
+
+        sample["distance_raw"] = distances_t.clone()
+        sample["distances"] = distances_t.clone()
+        sample["reward_target"] = reward_targets
+        sample["rewards"] = reward_targets.clone()
+        sample["is_failure"] = is_failure
+        sample["oracle_index"] = torch.tensor(best_idx, dtype=torch.long)
+        sample["oracle_reward"] = reward_targets[best_idx].clone()
+        sample["frontier_has_failure"] = bool(is_failure.any().item())
+
+
+def read_frontier_csv(csv_path: Path, kind_of_data: str) -> List[FrontierRow]:
     rows: List[FrontierRow] = []
     with csv_path.open("r", encoding="utf-8", newline="") as fh:
         reader = csv.DictReader(fh)
-        missing = [c for c in CSV_COLUMNS if c not in (reader.fieldnames or [])]
+        fieldnames = reader.fieldnames or []
+        missing = [c for c in CSV_REQUIRED_BASE if c not in fieldnames]
+        if kind_of_data == "separated" and CSV_GOAL not in fieldnames:
+            missing.append(CSV_GOAL)
         if missing:
             raise ValueError(f"{csv_path}: missing CSV columns {missing}")
+
         for record in reader:
+            goal_value = str(record.get(CSV_GOAL, "") or "").strip()
+            if kind_of_data == "merged":
+                goal_value = ""
             rows.append(
                 FrontierRow(
-                    successor_path=record["File Path"],
-                    depth=_safe_int(record["Depth"]),
-                    distance=_safe_float(record["Distance From Goal"]),
-                    goal_path=record["Goal"],
-                    predecessor_path=record["File Path Predecessor"],
-                    action=record["Action"],
+                    successor_path=str(record[CSV_FILE_PATH]).strip(),
+                    depth=_safe_int(record[CSV_DEPTH]),
+                    distance=_safe_float(record[CSV_DISTANCE]),
+                    predecessor_path=str(record[CSV_PREDECESSOR]).strip(),
+                    goal_path=goal_value,
                 )
             )
     return rows
 
 
-def group_frontiers(rows: Sequence[FrontierRow]) -> List[Dict[str, Any]]:
+def group_clean_frontiers(
+    rows: Sequence[FrontierRow],
+    kind_of_data: str,
+    max_regular_distance_for_reward: float,
+    failure_reward_value: float = -1.0,
+) -> List[Dict[str, Any]]:
     grouped: Dict[str, List[FrontierRow]] = {}
     for row in rows:
         grouped.setdefault(row.predecessor_path, []).append(row)
 
-    samples: List[Dict[str, Any]] = []
+    cleaned: List[Dict[str, Any]] = []
     for predecessor, group_rows in grouped.items():
-        if not group_rows:
+        if len(group_rows) <= 1:
+            # Remove frontier with a single candidate.
             continue
-        goal_path = group_rows[0].goal_path
-        samples.append(
+
+        successor_paths = [str(r.successor_path) for r in group_rows]
+        distances = [float(r.distance) for r in group_rows]
+        depths = [int(r.depth) for r in group_rows]
+        rewards = [
+            normalize_distance_to_reward(
+                distance=float(d),
+                max_regular_distance=float(max_regular_distance_for_reward),
+                failure_reward_value=float(failure_reward_value),
+            )
+            for d in distances
+        ]
+
+        # Remove frontier where all rewards are failures.
+        if all(_is_failure_reward(r, failure_reward_value) for r in rewards):
+            continue
+
+        goal_path = ""
+        if kind_of_data == "separated":
+            goal_values = [r.goal_path for r in group_rows if r.goal_path]
+            if not goal_values:
+                continue
+            goal_path = goal_values[0]
+            # Skip ambiguous frontier-goal mappings.
+            if any(g != goal_path for g in goal_values):
+                continue
+
+        cleaned.append(
             {
                 "predecessor_path": predecessor,
                 "goal_path": goal_path,
-                "successor_paths": [r.successor_path for r in group_rows],
-                "distances": [float(r.distance) for r in group_rows],
-                "depths": [int(r.depth) for r in group_rows],
-                "actions": [r.action for r in group_rows],
+                "successor_paths": successor_paths,
+                "distances": distances,
+                "depths": depths,
+                "rewards": rewards,
             }
         )
-    return samples
+    return cleaned
 
 
 def split_frontiers(
@@ -109,122 +227,161 @@ def split_frontiers(
     test_size: float = 0.2,
     seed: int = 42,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    samples = list(samples)
     if len(samples) <= 1:
-        return list(samples), []
+        return samples, []
+
     rng = random.Random(seed)
-    idx = list(range(len(samples)))
-    rng.shuffle(idx)
-    n_eval = max(1, int(round(len(samples) * test_size)))
-    eval_idx = set(idx[:n_eval])
-    train_samples = [samples[i] for i in range(len(samples)) if i not in eval_idx]
-    eval_samples = [samples[i] for i in range(len(samples)) if i in eval_idx]
-    return train_samples, eval_samples
+    indices = list(range(len(samples)))
+    rng.shuffle(indices)
+    n_eval = int(round(len(samples) * float(test_size)))
+    n_eval = min(max(1, n_eval), len(samples) - 1)
+    eval_set = set(indices[:n_eval])
+    train = [samples[i] for i in range(len(samples)) if i not in eval_set]
+    eval_ = [samples[i] for i in range(len(samples)) if i in eval_set]
+    return train, eval_
 
 
-def _sample_failure_frontier_indices(
-    samples: Sequence[Dict[str, Any]],
-    test_size: float,
+def _flatten_candidates(frontiers: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    for frontier in frontiers:
+        goal_path = str(frontier.get("goal_path", ""))
+        paths = [str(x) for x in frontier.get("successor_paths", [])]
+        distances = [float(x) for x in frontier.get("distances", [])]
+        depths = [int(x) for x in frontier.get("depths", [])]
+        rewards = [float(x) for x in frontier.get("rewards", [])]
+        n = min(len(paths), len(distances), len(depths), len(rewards))
+        for i in range(n):
+            candidates.append(
+                {
+                    "successor_path": paths[i],
+                    "distance": distances[i],
+                    "depth": depths[i],
+                    "reward": rewards[i],
+                    "goal_path": goal_path,
+                }
+            )
+    return candidates
+
+
+def _deduplicate_candidates(
+    candidates: Sequence[Dict[str, Any]],
+    kind_of_data: str,
+) -> List[Dict[str, Any]]:
+    best_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for cand in candidates:
+        goal = str(cand.get("goal_path", "")) if kind_of_data == "separated" else ""
+        path = str(cand["successor_path"])
+        key = (goal, path)
+        current = best_by_key.get(key)
+        if current is None or float(cand["reward"]) > float(current["reward"]):
+            best_by_key[key] = dict(cand)
+    return list(best_by_key.values())
+
+
+def build_random_eval2_frontiers_for_dataset(
+    clean_frontiers: Sequence[Dict[str, Any]],
+    kind_of_data: str,
+    max_random_eval_frontiers_for_dataset: int,
     seed: int,
-    m_failed_state: float,
-    max_percentage_of_failure_states: float,
-    max_percentage_of_failure_states_test: float,
-) -> Tuple[List[int], List[int], Dict[str, Any]]:
+    dataset_tag: str,
+    failure_reward_value: float = -1.0,
+) -> List[Dict[str, Any]]:
+    target = max(0, int(max_random_eval_frontiers_for_dataset))
+    if target == 0:
+        return []
+
     rng = random.Random(seed)
-    max_percentage_of_failure_states = min(
-        1.0, max(0.0, float(max_percentage_of_failure_states))
+    candidates = _deduplicate_candidates(
+        _flatten_candidates(clean_frontiers),
+        kind_of_data=kind_of_data,
     )
-    max_percentage_of_failure_states_test = min(
-        1.0, max(0.0, float(max_percentage_of_failure_states_test))
-    )
+    if not candidates:
+        return []
 
-    failure_indices: List[int] = []
-    non_failure_indices: List[int] = []
-    for idx, sample in enumerate(samples):
-        distances = [float(d) for d in sample.get("distances", [])]
-        has_failure = any(_is_failure_candidate(d, m_failed_state) for d in distances)
-        if has_failure:
-            failure_indices.append(idx)
-        else:
-            non_failure_indices.append(idx)
-
-    # Keep non-failure splitting unchanged ("as usual"), with deterministic seed.
-    if len(non_failure_indices) <= 1:
-        train_non_failure_indices = list(non_failure_indices)
-        eval_non_failure_indices = []
+    pools_by_goal: Dict[str, List[Dict[str, Any]]] = {}
+    if kind_of_data == "separated":
+        for cand in candidates:
+            goal = str(cand.get("goal_path", ""))
+            if not goal:
+                continue
+            pools_by_goal.setdefault(goal, []).append(cand)
+        if not pools_by_goal:
+            return []
     else:
-        non_failure_shuffled = list(non_failure_indices)
-        rng.shuffle(non_failure_shuffled)
-        n_eval_non_failure = max(1, int(round(len(non_failure_shuffled) * test_size)))
-        eval_non_failure_set = set(non_failure_shuffled[:n_eval_non_failure])
-        train_non_failure_indices = [
-            i for i in non_failure_indices if i not in eval_non_failure_set
-        ]
-        eval_non_failure_indices = [i for i in non_failure_indices if i in eval_non_failure_set]
+        pools_by_goal[""] = candidates
 
-    rng.shuffle(failure_indices)
-    total_failure = len(failure_indices)
-    n_failure_train_target = min(
-        total_failure,
-        max(0, int(total_failure * max_percentage_of_failure_states)),
-    )
-    n_failure_eval_target = min(
-        total_failure,
-        max(0, int(total_failure * max_percentage_of_failure_states_test)),
-    )
+    random_frontiers: List[Dict[str, Any]] = []
+    seen_keys = set()
+    attempts = 0
+    max_attempts = max(1000, target * 300)
+    while len(random_frontiers) < target and attempts < max_attempts:
+        attempts += 1
+        size = int(rng.choice(RANDOM_EVAL_FRONTIER_SIZES))
 
-    train_failure_indices = failure_indices[:n_failure_train_target]
-    remaining_failure_indices = failure_indices[n_failure_train_target:]
+        if kind_of_data == "separated":
+            eligible_goals = [g for g, pool in pools_by_goal.items() if len(pool) >= size]
+            if not eligible_goals:
+                break
+            goal = str(rng.choice(eligible_goals))
+            pool = pools_by_goal[goal]
+        else:
+            goal = ""
+            pool = pools_by_goal[""]
+            if len(pool) < size:
+                continue
 
-    eval_failure_indices = remaining_failure_indices[:n_failure_eval_target]
-    needed = n_failure_eval_target - len(eval_failure_indices)
-    reused_train_failure_indices: List[int] = []
-    if needed > 0:
-        reused_train_failure_indices = train_failure_indices[:needed]
-        eval_failure_indices.extend(reused_train_failure_indices)
+        chosen = rng.sample(pool, size)
+        rewards = [float(c["reward"]) for c in chosen]
+        best_reward = max(rewards)
+        n_best = sum(1 for r in rewards if abs(r - best_reward) <= FAILURE_EPS)
+        if n_best != 1:
+            continue
+        if all(_is_failure_reward(r, failure_reward_value) for r in rewards):
+            continue
 
-    train_indices = train_non_failure_indices + train_failure_indices
-    eval_indices = eval_non_failure_indices + eval_failure_indices
+        frontier_key = (
+            goal,
+            tuple(sorted(str(c["successor_path"]) for c in chosen)),
+        )
+        if frontier_key in seen_keys:
+            continue
+        seen_keys.add(frontier_key)
 
-    # Keep dataset usable in degenerate settings (e.g., all-failure data with very low
-    # requested train percentage that rounds to zero).
-    if samples and not train_indices:
-        fallback_idx = failure_indices[0] if failure_indices else 0
-        train_indices.append(fallback_idx)
-        eval_indices = [i for i in eval_indices if i != fallback_idx]
-        if fallback_idx in failure_indices and fallback_idx not in train_failure_indices:
-            train_failure_indices.append(fallback_idx)
+        random_frontiers.append(
+            {
+                "predecessor_path": f"random_eval2_{dataset_tag}_{len(random_frontiers)}",
+                "goal_path": goal,
+                "successor_paths": [str(c["successor_path"]) for c in chosen],
+                "distances": [float(c["distance"]) for c in chosen],
+                "depths": [int(c["depth"]) for c in chosen],
+                "rewards": rewards,
+            }
+        )
 
-    train_failure_set = set(train_failure_indices)
-    eval_failure_set = set(eval_failure_indices)
-    overlap_failure = train_failure_set.intersection(eval_failure_set)
-    disjoint_eval_failure_count = len(eval_failure_set - train_failure_set)
-    achieved_train_failure_pct = (
-        len(train_failure_indices) / total_failure if total_failure else 0.0
-    )
-    achieved_eval_failure_pct = (
-        len(eval_failure_indices) / total_failure if total_failure else 0.0
-    )
+    return random_frontiers
 
-    split_summary = {
-        "m_failed_state": float(m_failed_state),
-        "test_size": float(test_size),
-        "requested_max_percentage_of_failure_states_train": float(max_percentage_of_failure_states),
-        "requested_max_percentage_of_failure_states_eval": float(max_percentage_of_failure_states_test),
-        "num_frontiers_total": len(samples),
-        "num_frontiers_train": len(train_indices),
-        "num_frontiers_eval": len(eval_indices),
-        "num_failure_frontiers_total": total_failure,
-        "num_failure_frontiers_train": len(train_failure_indices),
-        "num_failure_frontiers_eval": len(eval_failure_indices),
-        "achieved_failure_percentage_train": float(achieved_train_failure_pct),
-        "achieved_failure_percentage_eval": float(achieved_eval_failure_pct),
-        "num_disjoint_eval_failure_frontiers": int(disjoint_eval_failure_count),
-        "num_reused_training_failure_frontiers_in_eval": int(len(overlap_failure)),
-        "num_failure_overlap_train_eval": int(len(overlap_failure)),
-        # Failure frontier == frontier containing at least one failure candidate.
-        "failure_frontier_definition": "contains at least one candidate with Distance From Goal == m_failed_state",
-    }
-    return train_indices, eval_indices, split_summary
+
+def _build_graph_loader(
+    dataset_type: str,
+    enable_graph_cache: bool = True,
+) -> Tuple[Callable[[str], Any], Dict[str, int]]:
+    graph_cache: Dict[str, Any] = {}
+    stats = {"requests": 0, "hits": 0, "misses": 0}
+
+    def _load(path: str) -> Any:
+        key = str(path)
+        stats["requests"] += 1
+        if enable_graph_cache and key in graph_cache:
+            stats["hits"] += 1
+            return graph_cache[key]
+        graph = load_pyg_graph(key, dataset_type=dataset_type)
+        stats["misses"] += 1
+        if enable_graph_cache:
+            graph_cache[key] = graph
+        return graph
+
+    return _load, stats
 
 
 def build_frontier_samples(
@@ -234,114 +391,244 @@ def build_frontier_samples(
     dataset_type: str,
     test_size: float,
     seed: int,
-    m_failed_state: int = 100000,
-    max_percentage_of_failure_states: float = 0.1,
-    max_percentage_of_failure_states_test: float = 0.2,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    max_regular_distance_for_reward: float = 50.0,
+    failure_reward_value: float = -1.0,
+    max_random_eval_frontiers_for_dataset: int = 1000,
+    enable_graph_cache: bool = True,
+    include_eval2: bool = False,
+    **_: Any,
+) -> Any:
     root = Path(folder_data)
-    bitmask = dataset_type == "BITMASK"
+    dataset_type = str(dataset_type).upper()
+    if dataset_type not in VALID_DATASET_TYPES:
+        raise ValueError(
+            f"Unsupported dataset_type '{dataset_type}'. "
+            f"Expected one of {sorted(VALID_DATASET_TYPES)}."
+        )
+    if kind_of_data not in {"merged", "separated"}:
+        raise ValueError(f"Unsupported kind_of_data: {kind_of_data}")
 
-    all_frontiers: List[Dict[str, Any]] = []
+    all_train_frontiers: List[Dict[str, Any]] = []
+    all_eval_frontiers: List[Dict[str, Any]] = []
+    all_eval2_frontiers: List[Dict[str, Any]] = []
+    dataset_summaries: List[Dict[str, Any]] = []
+
+    dataset_counter = 0
     for prob_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         if list_subset_train and os.path.basename(prob_dir) not in list_subset_train:
             continue
-        csv_files = sorted(p for p in prob_dir.iterdir() if p.suffix == ".csv")
-        if not csv_files:
-            continue
+        csv_files = sorted(p for p in prob_dir.iterdir() if p.suffix.lower() == ".csv")
         for csv_path in csv_files:
-            rows = read_frontier_csv(csv_path)
-            all_frontiers.extend(group_frontiers(rows))
+            rows = read_frontier_csv(csv_path, kind_of_data=kind_of_data)
+            cleaned = group_clean_frontiers(
+                rows=rows,
+                kind_of_data=kind_of_data,
+                max_regular_distance_for_reward=float(max_regular_distance_for_reward),
+                failure_reward_value=float(failure_reward_value),
+            )
+            dataset_id = f"{prob_dir.name}/{csv_path.name}"
 
-    train_idx, eval_idx, split_summary = _sample_failure_frontier_indices(
-        samples=all_frontiers,
-        test_size=test_size,
-        seed=seed,
-        m_failed_state=float(m_failed_state),
-        max_percentage_of_failure_states=max_percentage_of_failure_states,
-        max_percentage_of_failure_states_test=max_percentage_of_failure_states_test,
+            if not cleaned:
+                dataset_summaries.append(
+                    {
+                        "dataset_id": dataset_id,
+                        "frontiers_cleaned": 0,
+                        "train_frontiers": 0,
+                        "eval_frontiers": 0,
+                        "eval2_frontiers": 0,
+                    }
+                )
+                dataset_counter += 1
+                continue
+
+            split_seed = int(seed + 7919 * dataset_counter)
+            train_frontiers, eval_frontiers = split_frontiers(
+                cleaned,
+                test_size=float(test_size),
+                seed=split_seed,
+            )
+
+            eval2_seed = int(seed + 104729 * dataset_counter + 17)
+            eval2_frontiers = build_random_eval2_frontiers_for_dataset(
+                clean_frontiers=cleaned,
+                kind_of_data=kind_of_data,
+                max_random_eval_frontiers_for_dataset=max_random_eval_frontiers_for_dataset,
+                seed=eval2_seed,
+                dataset_tag=f"{prob_dir.name}_{csv_path.stem}",
+                failure_reward_value=float(failure_reward_value),
+            )
+
+            for frontier in train_frontiers:
+                frontier["dataset_id"] = dataset_id
+            for frontier in eval_frontiers:
+                frontier["dataset_id"] = dataset_id
+            for frontier in eval2_frontiers:
+                frontier["dataset_id"] = dataset_id
+
+            all_train_frontiers.extend(train_frontiers)
+            all_eval_frontiers.extend(eval_frontiers)
+            all_eval2_frontiers.extend(eval2_frontiers)
+
+            dataset_summaries.append(
+                {
+                    "dataset_id": dataset_id,
+                    "frontiers_cleaned": len(cleaned),
+                    "train_frontiers": len(train_frontiers),
+                    "eval_frontiers": len(eval_frontiers),
+                    "eval2_frontiers": len(eval2_frontiers),
+                }
+            )
+            dataset_counter += 1
+
+    graph_loader, graph_load_stats = _build_graph_loader(
+        dataset_type=dataset_type,
+        enable_graph_cache=bool(enable_graph_cache),
     )
-    train_meta = [all_frontiers[i] for i in train_idx]
-    eval_meta = [all_frontiers[i] for i in eval_idx]
+
     train_samples = [
         _materialize_frontier(
-            frontier,
+            frontier=f,
             kind_of_data=kind_of_data,
-            bitmask=bitmask,
-            m_failed_state=float(m_failed_state),
+            dataset_type=dataset_type,
+            max_regular_distance_for_reward=float(max_regular_distance_for_reward),
+            failure_reward_value=float(failure_reward_value),
+            graph_loader=graph_loader,
         )
-        for frontier in tqdm(train_meta, desc="Building train frontiers")
+        for f in tqdm(all_train_frontiers, desc="Materializing train frontiers")
     ]
     eval_samples = [
         _materialize_frontier(
-            frontier,
+            frontier=f,
             kind_of_data=kind_of_data,
-            bitmask=bitmask,
-            m_failed_state=float(m_failed_state),
+            dataset_type=dataset_type,
+            max_regular_distance_for_reward=float(max_regular_distance_for_reward),
+            failure_reward_value=float(failure_reward_value),
+            graph_loader=graph_loader,
         )
-        for frontier in tqdm(eval_meta, desc="Building eval frontiers")
+        for f in tqdm(all_eval_frontiers, desc="Materializing eval frontiers")
     ]
+    eval2_samples = [
+        _materialize_frontier(
+            frontier=f,
+            kind_of_data=kind_of_data,
+            dataset_type=dataset_type,
+            max_regular_distance_for_reward=float(max_regular_distance_for_reward),
+            failure_reward_value=float(failure_reward_value),
+            graph_loader=graph_loader,
+        )
+        for f in tqdm(all_eval2_frontiers, desc="Materializing eval2 frontiers")
+    ]
+
     params = {
         "folder_data": str(root),
-        "kind_of_data": kind_of_data,
-        "dataset_type": dataset_type,
-        "num_frontiers_total": len(all_frontiers),
+        "kind_of_data": str(kind_of_data),
+        "dataset_type": str(dataset_type),
+        "seed": int(seed),
+        "test_size": float(test_size),
+        "max_regular_distance_for_reward": float(max_regular_distance_for_reward),
+        "failure_reward_value": float(failure_reward_value),
+        "max_random_eval_frontiers_for_dataset": int(max_random_eval_frontiers_for_dataset),
         "num_frontiers_train": len(train_samples),
         "num_frontiers_eval": len(eval_samples),
-        "seed": seed,
-        "test_size": test_size,
-        "m_failed_state": float(m_failed_state),
-        "max_percentage_of_failure_states": float(max_percentage_of_failure_states),
-        "max_percentage_of_failure_states_test": float(max_percentage_of_failure_states_test),
-        "split_summary": split_summary,
+        "num_frontiers_eval2": len(eval2_samples),
+        "dataset_summaries": dataset_summaries,
+        "split_summary": {
+            "num_datasets": len(dataset_summaries),
+            "num_frontiers_train": len(train_samples),
+            "num_frontiers_eval": len(eval_samples),
+            "num_frontiers_eval2": len(eval2_samples),
+            "dataset_summaries": dataset_summaries,
+        },
+        "graph_cache_requests": int(graph_load_stats["requests"]),
+        "graph_cache_hits": int(graph_load_stats["hits"]),
+        "graph_cache_misses": int(graph_load_stats["misses"]),
+        "graph_cache_hit_rate": (
+            float(graph_load_stats["hits"] / graph_load_stats["requests"])
+            if int(graph_load_stats["requests"]) > 0
+            else 0.0
+        ),
     }
+    if include_eval2:
+        return train_samples, eval_samples, eval2_samples, params
     return train_samples, eval_samples, params
 
 
 def _materialize_frontier(
     frontier: Dict[str, Any],
     kind_of_data: str,
-    bitmask: bool,
-    m_failed_state: float,
+    dataset_type: str,
+    max_regular_distance_for_reward: float,
+    failure_reward_value: float = -1.0,
+    graph_loader: Optional[Callable[[str], Any]] = None,
+    m_failed_state: Optional[float] = None,
+    **_: Any,
 ) -> Dict[str, Any]:
+    _ = m_failed_state
     if kind_of_data not in {"merged", "separated"}:
         raise ValueError(f"Unsupported kind_of_data: {kind_of_data}")
 
-    successor_graphs = [load_pyg_graph(p, bitmask=bitmask) for p in frontier["successor_paths"]]
+    load_graph = (
+        graph_loader
+        if graph_loader is not None
+        else lambda p: load_pyg_graph(p, dataset_type=dataset_type)
+    )
+    successor_graphs = [load_graph(p) for p in frontier["successor_paths"]]
     goal_graph = None
     if kind_of_data == "separated":
-        if not frontier.get("goal_path"):
+        goal_path = str(frontier.get("goal_path", ""))
+        if not goal_path:
             raise ValueError(
-                "Missing Goal path for kind_of_data='separated'. "
-                "Each frontier row must provide a valid Goal graph path."
+                "Missing Goal path for kind_of_data='separated'."
             )
-        goal_graph = load_pyg_graph(frontier["goal_path"], bitmask=bitmask)
-    # merged semantics: goal is embedded in successor graphs, Goal CSV path is ignored.
+        goal_graph = load_graph(goal_path)
 
-    action_ids = [_to_action_id(a, idx) for idx, a in enumerate(frontier["actions"])]
     combined = combine_graphs(
         frontier_graphs=successor_graphs,
         goal_graph=goal_graph,
         kind_of_data=kind_of_data,
-        action_ids=action_ids,
+        action_ids=None,
     )
 
     distances = torch.tensor(frontier["distances"], dtype=torch.float32)
-    rewards = -distances
-    best_idx = int(torch.argmin(distances).item())
-    frontier_has_failure = any(_is_failure_candidate(float(d), m_failed_state) for d in frontier["distances"])
+    if "rewards" in frontier and frontier["rewards"] is not None:
+        reward_values = [float(x) for x in frontier["rewards"]]
+    else:
+        reward_values = [
+            normalize_distance_to_reward(
+                distance=float(d),
+                max_regular_distance=float(max_regular_distance_for_reward),
+                failure_reward_value=float(failure_reward_value),
+            )
+            for d in frontier["distances"]
+        ]
+    reward_targets = torch.tensor(reward_values, dtype=torch.float32)
+    is_failure = torch.tensor(
+        [
+            _is_failure_reward(float(r), float(failure_reward_value))
+            for r in reward_values
+        ],
+        dtype=torch.bool,
+    )
+    best_idx = int(torch.argmax(reward_targets).item())
+
     sample = {
         "node_features": combined.node_features,
         "edge_index": combined.edge_index,
         "edge_attr": combined.edge_attr,
         "membership": combined.membership,
         "action_map": combined.action_map,
-        "rewards": rewards,
-        "distances": distances,
+        "successor_ids": [str(p) for p in frontier["successor_paths"]],
+        "reward_target": reward_targets,
+        "rewards": reward_targets.clone(),
+        "distance_raw": distances,
+        "distances": distances.clone(),
+        "is_failure": is_failure,
         "oracle_index": torch.tensor(best_idx, dtype=torch.long),
-        "oracle_reward": rewards[best_idx].clone(),
-        "goal_path": frontier["goal_path"],
-        "predecessor_path": frontier["predecessor_path"],
-        "frontier_has_failure": bool(frontier_has_failure),
+        "oracle_reward": reward_targets[best_idx].clone(),
+        "goal_path": str(frontier.get("goal_path", "")),
+        "predecessor_path": str(frontier.get("predecessor_path", "")),
+        "dataset_id": str(frontier.get("dataset_id", "")),
+        "frontier_has_failure": bool(is_failure.any().item()),
     }
     if combined.pool_node_index is not None and combined.pool_membership is not None:
         sample["pool_node_index"] = combined.pool_node_index
@@ -350,7 +637,6 @@ def _materialize_frontier(
         sample["goal_node_features"] = goal_graph.node_features
         sample["goal_edge_index"] = goal_graph.edge_index
         sample["goal_edge_attr"] = goal_graph.edge_attr
-
     return sample
 
 
@@ -371,8 +657,10 @@ def frontier_collate_fn(batch: Sequence[Dict[str, Any]], pad_frontiers: bool = T
     edge_attr_parts: List[torch.Tensor] = []
     membership_parts: List[torch.Tensor] = []
     action_parts: List[torch.Tensor] = []
-    reward_parts: List[torch.Tensor] = []
-    distance_parts: List[torch.Tensor] = []
+    successor_id_parts: List[List[str]] = []
+    reward_target_parts: List[torch.Tensor] = []
+    distance_raw_parts: List[torch.Tensor] = []
+    failure_parts: List[torch.Tensor] = []
     oracle_parts: List[torch.Tensor] = []
     oracle_reward_parts: List[torch.Tensor] = []
     candidate_batch_parts: List[torch.Tensor] = []
@@ -393,7 +681,20 @@ def frontier_collate_fn(batch: Sequence[Dict[str, Any]], pad_frontiers: bool = T
     goal_node_offset = 0
     for batch_idx, item in enumerate(batch):
         n_nodes = int(item["node_features"].size(0))
-        n_candidates = int(item["rewards"].size(0))
+        reward_target = item.get("reward_target", item["rewards"]).to(torch.float32)
+        distance_raw = item.get("distance_raw", item.get("distances")).to(torch.float32)
+        if reward_target.numel() != distance_raw.numel():
+            raise ValueError(
+                "reward_target and distance tensors must have identical lengths per sample."
+            )
+        is_failure = item.get(
+            "is_failure", torch.zeros((reward_target.numel(),), dtype=torch.bool)
+        ).to(torch.bool)
+        if is_failure.numel() != reward_target.numel():
+            raise ValueError(
+                "is_failure and reward_target tensors must have identical lengths per sample."
+            )
+        n_candidates = int(reward_target.size(0))
 
         node_parts.append(item["node_features"])
         membership = item["membership"].clone()
@@ -403,11 +704,21 @@ def frontier_collate_fn(batch: Sequence[Dict[str, Any]], pad_frontiers: bool = T
 
         if item["edge_index"].numel() > 0:
             edge_index_parts.append(item["edge_index"] + node_offset)
-            edge_attr_parts.append(item["edge_attr"].to(torch.float32))
+            edge_attr_parts.append(item["edge_attr"].to(torch.int64))
 
         action_parts.append(item["action_map"])
-        reward_parts.append(item["rewards"])
-        distance_parts.append(item["distances"])
+        successor_ids = item.get("successor_ids")
+        if successor_ids is None:
+            successor_id_parts.append([])
+        else:
+            if len(successor_ids) != n_candidates:
+                raise ValueError(
+                    "successor_ids must have the same length as candidates per sample."
+                )
+            successor_id_parts.append([str(x) for x in successor_ids])
+        reward_target_parts.append(reward_target)
+        distance_raw_parts.append(distance_raw)
+        failure_parts.append(is_failure)
         oracle_parts.append(item["oracle_index"].view(1) + membership_offset)
         oracle_reward_parts.append(item["oracle_reward"].view(1))
         candidate_batch_parts.append(torch.full((n_candidates,), batch_idx, dtype=torch.long))
@@ -444,7 +755,7 @@ def frontier_collate_fn(batch: Sequence[Dict[str, Any]], pad_frontiers: bool = T
             goal_batch_parts.append(torch.full((goal_nodes.size(0),), batch_idx, dtype=torch.long))
             if item["goal_edge_index"].numel() > 0:
                 goal_edge_index_parts.append(item["goal_edge_index"] + goal_node_offset)
-                goal_edge_attr_parts.append(item["goal_edge_attr"].to(torch.float32))
+                goal_edge_attr_parts.append(item["goal_edge_attr"].to(torch.int64))
             goal_node_offset += int(goal_nodes.size(0))
 
         frontier_ptr.append(frontier_ptr[-1] + n_candidates)
@@ -461,12 +772,16 @@ def frontier_collate_fn(batch: Sequence[Dict[str, Any]], pad_frontiers: bool = T
         "edge_attr": (
             torch.cat(edge_attr_parts, dim=0)
             if edge_attr_parts
-            else torch.zeros((0, 1), dtype=torch.float32)
+            else torch.zeros((0, 1), dtype=torch.int64)
         ),
         "membership": torch.cat(membership_parts, dim=0),
         "action_map": torch.cat(action_parts, dim=0),
-        "rewards": torch.cat(reward_parts, dim=0),
-        "distances": torch.cat(distance_parts, dim=0),
+        "successor_ids": successor_id_parts,
+        "reward_target": torch.cat(reward_target_parts, dim=0),
+        "rewards": torch.cat(reward_target_parts, dim=0),
+        "distance_raw": torch.cat(distance_raw_parts, dim=0),
+        "distances": torch.cat(distance_raw_parts, dim=0),
+        "is_failure": torch.cat(failure_parts, dim=0),
         "oracle_index": torch.cat(oracle_parts, dim=0),
         "oracle_reward": torch.cat(oracle_reward_parts, dim=0),
         "candidate_batch": torch.cat(candidate_batch_parts, dim=0),
@@ -513,30 +828,7 @@ def frontier_collate_fn(batch: Sequence[Dict[str, Any]], pad_frontiers: bool = T
             if pool_membership_parts
             else torch.zeros((0,), dtype=torch.long)
         )
-        pool_node_index = out["pool_node_index"]
-        pool_membership = out["pool_membership"]
-        if pool_node_index.dim() != 1 or pool_membership.dim() != 1:
-            raise ValueError("pool_node_index and pool_membership must be 1D after collation.")
-        if pool_node_index.numel() != pool_membership.numel():
-            raise ValueError(
-                "pool_node_index and pool_membership length mismatch after collation."
-            )
-        if pool_node_index.numel() > 0:
-            if int(pool_node_index.min().item()) < 0:
-                raise ValueError("pool_node_index contains negative values after collation.")
-            if int(pool_node_index.max().item()) >= int(out["node_features"].size(0)):
-                raise ValueError(
-                    f"pool_node_index out of bounds after collation: max={int(pool_node_index.max().item())} "
-                    f"n_nodes={int(out['node_features'].size(0))}"
-                )
-        if pool_membership.numel() > 0:
-            if int(pool_membership.min().item()) < 0:
-                raise ValueError("pool_membership contains negative values after collation.")
-            if int(pool_membership.max().item()) >= total_candidates:
-                raise ValueError(
-                    f"pool_membership out of bounds after collation: max={int(pool_membership.max().item())} "
-                    f"total_candidates={total_candidates}"
-                )
+
     if any(has_goal_parts) and not all(has_goal_parts):
         raise ValueError("Mixed batches with and without goal tensors are not supported.")
     if all(has_goal_parts) and goal_node_parts:
@@ -549,26 +841,32 @@ def frontier_collate_fn(batch: Sequence[Dict[str, Any]], pad_frontiers: bool = T
         out["goal_edge_attr"] = (
             torch.cat(goal_edge_attr_parts, dim=0)
             if goal_edge_attr_parts
-            else torch.zeros((0, 1), dtype=torch.float32)
+            else torch.zeros((0, 1), dtype=torch.int64)
         )
         out["goal_batch"] = torch.cat(goal_batch_parts, dim=0)
 
     if pad_frontiers:
-        max_n = max(x.size(0) for x in reward_parts)
+        max_n = max(x.size(0) for x in reward_target_parts)
         bsz = len(batch)
         mask = torch.zeros((bsz, max_n), dtype=torch.bool)
-        padded_rewards = torch.zeros((bsz, max_n), dtype=torch.float32)
+        padded_reward_targets = torch.zeros((bsz, max_n), dtype=torch.float32)
         padded_distances = torch.zeros((bsz, max_n), dtype=torch.float32)
+        padded_is_failure = torch.zeros((bsz, max_n), dtype=torch.bool)
         padded_actions = torch.full((bsz, max_n), -1, dtype=torch.long)
-        for i, (r, d, a) in enumerate(zip(reward_parts, distance_parts, action_parts)):
+        for i, (r, d, f, a) in enumerate(
+            zip(reward_target_parts, distance_raw_parts, failure_parts, action_parts)
+        ):
             n = int(r.size(0))
             mask[i, :n] = True
-            padded_rewards[i, :n] = r
+            padded_reward_targets[i, :n] = r
             padded_distances[i, :n] = d
+            padded_is_failure[i, :n] = f
             padded_actions[i, :n] = a
         out["frontier_mask"] = mask
-        out["padded_rewards"] = padded_rewards
+        out["padded_reward_targets"] = padded_reward_targets
+        out["padded_rewards"] = padded_reward_targets
         out["padded_distances"] = padded_distances
+        out["padded_is_failure"] = padded_is_failure
         out["padded_actions"] = padded_actions
 
     return out
@@ -577,6 +875,7 @@ def frontier_collate_fn(batch: Sequence[Dict[str, Any]], pad_frontiers: bool = T
 def get_dataloaders(
     train_samples: Sequence[Dict[str, Any]],
     eval_samples: Sequence[Dict[str, Any]],
+    eval2_samples: Optional[Sequence[Dict[str, Any]]] = None,
     batch_size: int = 8,
     seed: int = 42,
     num_workers: int = 0,
@@ -595,13 +894,17 @@ def get_dataloaders(
             generator=generator,
         )
 
-    return _loader(train_samples, True), _loader(eval_samples, False)
+    train_loader = _loader(train_samples, True)
+    eval_loader = _loader(eval_samples, False)
+    eval2_loader = _loader(eval2_samples, False) if eval2_samples is not None else None
+    return train_loader, eval_loader, eval2_loader
 
 
 def save_samples(
     out_path: str | Path,
     train_samples: Sequence[Dict[str, Any]],
     eval_samples: Sequence[Dict[str, Any]],
+    eval2_samples: Optional[Sequence[Dict[str, Any]]] = None,
     params: Optional[Dict[str, Any]] = None,
 ) -> Path:
     out_path = Path(out_path)
@@ -610,6 +913,7 @@ def save_samples(
         {
             "train_samples": list(train_samples),
             "eval_samples": list(eval_samples),
+            "eval2_samples": list(eval2_samples or []),
             "params": params or {},
         },
         out_path,
@@ -619,6 +923,8 @@ def save_samples(
 
 def load_saved_samples(path: str | Path) -> Dict[str, Any]:
     payload = torch.load(path, weights_only=False)
+    payload.setdefault("eval2_samples", [])
+    payload.setdefault("params", {})
     return payload
 
 

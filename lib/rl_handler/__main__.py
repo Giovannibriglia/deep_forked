@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
+
+import torch
 
 from src.data import (
     build_frontier_samples,
     get_dataloaders,
     load_saved_samples,
+    refresh_frontier_sample_targets,
     save_samples,
     seed_everything,
 )
@@ -45,45 +47,42 @@ def parse_args():
         default="merged",
         help=(
             "Graph composition mode. "
-            "'merged': frontier is one combined graph with shared central goal already embedded; Goal CSV path is ignored. "
-            "'separated': frontier candidates stay disconnected and goal graph is loaded separately from Goal CSV path."
+            "'merged': Goal CSV path is ignored. "
+            "'separated': Goal CSV path is loaded for each frontier."
         ),
     )
     parser.add_argument("--test-size", type=float, default=0.2)
-    parser.add_argument(
-        "--m-failed-state",
-        type=int,
-        default=100000,
-        help="Distance From Goal value treated as failure state.",
-    )
-    parser.add_argument(
-        "--max-percentage-of-failure-states",
-        type=float,
-        default=0.1,
-        help=(
-            "Maximum fraction of failure frontiers included in train split "
-            "(failure frontier = contains at least one candidate with Distance From Goal == m_failed_state)."
-        ),
-    )
-    parser.add_argument(
-        "--max-percentage-of-failure-states-test",
-        type=float,
-        default=0.2,
-        help=(
-            "Maximum fraction of failure frontiers included in eval split "
-            "(failure frontier = contains at least one candidate with Distance From Goal == m_failed_state)."
-        ),
-    )
-    parser.add_argument("--batch-size", type=int, default=4096)
+    parser.add_argument("--max-random-eval-frontiers-for-dataset", type=int, default=100)
+
+    parser.add_argument("--batch-size", type=int, default=9092)
     parser.add_argument("--n-train-epochs", type=int, default=200)
     parser.add_argument("--eval-every", type=int, default=10)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument(
+        "--max-grad-norm",
+        type=float,
+        default=0.0,
+        help="If > 0, clip gradient norm to this value before optimizer step.",
+    )
+    parser.add_argument(
+        "--early-stopping-patience-evals",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, stop training when eval reward does not improve for this many "
+            "evaluation checkpoints."
+        ),
+    )
 
     parser.add_argument("--gnn-layers", type=int, default=3)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--conv-type", choices=["gine", "rgcn", "gcn"], default="gine")
     parser.add_argument("--pooling-type", choices=["mean", "sum", "max"], default="mean")
+    parser.add_argument("--edge-emb-dim", type=int, default=32)
+    parser.add_argument("--num-node-labels", type=int, default=4096)
     parser.add_argument("--use-global-context", type=str2bool, default=True)
     parser.add_argument("--mlp-depth", type=int, default=2)
     parser.add_argument(
@@ -95,21 +94,9 @@ def parse_args():
             "for 'merged' the model ignores missing goal tensors."
         ),
     )
-    parser.add_argument(
-        "--track-rank-correlation",
-        type=str2bool,
-        default=True,
-        help="Track reward rank correlation (Spearman) between logits and rewards during evaluation.",
-    )
     parser.add_argument("--reward-formulation", type=str, default="negative_distance")
-    parser.add_argument("--reward-loss-weight", type=float, default=1.0)
-    parser.add_argument("--ranking-loss-weight", type=float, default=0.0)
-    parser.add_argument(
-        "--ranking-loss-type",
-        choices=["none", "pairwise", "listwise"],
-        default="none",
-    )
-    parser.add_argument("--reward-temperature", type=float, default=0.5)
+    parser.add_argument("--max-regular-distance-for-reward", type=float, default=50.0)
+    parser.add_argument("--failure-reward-value", type=float, default=-1.0)
 
     parser.add_argument("--build-data", type=str2bool, default=True)
     parser.add_argument("--train", type=str2bool, default=True)
@@ -135,36 +122,87 @@ def _build_or_load_samples(args):
     samples_path = data_root / "samples.pt"
 
     if args.build_data:
-        train_samples, eval_samples, params = build_frontier_samples(
+        train_samples, eval_samples, eval2_samples, params = build_frontier_samples(
             folder_data=args.folder_raw_data,
             list_subset_train=args.subset_train,
             kind_of_data=args.kind_of_data,
             dataset_type=args.dataset_type,
             test_size=args.test_size,
             seed=args.seed,
-            m_failed_state=args.m_failed_state,
-            max_percentage_of_failure_states=args.max_percentage_of_failure_states,
-            max_percentage_of_failure_states_test=args.max_percentage_of_failure_states_test,
+            max_regular_distance_for_reward=args.max_regular_distance_for_reward,
+            failure_reward_value=args.failure_reward_value,
+            max_random_eval_frontiers_for_dataset=args.max_random_eval_frontiers_for_dataset,
+            include_eval2=True,
         )
-        save_samples(samples_path, train_samples, eval_samples, params=params)
+        save_samples(
+            samples_path,
+            train_samples,
+            eval_samples,
+            eval2_samples=eval2_samples,
+            params=params,
+        )
     payload = load_saved_samples(samples_path)
     return payload, samples_path
+
+
+def _infer_num_edge_labels(samples):
+    max_label = 0
+    found_label = False
+    for sample in samples:
+        for key in ("edge_attr", "goal_edge_attr"):
+            edge_attr = sample.get(key)
+            if edge_attr is None or edge_attr.numel() == 0:
+                continue
+            edge_ids = edge_attr.view(-1).to(torch.long)
+            if edge_ids.numel() == 0:
+                continue
+            min_label = int(edge_ids.min().item())
+            if min_label < 0:
+                raise ValueError(
+                    f"Edge labels must be non-negative categorical IDs. Got min={min_label} in '{key}'."
+                )
+            max_label = max(max_label, int(edge_ids.max().item()))
+            found_label = True
+    return (max_label + 1) if found_label else 1
 
 
 def main(args):
     seed_everything(args.seed)
     payload, samples_path = _build_or_load_samples(args)
-    train_samples = payload["train_samples"]
-    eval_samples = payload["eval_samples"]
+    train_samples = payload.get("train_samples", [])
+    eval_samples = payload.get("eval_samples", [])
+    eval2_samples = payload.get("eval2_samples", [])
+
+    refresh_frontier_sample_targets(
+        train_samples,
+        m_failed_state=0.0,
+        max_regular_distance_for_reward=float(args.max_regular_distance_for_reward),
+        failure_reward_value=float(args.failure_reward_value),
+    )
+    refresh_frontier_sample_targets(
+        eval_samples,
+        m_failed_state=0.0,
+        max_regular_distance_for_reward=float(args.max_regular_distance_for_reward),
+        failure_reward_value=float(args.failure_reward_value),
+    )
+    refresh_frontier_sample_targets(
+        eval2_samples,
+        m_failed_state=0.0,
+        max_regular_distance_for_reward=float(args.max_regular_distance_for_reward),
+        failure_reward_value=float(args.failure_reward_value),
+    )
 
     if not train_samples:
         raise ValueError(f"No training frontiers loaded from {samples_path}.")
     if not eval_samples:
         print("[warning] Eval split is empty; evaluation metrics will be trivial.")
+    if not eval2_samples:
+        print("[warning] Eval2 split is empty; eval2 metrics will be trivial.")
 
-    train_loader, eval_loader = get_dataloaders(
+    train_loader, eval_loader, eval2_loader = get_dataloaders(
         train_samples=train_samples,
         eval_samples=eval_samples,
+        eval2_samples=eval2_samples,
         batch_size=args.batch_size,
         seed=args.seed,
         num_workers=args.num_workers,
@@ -177,6 +215,7 @@ def main(args):
         if args.use_goal_separate_input is None
         else bool(args.use_goal_separate_input)
     )
+    num_edge_labels = _infer_num_edge_labels(train_samples + eval_samples + eval2_samples)
 
     model = FrontierPolicyNetwork(
         node_input_dim=node_input_dim,
@@ -184,20 +223,21 @@ def main(args):
         gnn_layers=args.gnn_layers,
         conv_type=args.conv_type,
         pooling_type=args.pooling_type,
+        dataset_type=args.dataset_type,
+        edge_emb_dim=args.edge_emb_dim,
+        num_edge_labels=num_edge_labels,
+        num_node_labels=args.num_node_labels,
         use_global_context=args.use_global_context,
         mlp_depth=args.mlp_depth,
         use_goal_separate_input=use_goal_separate_input,
     )
     trainer = RLFrontierTrainer(
         model=model,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
         reward_formulation=args.reward_formulation,
-        m_failed_state=float(args.m_failed_state),
         kind_of_data=args.kind_of_data,
-        track_rank_correlation=args.track_rank_correlation,
-        reward_loss_weight=args.reward_loss_weight,
-        ranking_loss_weight=args.ranking_loss_weight,
-        ranking_loss_type=args.ranking_loss_type,
-        reward_temperature=args.reward_temperature,
+        max_grad_norm=args.max_grad_norm,
     )
 
     _, model_root = _paths(args)
@@ -208,10 +248,12 @@ def main(args):
         trainer.train(
             train_loader=train_loader,
             eval_loader=eval_loader,
+            eval2_loader=eval2_loader,
             n_epochs=args.n_train_epochs,
             checkpoint_dir=model_root.as_posix(),
             model_name=args.model_name,
             eval_every=args.eval_every,
+            early_stopping_patience_evals=args.early_stopping_patience_evals,
         )
 
     if model_ckpt.exists():
@@ -221,52 +263,29 @@ def main(args):
         raise FileNotFoundError(f"Missing checkpoint: {model_ckpt}")
 
     if args.evaluate:
-        metrics = trainer.evaluate(eval_loader, verbose=True)
-        with (model_root / f"{args.model_name}_eval.json").open("w", encoding="utf-8") as fh:
-            json.dump(metrics, fh, indent=2)
+        eval_metrics = trainer.evaluate(eval_loader, verbose=True)
+        eval2_metrics = trainer.evaluate(eval2_loader, verbose=True) if eval2_loader is not None else {}
 
-        with (model_root / f"{args.model_name}_eval_errors.json").open("w", encoding="utf-8") as fh:
-            json.dump(
-                {
-                    "n_frontiers": metrics["n_frontiers"],
-                    "n_errors": metrics["n_errors"],
-                    "error_rate": metrics["error_rate"],
-                    "n_action_errors": metrics["n_action_errors"],
-                    "action_error_rate": metrics["action_error_rate"],
-                    "n_failure_choices": metrics["n_failure_choices"],
-                    "failure_choice_rate": metrics["failure_choice_rate"],
-                    "n_failure_frontiers": metrics["n_failure_frontiers"],
-                    "failure_frontier_rate": metrics["failure_frontier_rate"],
-                    "failure_metrics_applicable": metrics["failure_metrics_applicable"],
-                    "failure_avoidance_accuracy": metrics["failure_avoidance_accuracy"],
-                    "eval_reward_kl": metrics["eval_reward_kl"],
-                    "eval_reward_js": metrics["eval_reward_js"],
-                    "eval_reward_js_normalized": metrics["eval_reward_js_normalized"],
-                    "eval_reward_mae": metrics["eval_reward_mae"],
-                    "eval_reward_rmse": metrics["eval_reward_rmse"],
-                    "eval_score_std_within_frontier": metrics[
-                        "eval_score_std_within_frontier"
-                    ],
-                    "errors": metrics["errors"],
-                },
-                fh,
-                indent=2,
-            )
+        with (model_root / f"{args.model_name}_eval.json").open("w", encoding="utf-8") as fh:
+            json.dump(eval_metrics, fh, indent=2)
+        with (model_root / f"{args.model_name}_eval2.json").open("w", encoding="utf-8") as fh:
+            json.dump(eval2_metrics, fh, indent=2)
+
+        eval_metrics_dir = model_root / "metrics" / "eval"
+        eval2_metrics_dir = model_root / "metrics" / "eval2"
+        eval_metrics_dir.mkdir(parents=True, exist_ok=True)
+        eval2_metrics_dir.mkdir(parents=True, exist_ok=True)
+        with (eval_metrics_dir / "final_metrics.json").open("w", encoding="utf-8") as fh:
+            json.dump(eval_metrics, fh, indent=2)
+        with (eval2_metrics_dir / "final_metrics.json").open("w", encoding="utf-8") as fh:
+            json.dump(eval2_metrics, fh, indent=2)
 
     params = payload.get("params", {})
-    split_summary = params.get("split_summary")
-    if not split_summary:
-        split_summary = {
-            "num_frontiers_train": len(train_samples),
-            "num_frontiers_eval": len(eval_samples),
-            "m_failed_state": float(args.m_failed_state),
-            "requested_max_percentage_of_failure_states_train": float(
-                args.max_percentage_of_failure_states
-            ),
-            "requested_max_percentage_of_failure_states_eval": float(
-                args.max_percentage_of_failure_states_test
-            ),
-        }
+    split_summary = params.get("split_summary") or {
+        "num_frontiers_train": len(train_samples),
+        "num_frontiers_eval": len(eval_samples),
+        "num_frontiers_eval2": len(eval2_samples),
+    }
     with (model_root / "dataset_split_summary.json").open("w", encoding="utf-8") as fh:
         json.dump(split_summary, fh, indent=2)
 
@@ -277,6 +296,9 @@ def main(args):
         for key, value in vars(args).items():
             fh.write(f"{key} = {value}\n")
         fh.write(f"samples_path = {samples_path}\n")
+        fh.write(f"n_train_samples = {len(train_samples)}\n")
+        fh.write(f"n_eval_samples = {len(eval_samples)}\n")
+        fh.write(f"n_eval2_samples = {len(eval2_samples)}\n")
         fh.write(f"model_checkpoint = {model_ckpt}\n")
         fh.write(f"onnx_path = {onnx_path}\n")
 

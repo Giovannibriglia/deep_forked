@@ -14,6 +14,16 @@ from torch_geometric.nn import (
     global_mean_pool,
 )
 
+DATASET_TYPE_HASHED = "HASHED"
+DATASET_TYPE_MAPPED = "MAPPED"
+DATASET_TYPE_BITMASK = "BITMASK"
+VALID_DATASET_TYPES = {
+    DATASET_TYPE_HASHED,
+    DATASET_TYPE_MAPPED,
+    DATASET_TYPE_BITMASK,
+}
+TWO_48_MINUS_1 = float(2**48 - 1)
+
 
 def _build_mlp(in_dim: int, hidden_dim: int, depth: int, out_dim: int) -> nn.Sequential:
     layers = []
@@ -33,11 +43,36 @@ class GNNEncoder(nn.Module):
         hidden_dim: int = 128,
         num_layers: int = 3,
         conv_type: str = "gine",
+        dataset_type: str = DATASET_TYPE_HASHED,
+        edge_emb_dim: int = 32,
+        num_edge_labels: int = 256,
+        num_node_labels: int = 4096,
     ):
         super().__init__()
         self.conv_type = conv_type.lower()
-        self.input_proj = nn.Linear(node_input_dim, hidden_dim)
-        self.edge_proj = nn.Linear(1, hidden_dim)
+        self.dataset_type = str(dataset_type).upper()
+        if self.dataset_type not in VALID_DATASET_TYPES:
+            raise ValueError(
+                f"Unsupported dataset_type '{dataset_type}'. "
+                f"Expected one of {sorted(VALID_DATASET_TYPES)}."
+            )
+        self.node_input_dim = int(node_input_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.edge_emb_dim = int(edge_emb_dim)
+        self.num_edge_labels = max(1, int(num_edge_labels))
+        self.num_node_labels = max(1, int(num_node_labels))
+        self.input_proj = nn.Linear(self.node_input_dim, self.hidden_dim)
+        self.input_proj_refine = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+        )
+        self.node_label_embedding = nn.Embedding(self.num_node_labels, self.hidden_dim)
+        self.edge_embedding = nn.Embedding(self.num_edge_labels, self.edge_emb_dim)
+        self.edge_proj = nn.Sequential(
+            nn.Linear(self.edge_emb_dim, self.edge_emb_dim),
+            nn.ReLU(),
+            nn.Linear(self.edge_emb_dim, self.edge_emb_dim),
+        )
         self.layers = nn.ModuleList()
 
         for _ in range(num_layers):
@@ -49,15 +84,118 @@ class GNNEncoder(nn.Module):
                             nn.ReLU(),
                             nn.Linear(hidden_dim, hidden_dim),
                         ),
-                        edge_dim=hidden_dim,
+                        edge_dim=self.edge_emb_dim,
                     )
                 )
             elif self.conv_type == "rgcn":
-                self.layers.append(RGCNConv(hidden_dim, hidden_dim, num_relations=64))
+                self.layers.append(
+                    RGCNConv(hidden_dim, hidden_dim, num_relations=self.num_edge_labels)
+                )
             elif self.conv_type == "gcn":
                 self.layers.append(GCNConv(hidden_dim, hidden_dim))
             else:
                 raise ValueError(f"Unsupported conv_type: {conv_type}")
+
+    def _prepare_node_features(self, node_features: torch.Tensor) -> torch.Tensor:
+        x = node_features.to(torch.float32)
+        if x.dim() == 1:
+            x = x.view(-1, 1)
+
+        if self.dataset_type == DATASET_TYPE_HASHED:
+            if x.size(-1) != 1:
+                raise ValueError(
+                    f"HASHED dataset expects scalar node IDs. Got shape {tuple(x.shape)}."
+                )
+            # HASHED is the only mode that uses TWO_48_MINUS_1 normalization.
+            if x.numel() > 0:
+                x_min = float(x.min().item())
+                x_max = float(x.max().item())
+                if x_min < 0.0 or x_max > 1.0:
+                    x = (x / TWO_48_MINUS_1).clamp(0.0, 1.0)
+                else:
+                    x = x.clamp(0.0, 1.0)
+        elif self.dataset_type in {DATASET_TYPE_MAPPED, DATASET_TYPE_BITMASK}:
+            pass
+        else:
+            raise ValueError(f"Unsupported dataset_type: {self.dataset_type}")
+
+        if x.size(-1) != self.node_input_dim:
+            raise ValueError(
+                f"node feature dim mismatch: got {x.size(-1)} expected {self.node_input_dim}"
+            )
+        return x
+
+    def _edge_label_ids(
+        self,
+        edge_attr: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if edge_attr.numel() == 0:
+            return torch.zeros((0,), dtype=torch.long, device=device)
+        if edge_attr.dim() == 2:
+            if edge_attr.size(1) != 1:
+                raise ValueError(
+                    f"edge_attr must be categorical IDs with shape [E] or [E, 1], got {tuple(edge_attr.shape)}."
+                )
+            raw_ids = edge_attr[:, 0]
+        elif edge_attr.dim() == 1:
+            raw_ids = edge_attr
+        else:
+            raise ValueError(
+                f"edge_attr must be 1D/2D categorical IDs, got rank {edge_attr.dim()}."
+            )
+        edge_ids = raw_ids.to(device=device, dtype=torch.long).view(-1)
+        if edge_ids.numel() == 0:
+            return edge_ids
+        min_id = int(edge_ids.min().item())
+        max_id = int(edge_ids.max().item())
+        if min_id < 0:
+            raise ValueError(f"edge label IDs must be >= 0, got min {min_id}.")
+        if max_id >= self.num_edge_labels:
+            raise ValueError(
+                f"edge label ID {max_id} out of range for num_edge_labels={self.num_edge_labels}."
+            )
+        return edge_ids
+
+    def _node_label_ids(
+        self,
+        node_features: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        x = node_features
+        if x.dim() == 1:
+            x = x.view(-1, 1)
+        if x.size(0) == 0:
+            return torch.zeros((0,), dtype=torch.long, device=device)
+
+        if self.dataset_type in {DATASET_TYPE_HASHED, DATASET_TYPE_MAPPED}:
+            if x.size(-1) != 1:
+                raise ValueError(
+                    f"{self.dataset_type} dataset expects scalar node IDs for label embedding, got shape {tuple(x.shape)}."
+                )
+            raw = x[:, 0].to(device=device, dtype=torch.long)
+            return torch.remainder(raw, self.num_node_labels).view(-1)
+
+        if self.dataset_type == DATASET_TYPE_BITMASK:
+            bits = (x > 0.5).to(device=device, dtype=torch.long)
+            if bits.dim() != 2:
+                bits = bits.view(bits.size(0), -1)
+            n_bits = int(bits.size(1))
+            if n_bits == 0:
+                return torch.zeros((bits.size(0),), dtype=torch.long, device=device)
+            max_bits = min(n_bits, 31)
+            weights = (2 ** torch.arange(max_bits, device=device, dtype=torch.long)).view(
+                1, -1
+            )
+            label_ids = (bits[:, :max_bits] * weights).sum(dim=1)
+            if n_bits > max_bits:
+                tail = bits[:, max_bits:].sum(dim=1) * 131
+                label_ids = label_ids + tail
+            return torch.remainder(label_ids, self.num_node_labels).view(-1)
+
+        raise ValueError(f"Unsupported dataset_type for node label embedding: {self.dataset_type}")
 
     def forward(
         self,
@@ -65,15 +203,26 @@ class GNNEncoder(nn.Module):
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
     ) -> torch.Tensor:
-        x = self.input_proj(node_features.to(torch.float32))
+        raw_nodes = node_features.to(torch.float32)
+        if raw_nodes.dim() == 1:
+            raw_nodes = raw_nodes.view(-1, 1)
+        x = self._prepare_node_features(raw_nodes)
+        x = self.input_proj(x)
+        x = self.input_proj_refine(x)
+        node_ids = self._node_label_ids(raw_nodes, device=edge_index.device)
+        x = x + self.node_label_embedding(node_ids)
+        edge_ids = self._edge_label_ids(edge_attr, device=edge_index.device)
 
         for conv in self.layers:
             if isinstance(conv, GINEConv):
-                e = self.edge_proj(edge_attr.to(torch.float32))
+                if edge_ids.numel() == 0:
+                    e = x.new_zeros((0, self.edge_emb_dim))
+                else:
+                    e = self.edge_embedding(edge_ids)
+                    e = self.edge_proj(e)
                 x = F.relu(conv(x, edge_index, e))
             elif isinstance(conv, RGCNConv):
-                edge_type = edge_attr.view(-1).to(torch.long).clamp(min=0, max=63)
-                x = F.relu(conv(x, edge_index, edge_type))
+                x = F.relu(conv(x, edge_index, edge_ids))
             else:
                 x = F.relu(conv(x, edge_index))
         return x
@@ -87,6 +236,10 @@ class FrontierPolicyNetwork(nn.Module):
         gnn_layers: int = 3,
         conv_type: str = "gine",
         pooling_type: str = "mean",
+        dataset_type: str = DATASET_TYPE_HASHED,
+        edge_emb_dim: int = 32,
+        num_edge_labels: int = 256,
+        num_node_labels: int = 4096,
         use_global_context: bool = True,
         mlp_depth: int = 2,
         use_goal_separate_input: bool = False,
@@ -95,11 +248,19 @@ class FrontierPolicyNetwork(nn.Module):
         self.use_global_context = use_global_context
         self.pooling_type = pooling_type
         self.use_goal_separate_input = use_goal_separate_input
+        self.dataset_type = str(dataset_type).upper()
+        self.edge_emb_dim = int(edge_emb_dim)
+        self.num_edge_labels = max(1, int(num_edge_labels))
+        self.num_node_labels = max(1, int(num_node_labels))
         self.encoder = GNNEncoder(
             node_input_dim=node_input_dim,
             hidden_dim=hidden_dim,
             num_layers=gnn_layers,
             conv_type=conv_type,
+            dataset_type=self.dataset_type,
+            edge_emb_dim=self.edge_emb_dim,
+            num_edge_labels=self.num_edge_labels,
+            num_node_labels=self.num_node_labels,
         )
         head_in = hidden_dim * 2 if use_global_context else hidden_dim
         if self.use_goal_separate_input:

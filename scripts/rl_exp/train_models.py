@@ -19,9 +19,14 @@ def run_training(
     training_data_folder,
     no_goal,
     dataset_type,
-    m_failed_state,
-    max_percentage_of_failure_states,
-    max_percentage_of_failure_states_test,
+    max_regular_distance_for_reward,
+    max_random_eval_frontiers_for_dataset,
+    lr,
+    weight_decay,
+    max_grad_norm,
+    early_stopping_patience_evals,
+    failure_reward_value,
+    build_data,
 ):
     if not os.path.isdir(training_data_folder):
         print(f"[ERROR] Missing training folder: {training_data_folder}")
@@ -50,18 +55,33 @@ def run_training(
         model_dir,
         "--dataset_type",
         dataset_type,
-        "--m-failed-state",
-        str(m_failed_state),
-        "--max-percentage-of-failure-states",
-        str(max_percentage_of_failure_states),
-        "--max-percentage-of-failure-states-test",
-        str(max_percentage_of_failure_states_test),
+        "--build-data",
+        str(bool(build_data)).lower(),
+        "--failure-reward-value",
+        str(failure_reward_value),
+        "--max-regular-distance-for-reward",
+        str(max_regular_distance_for_reward),
+        "--max-random-eval-frontiers-for-dataset",
+        str(max_random_eval_frontiers_for_dataset),
+        "--lr",
+        str(lr),
+        "--weight-decay",
+        str(weight_decay),
+        "--max-grad-norm",
+        str(max_grad_norm),
+        "--early-stopping-patience-evals",
+        str(early_stopping_patience_evals),
     ]
     if no_goal:
         cmd.extend(["--kind-of-data", "separated"])
     print(" ".join(cmd))
+
     process = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
     )
     prefix = f"[{os.path.basename(model_dir)}]".ljust(20)
     print(f"{prefix} Running RL training...")
@@ -87,9 +107,19 @@ def main():
     parser.add_argument("batch_root")
     parser.add_argument("--no_goal", action="store_true")
     parser.add_argument("--dataset_type", choices=["MAPPED", "HASHED", "BITMASK"], default="HASHED")
-    parser.add_argument("--m-failed-state", type=int, default=100000)
-    parser.add_argument("--max-percentage-of-failure-states", type=float, default=0.1)
-    parser.add_argument("--max-percentage-of-failure-states-test", type=float, default=0.2)
+    parser.add_argument("--max-regular-distance-for-reward", type=float, default=50.0)
+    parser.add_argument("--max-random-eval-frontiers-for-dataset", type=int, default=1000)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--failure-reward-value", type=float, default=-1.0)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--early-stopping-patience-evals", type=int, default=8)
+    parser.add_argument(
+        "--build-data",
+        choices=["true", "false"],
+        default="true",
+        help="Whether to rebuild samples.pt before training.",
+    )
     args = parser.parse_args()
 
     folders = find_training_data_folders(args.batch_root)
@@ -105,9 +135,14 @@ def main():
                 folder,
                 args.no_goal,
                 args.dataset_type,
-                args.m_failed_state,
-                args.max_percentage_of_failure_states,
-                args.max_percentage_of_failure_states_test,
+                args.max_regular_distance_for_reward,
+                args.max_random_eval_frontiers_for_dataset,
+                args.lr,
+                args.weight_decay,
+                args.max_grad_norm,
+                args.early_stopping_patience_evals,
+                args.failure_reward_value,
+                args.build_data.lower() == "true",
             )
             for folder in folders
         ]
