@@ -792,7 +792,14 @@ void TrainingDataset<StateRepr>::add_to_dataset(
     return;
   }
 
-  m_added_to_dataset++;
+  if (score >= m_failed_state) {
+    auto m_total_failures = m_current_nodes - m_added_to_dataset;
+    if (m_total_failures % m_threshold_failures_print_modulo != 0) {
+      return;
+    }
+  } else {
+    m_added_to_dataset++;
+  }
 
   std::stringstream ss;
 
