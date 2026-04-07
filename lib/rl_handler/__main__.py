@@ -30,6 +30,16 @@ def str2bool(v):
     raise argparse.ArgumentTypeError("Boolean value expected (true/false).")
 
 
+def ratio_0_1(v):
+    try:
+        ratio = float(v)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("Expected a float value.") from exc
+    if ratio < 0.0 or ratio > 1.0:
+        raise argparse.ArgumentTypeError("Expected a value in [0.0, 1.0].")
+    return ratio
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Offline RL frontier selector training and export pipeline."
@@ -54,6 +64,16 @@ def parse_args():
     )
     parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--max-random-eval-frontiers-for-dataset", type=int, default=100)
+    parser.add_argument(
+        "--max-failure-states-per-dataset",
+        type=ratio_0_1,
+        default=0.3,
+        help=(
+            "Keep all train frontiers with no failure states, then keep at most "
+            "this fraction of train frontiers that have at least one failure "
+            "state (ratio w.r.t. no-failure train frontiers)."
+        ),
+    )
 
     parser.add_argument("--batch-size", type=int, default=9092)
     parser.add_argument("--n-train-epochs", type=int, default=200)
@@ -488,6 +508,72 @@ def _compare_first_example_pytorch_vs_onnx(
     print(f"[onnx-check] report written to: {report_path}")
 
 
+def _sample_has_failure_state(sample: Dict[str, Any]) -> bool:
+    has_failure = sample.get("frontier_has_failure")
+    if has_failure is not None:
+        return bool(has_failure)
+
+    failure_vec = sample.get("is_failure")
+    if isinstance(failure_vec, torch.Tensor):
+        if failure_vec.numel() == 0:
+            return False
+        return bool(failure_vec.to(torch.bool).any().item())
+    if isinstance(failure_vec, (list, tuple)):
+        return any(bool(x) for x in failure_vec)
+    return False
+
+
+def _limit_failure_frontiers_in_train_dataset(
+    train_samples: Sequence[Dict[str, Any]],
+    max_failure_states_per_dataset: float,
+    seed: int,
+) -> Tuple[list[Dict[str, Any]], Dict[str, int]]:
+    if not train_samples:
+        return [], {
+            "n_total": 0,
+            "n_no_failure": 0,
+            "n_with_failure_total": 0,
+            "n_with_failure_kept": 0,
+            "n_total_kept": 0,
+        }
+
+    no_failure_indices = []
+    with_failure_indices = []
+    for idx, sample in enumerate(train_samples):
+        if _sample_has_failure_state(sample):
+            with_failure_indices.append(idx)
+        else:
+            no_failure_indices.append(idx)
+
+    max_failure_to_keep = int(len(no_failure_indices) * float(max_failure_states_per_dataset))
+    max_failure_to_keep = max(0, min(max_failure_to_keep, len(with_failure_indices)))
+
+    if max_failure_to_keep >= len(with_failure_indices):
+        selected_failure_indices = set(with_failure_indices)
+    elif max_failure_to_keep <= 0:
+        selected_failure_indices = set()
+    else:
+        generator = torch.Generator()
+        generator.manual_seed(int(seed))
+        selected_positions = torch.randperm(
+            len(with_failure_indices), generator=generator
+        )[:max_failure_to_keep].tolist()
+        selected_failure_indices = {with_failure_indices[pos] for pos in selected_positions}
+
+    kept_indices = set(no_failure_indices) | selected_failure_indices
+    filtered_train_samples = [
+        sample for idx, sample in enumerate(train_samples) if idx in kept_indices
+    ]
+
+    return filtered_train_samples, {
+        "n_total": len(train_samples),
+        "n_no_failure": len(no_failure_indices),
+        "n_with_failure_total": len(with_failure_indices),
+        "n_with_failure_kept": len(selected_failure_indices),
+        "n_total_kept": len(filtered_train_samples),
+    }
+
+
 def main(args):
     seed_everything(args.seed)
     payload, samples_path = _build_or_load_samples(args)
@@ -512,6 +598,18 @@ def main(args):
         m_failed_state=0.0,
         max_regular_distance_for_reward=float(args.max_regular_distance_for_reward),
         failure_reward_value=float(args.failure_reward_value),
+    )
+    train_samples, train_filter_stats = _limit_failure_frontiers_in_train_dataset(
+        train_samples=train_samples,
+        max_failure_states_per_dataset=float(args.max_failure_states_per_dataset),
+        seed=int(args.seed),
+    )
+    print(
+        "[dataset-filter] train frontiers | no_failure="
+        f"{train_filter_stats['n_no_failure']} | with_failure_total="
+        f"{train_filter_stats['n_with_failure_total']} | with_failure_kept="
+        f"{train_filter_stats['n_with_failure_kept']} | total_kept="
+        f"{train_filter_stats['n_total_kept']}"
     )
 
     if not train_samples:
@@ -610,6 +708,18 @@ def main(args):
         "num_frontiers_eval": len(eval_samples),
         "num_frontiers_eval2": len(eval2_samples),
     }
+    split_summary = dict(split_summary)
+    split_summary["num_frontiers_train"] = len(train_samples)
+    split_summary["num_frontiers_eval"] = len(eval_samples)
+    split_summary["num_frontiers_eval2"] = len(eval2_samples)
+    split_summary["train_no_failure_frontiers"] = int(train_filter_stats["n_no_failure"])
+    split_summary["train_with_failure_frontiers_total"] = int(
+        train_filter_stats["n_with_failure_total"]
+    )
+    split_summary["train_with_failure_frontiers_kept"] = int(
+        train_filter_stats["n_with_failure_kept"]
+    )
+    split_summary["max_failure_states_per_dataset"] = float(args.max_failure_states_per_dataset)
     with (model_root / "dataset_split_summary.json").open("w", encoding="utf-8") as fh:
         json.dump(split_summary, fh, indent=2)
 
