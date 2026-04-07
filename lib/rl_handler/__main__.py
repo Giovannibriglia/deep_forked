@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 
@@ -102,6 +103,15 @@ def parse_args():
     parser.add_argument("--train", type=str2bool, default=True)
     parser.add_argument("--evaluate", type=str2bool, default=True)
     parser.add_argument("--export-onnx", type=str2bool, default=True)
+    parser.add_argument(
+        "--if-try-example",
+        type=str2bool,
+        default=False,
+        help=(
+            "If true and ONNX export is enabled, run one frontier sample through "
+            "both PyTorch and ONNX and save a parity report."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -164,6 +174,318 @@ def _infer_num_edge_labels(samples):
             max_label = max(max_label, int(edge_ids.max().item()))
             found_label = True
     return (max_label + 1) if found_label else 1
+
+
+def _first_available_sample(
+    train_samples: Sequence[Dict[str, Any]],
+    eval_samples: Sequence[Dict[str, Any]],
+    eval2_samples: Sequence[Dict[str, Any]],
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    if train_samples:
+        return "train", train_samples[0]
+    if eval_samples:
+        return "eval", eval_samples[0]
+    if eval2_samples:
+        return "eval2", eval2_samples[0]
+    return None, None
+
+
+def _infer_num_candidates(sample: Dict[str, Any]) -> int:
+    for key in ("reward_target", "rewards", "distance_raw", "distances"):
+        values = sample.get(key)
+        if values is None:
+            continue
+        if isinstance(values, torch.Tensor):
+            n_candidates = int(values.numel())
+        else:
+            try:
+                n_candidates = int(len(values))
+            except TypeError:
+                continue
+        if n_candidates > 0:
+            return n_candidates
+
+    membership = sample.get("membership")
+    if isinstance(membership, torch.Tensor) and membership.numel() > 0:
+        return int(membership.max().item()) + 1
+    return 0
+
+
+def _compare_first_example_pytorch_vs_onnx(
+    trainer: RLFrontierTrainer,
+    train_samples: Sequence[Dict[str, Any]],
+    eval_samples: Sequence[Dict[str, Any]],
+    eval2_samples: Sequence[Dict[str, Any]],
+    kind_of_data: str,
+    onnx_path: Path,
+    report_path: Path,
+) -> None:
+    split_name, sample = _first_available_sample(train_samples, eval_samples, eval2_samples)
+    if sample is None:
+        print("[warning] Could not run ONNX parity check: no sample available.")
+        return
+
+    n_candidates = _infer_num_candidates(sample)
+    if n_candidates <= 0:
+        print("[warning] Could not run ONNX parity check: sample has no candidates.")
+        return
+
+    required_base = ["node_features", "edge_index", "edge_attr", "membership"]
+    missing_base = [k for k in required_base if k not in sample]
+    if missing_base:
+        print(
+            "[warning] Could not run ONNX parity check: "
+            f"sample is missing required tensors {missing_base}."
+        )
+        return
+
+    use_goal_inputs = kind_of_data == "separated" and trainer.model.use_goal_separate_input
+    goal_missing = []
+    if use_goal_inputs:
+        goal_keys = ["goal_node_features", "goal_edge_index", "goal_edge_attr"]
+        goal_missing = [k for k in goal_keys if k not in sample]
+    if goal_missing:
+        print(
+            "[warning] Could not run ONNX parity check: "
+            f"sample is missing goal tensors {goal_missing}."
+        )
+        return
+
+    node_features = sample["node_features"].to(torch.float32)
+    edge_index = sample["edge_index"].to(torch.int64)
+    edge_attr = sample["edge_attr"].to(torch.int64)
+    membership = sample["membership"].to(torch.int64)
+
+    model_kwargs: Dict[str, Any] = {
+        "node_features": node_features.to(trainer.device),
+        "edge_index": edge_index.to(trainer.device),
+        "edge_attr": edge_attr.to(trainer.device),
+        "membership": membership.to(trainer.device),
+        "candidate_batch": None,
+    }
+    if use_goal_inputs:
+        goal_batch = sample.get("goal_batch")
+        if goal_batch is None:
+            # Single-sample parity check: goal graph belongs to one frontier.
+            goal_batch = torch.zeros(
+                (int(sample["goal_node_features"].size(0)),),
+                dtype=torch.int64,
+            )
+        else:
+            goal_batch = goal_batch.to(torch.int64)
+        model_kwargs["goal_node_features"] = sample["goal_node_features"].to(
+            trainer.device, dtype=torch.float32
+        )
+        model_kwargs["goal_edge_index"] = sample["goal_edge_index"].to(
+            trainer.device, dtype=torch.int64
+        )
+        model_kwargs["goal_edge_attr"] = sample["goal_edge_attr"].to(
+            trainer.device, dtype=torch.int64
+        )
+        model_kwargs["goal_batch"] = goal_batch.to(trainer.device)
+
+    with torch.no_grad():
+        trainer.model.eval()
+        # In merged mode, ONNX wrapper semantics may produce a logits length that
+        # differs from reward tensor length. Derive mask shape from actual forward output.
+        pytorch_logits = trainer.model(**model_kwargs).detach().cpu().to(torch.float32).view(-1)
+    mask = torch.ones((int(pytorch_logits.numel()),), dtype=torch.bool)
+    model_kwargs["mask"] = mask.to(trainer.device)
+    with torch.no_grad():
+        trainer.model.eval()
+        pytorch_logits = trainer.model(**model_kwargs).detach().cpu().to(torch.float32).view(-1)
+
+    try:
+        import numpy as np
+        import onnxruntime as ort
+    except ImportError as exc:
+        print(f"[warning] Skipping ONNX parity check: missing dependency ({exc}).")
+        return
+
+    def _mask_numpy(mask_len: int, valid_len: int):
+        valid = max(0, min(int(mask_len), int(valid_len)))
+        out = torch.zeros((int(mask_len),), dtype=torch.bool)
+        if valid > 0:
+            out[:valid] = True
+        return out.numpy().astype("bool")
+
+    base_onnx_inputs = {
+        "node_features": node_features.detach().cpu().numpy().astype("float32"),
+        "edge_index": edge_index.detach().cpu().numpy().astype("int64"),
+        "edge_attr": edge_attr.detach().cpu().numpy().astype("int64"),
+        "membership": membership.detach().cpu().numpy().astype("int64"),
+    }
+    if use_goal_inputs:
+        goal_batch = sample.get("goal_batch")
+        if goal_batch is None:
+            goal_batch = torch.zeros(
+                (int(sample["goal_node_features"].size(0)),),
+                dtype=torch.int64,
+            )
+        else:
+            goal_batch = goal_batch.to(torch.int64)
+        base_onnx_inputs["goal_node_features"] = (
+            sample["goal_node_features"].detach().cpu().numpy().astype("float32")
+        )
+        base_onnx_inputs["goal_edge_index"] = (
+            sample["goal_edge_index"].detach().cpu().numpy().astype("int64")
+        )
+        base_onnx_inputs["goal_edge_attr"] = (
+            sample["goal_edge_attr"].detach().cpu().numpy().astype("int64")
+        )
+        base_onnx_inputs["goal_batch"] = goal_batch.detach().cpu().numpy().astype("int64")
+
+    try:
+        ort_sess = ort.InferenceSession(
+            onnx_path.as_posix(),
+            providers=["CPUExecutionProvider"],
+        )
+    except Exception as exc:  # pragma: no cover - runtime dependent
+        print(f"[warning] ONNX parity check failed while loading session: {exc}")
+        return
+
+    onnx_logits = None
+    onnx_mask_len = None
+    last_onnx_error = None
+    static_onnx_len = None
+    try:
+        out_shape = ort_sess.get_outputs()[0].shape
+        if out_shape and isinstance(out_shape[0], int) and out_shape[0] > 0:
+            static_onnx_len = int(out_shape[0])
+    except Exception:
+        static_onnx_len = None
+
+    mask_attempts = []
+    if static_onnx_len is not None:
+        mask_attempts.append(static_onnx_len)
+    if int(pytorch_logits.numel()) > 0 and int(pytorch_logits.numel()) not in mask_attempts:
+        mask_attempts.append(int(pytorch_logits.numel()))
+    if int(n_candidates) > 0 and int(n_candidates) not in mask_attempts:
+        mask_attempts.append(int(n_candidates))
+
+    for mask_len in mask_attempts:
+        try:
+            onnx_inputs = dict(base_onnx_inputs)
+            onnx_inputs["mask"] = _mask_numpy(mask_len=mask_len, valid_len=n_candidates)
+            onnx_logits = (
+                np.asarray(ort_sess.run(["logits"], onnx_inputs)[0], dtype=np.float32)
+                .reshape(-1)
+                .astype(np.float32)
+            )
+            onnx_mask_len = int(mask_len)
+            break
+        except Exception as exc:  # pragma: no cover - runtime dependent
+            last_onnx_error = exc
+
+    if onnx_logits is None:
+        print(f"[warning] ONNX parity check failed: {last_onnx_error}")
+        return
+
+    gt_rewards = sample.get("reward_target", sample.get("rewards"))
+    gt_rewards_t = None
+    if isinstance(gt_rewards, torch.Tensor):
+        gt_rewards_t = gt_rewards.detach().cpu().to(torch.float32).view(-1)
+    elif gt_rewards is not None:
+        try:
+            gt_rewards_t = torch.tensor(gt_rewards, dtype=torch.float32).view(-1)
+        except (TypeError, ValueError):
+            gt_rewards_t = None
+
+    gt_valid_len = 0
+    ground_truth_index = None
+    ground_truth_reward = None
+    if gt_rewards_t is not None and gt_rewards_t.numel() > 0:
+        gt_valid_len = max(0, min(int(n_candidates), int(gt_rewards_t.numel())))
+        if gt_valid_len > 0:
+            gt_slice = gt_rewards_t[:gt_valid_len]
+            gt_local_idx = int(torch.argmax(gt_slice).item())
+            ground_truth_index = gt_local_idx
+            ground_truth_reward = float(gt_slice[gt_local_idx].item())
+
+    pytorch_logits_np = pytorch_logits.numpy().astype("float32")
+    max_abs_diff = None
+    if onnx_logits.shape == pytorch_logits_np.shape:
+        max_abs_diff = (
+            float(np.max(np.abs(onnx_logits - pytorch_logits_np)))
+            if onnx_logits.size > 0
+            else 0.0
+        )
+
+    valid_for_torch = max(0, min(int(n_candidates), int(pytorch_logits.numel())))
+    if valid_for_torch > 0:
+        pytorch_pred_idx = int(torch.argmax(pytorch_logits[:valid_for_torch]).item())
+    else:
+        pytorch_pred_idx = -1
+
+    valid_for_onnx = max(0, min(int(n_candidates), int(onnx_logits.size)))
+    if valid_for_onnx > 0:
+        onnx_pred_idx = int(np.argmax(onnx_logits[:valid_for_onnx]))
+    else:
+        onnx_pred_idx = -1
+
+    sample_oracle_index = sample.get("oracle_index")
+    if isinstance(sample_oracle_index, torch.Tensor) and sample_oracle_index.numel() > 0:
+        sample_oracle_index = int(sample_oracle_index.view(-1)[0].item())
+    elif sample_oracle_index is not None:
+        try:
+            sample_oracle_index = int(sample_oracle_index)
+        except (TypeError, ValueError):
+            sample_oracle_index = None
+    else:
+        sample_oracle_index = None
+
+    sample_oracle_reward = sample.get("oracle_reward")
+    if isinstance(sample_oracle_reward, torch.Tensor) and sample_oracle_reward.numel() > 0:
+        sample_oracle_reward = float(sample_oracle_reward.view(-1)[0].item())
+    elif sample_oracle_reward is not None:
+        try:
+            sample_oracle_reward = float(sample_oracle_reward)
+        except (TypeError, ValueError):
+            sample_oracle_reward = None
+    else:
+        sample_oracle_reward = None
+
+    parity_report = {
+        "sample_split": split_name,
+        "num_candidates": int(pytorch_logits.numel()),
+        "num_candidates_from_sample": int(n_candidates),
+        "ground_truth_index": ground_truth_index,
+        "ground_truth_reward": ground_truth_reward,
+        "ground_truth_valid_len": int(gt_valid_len),
+        "sample_oracle_index": sample_oracle_index,
+        "sample_oracle_reward": sample_oracle_reward,
+        "onnx_output_static_len": int(static_onnx_len) if static_onnx_len is not None else None,
+        "onnx_mask_len_used": int(onnx_mask_len) if onnx_mask_len is not None else None,
+        "onnx_path": onnx_path.as_posix(),
+        "pytorch_prediction_index": pytorch_pred_idx,
+        "onnx_prediction_index": onnx_pred_idx,
+        "prediction_match": bool(pytorch_pred_idx == onnx_pred_idx),
+        "pytorch_matches_ground_truth": (
+            bool(pytorch_pred_idx == ground_truth_index)
+            if ground_truth_index is not None
+            else None
+        ),
+        "onnx_matches_ground_truth": (
+            bool(onnx_pred_idx == ground_truth_index)
+            if ground_truth_index is not None
+            else None
+        ),
+        "max_abs_logit_diff": max_abs_diff,
+        "pytorch_logits": pytorch_logits_np.tolist(),
+        "onnx_logits": onnx_logits.tolist(),
+    }
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with report_path.open("w", encoding="utf-8") as fh:
+        json.dump(parity_report, fh, indent=2)
+
+    print(
+        "[onnx-check] first sample split="
+        f"{split_name} | torch_idx={pytorch_pred_idx} | onnx_idx={onnx_pred_idx}"
+    )
+    if max_abs_diff is not None:
+        print(f"[onnx-check] max_abs_logit_diff={max_abs_diff:.8f}")
+    print(f"[onnx-check] report written to: {report_path}")
 
 
 def main(args):
@@ -293,6 +615,16 @@ def main(args):
 
     if args.export_onnx:
         trainer.to_onnx(onnx_path, node_input_dim=node_input_dim)
+        if args.if_try_example:
+            _compare_first_example_pytorch_vs_onnx(
+                trainer=trainer,
+                train_samples=train_samples,
+                eval_samples=eval_samples,
+                eval2_samples=eval2_samples,
+                kind_of_data=args.kind_of_data,
+                onnx_path=onnx_path,
+                report_path=model_root / f"{args.model_name}_onnx_first_example_check.json",
+            )
 
     best_epoch = None
     best_perf_path = model_root / "best_model_performance.json"

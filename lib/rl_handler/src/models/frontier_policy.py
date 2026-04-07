@@ -148,6 +148,9 @@ class GNNEncoder(nn.Module):
         edge_ids = raw_ids.to(device=device, dtype=torch.long).view(-1)
         if edge_ids.numel() == 0:
             return edge_ids
+        # Avoid tracer warnings during ONNX export caused by Python scalar extraction.
+        if torch.onnx.is_in_onnx_export() or torch.jit.is_tracing():
+            return edge_ids
         min_id = int(edge_ids.min().item())
         max_id = int(edge_ids.max().item())
         if min_id < 0:
