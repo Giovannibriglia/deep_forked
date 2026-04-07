@@ -242,6 +242,7 @@ def main(args):
 
     _, model_root = _paths(args)
     model_ckpt = model_root / f"{args.model_name}.pt"
+    best_ckpt = model_root / "best.pt"
     onnx_path = model_root / f"{args.model_name}.onnx"
 
     if args.train:
@@ -256,11 +257,12 @@ def main(args):
             early_stopping_patience_evals=args.early_stopping_patience_evals,
         )
 
-    if model_ckpt.exists():
-        loaded = RLFrontierTrainer.load_model(model_ckpt, device=trainer.device)
+    load_ckpt = best_ckpt if best_ckpt.exists() else model_ckpt
+    if load_ckpt.exists():
+        loaded = RLFrontierTrainer.load_model(load_ckpt, device=trainer.device)
         trainer.model = loaded.to(trainer.device)
     elif not args.train:
-        raise FileNotFoundError(f"Missing checkpoint: {model_ckpt}")
+        raise FileNotFoundError(f"Missing checkpoint: {best_ckpt} or {model_ckpt}")
 
     if args.evaluate:
         eval_metrics = trainer.evaluate(eval_loader, verbose=True)
@@ -292,6 +294,16 @@ def main(args):
     if args.export_onnx:
         trainer.to_onnx(onnx_path, node_input_dim=node_input_dim)
 
+    best_epoch = None
+    best_perf_path = model_root / "best_model_performance.json"
+    if best_perf_path.exists():
+        try:
+            with best_perf_path.open("r", encoding="utf-8") as fh:
+                best_payload = json.load(fh)
+            best_epoch = best_payload.get("best_eval_epoch")
+        except (OSError, json.JSONDecodeError):
+            best_epoch = None
+
     with (model_root / f"{args.model_name}_info.txt").open("w", encoding="utf-8") as fh:
         for key, value in vars(args).items():
             fh.write(f"{key} = {value}\n")
@@ -299,7 +311,9 @@ def main(args):
         fh.write(f"n_train_samples = {len(train_samples)}\n")
         fh.write(f"n_eval_samples = {len(eval_samples)}\n")
         fh.write(f"n_eval2_samples = {len(eval2_samples)}\n")
-        fh.write(f"model_checkpoint = {model_ckpt}\n")
+        fh.write(f"model_checkpoint = {load_ckpt}\n")
+        fh.write(f"best_checkpoint = {best_ckpt}\n")
+        fh.write(f"best model epoch = {best_epoch}\n")
         fh.write(f"onnx_path = {onnx_path}\n")
 
     return onnx_path.as_posix()

@@ -191,6 +191,7 @@ class RLFrontierTrainer:
         accuracies: Sequence[int],
         frontier_has_failure: Sequence[int],
         frontier_sizes: Sequence[int],
+        abs_reward_gaps: Sequence[float],
     ) -> Dict[str, Dict[str, object]]:
         def _size_curve(
             sizes: Sequence[int],
@@ -218,15 +219,19 @@ class RLFrontierTrainer:
             regime_rewards = [float(r) for r, m in zip(rewards, mask) if m]
             regime_accuracies = [int(a) for a, m in zip(accuracies, mask) if m]
             regime_sizes = [int(s) for s, m in zip(frontier_sizes, mask) if m]
+            regime_abs_reward_gaps = [float(g) for g, m in zip(abs_reward_gaps, mask) if m]
             regimes[regime] = {
                 "n_frontiers": len(regime_rewards),
                 "rewards": regime_rewards,
                 "accuracies": regime_accuracies,
+                "abs_reward_gaps": regime_abs_reward_gaps,
                 "frontier_sizes": regime_sizes,
                 "reward_stats": cls._iqm_iqr_stats(regime_rewards),
                 "accuracy_stats": cls._iqm_iqr_stats(regime_accuracies),
+                "abs_reward_gap_stats": cls._iqm_iqr_stats(regime_abs_reward_gaps),
                 "reward_by_size": _size_curve(regime_sizes, regime_rewards),
                 "accuracy_by_size": _size_curve(regime_sizes, regime_accuracies),
+                "abs_reward_gap_by_size": _size_curve(regime_sizes, regime_abs_reward_gaps),
             }
         return regimes
 
@@ -367,6 +372,16 @@ class RLFrontierTrainer:
                 y_lim=(-0.05, 1.05),
                 title=f"{regime_title} | Accuracy by Frontier Size (IQM ± IQR-STD)",
             )
+            abs_gap_curve = regime_metrics["abs_reward_gap_by_size"]
+            self._plot_frontier_size_curve_with_band(
+                out_path=step_dir / f"{regime}_abs_reward_gap_by_frontier_size_iqm_iqrstd.png",
+                sizes=abs_gap_curve["sizes"],
+                iqm=abs_gap_curve["iqm"],
+                iqr_std=abs_gap_curve["iqr_std"],
+                ylabel="|best reward - taken reward|",
+                y_lim=(0.0, 1.05),
+                title=f"{regime_title} | Absolute Reward Gap by Frontier Size (IQM ± IQR-STD)",
+            )
 
         with (step_dir / "summary.json").open("w", encoding="utf-8") as fh:
             json.dump(metrics, fh, indent=2)
@@ -400,6 +415,16 @@ class RLFrontierTrainer:
                 title=f"{eval_name.upper()} | {regime} | Global Reward (mean ± std)",
                 y_lim=(-1.0, 0.05),
             )
+            self._plot_line_with_std_band(
+                out_path=eval_dir / f"{regime}_global_abs_reward_gap_over_epochs.png",
+                x=epochs,
+                means=hist["abs_reward_gap_mean"],
+                stds=hist["abs_reward_gap_std"],
+                xlabel="Epoch",
+                ylabel="|best reward - taken reward|",
+                title=f"{eval_name.upper()} | {regime} | Absolute Reward Gap (mean ± std)",
+                y_lim=(0.0, 1.05),
+            )
 
     @staticmethod
     def _append_regime_history(
@@ -410,11 +435,14 @@ class RLFrontierTrainer:
         for regime in REGIME_ORDER:
             stats_acc = regimes[regime]["accuracy_stats"]
             stats_reward = regimes[regime]["reward_stats"]
+            stats_abs_gap = regimes[regime]["abs_reward_gap_stats"]
             regime_history[regime]["epochs"].append(int(epoch))
             regime_history[regime]["accuracy_mean"].append(float(stats_acc["mean"]))
             regime_history[regime]["accuracy_std"].append(float(stats_acc["std"]))
             regime_history[regime]["reward_mean"].append(float(stats_reward["mean"]))
             regime_history[regime]["reward_std"].append(float(stats_reward["std"]))
+            regime_history[regime]["abs_reward_gap_mean"].append(float(stats_abs_gap["mean"]))
+            regime_history[regime]["abs_reward_gap_std"].append(float(stats_abs_gap["std"]))
 
     @staticmethod
     def _empty_regime_history() -> Dict[str, Dict[str, List[float]]]:
@@ -425,8 +453,56 @@ class RLFrontierTrainer:
                 "accuracy_std": [],
                 "reward_mean": [],
                 "reward_std": [],
+                "abs_reward_gap_mean": [],
+                "abs_reward_gap_std": [],
             }
             for regime in REGIME_ORDER
+        }
+
+    @staticmethod
+    def _collect_frontier_decisions(
+        logits: torch.Tensor,
+        rewards: torch.Tensor,
+        frontier_ptr: torch.Tensor,
+    ) -> Dict[str, List[float]]:
+        chosen_rewards: List[float] = []
+        accuracies: List[int] = []
+        frontier_has_failure: List[int] = []
+        frontier_sizes: List[int] = []
+        abs_reward_gaps: List[float] = []
+
+        for i in range(frontier_ptr.numel() - 1):
+            s = int(frontier_ptr[i].item())
+            e = int(frontier_ptr[i + 1].item())
+            if e <= s:
+                continue
+            frontier_logits = logits[s:e]
+            frontier_rewards = rewards[s:e]
+            chosen_local = int(torch.argmax(frontier_logits).item())
+            chosen_reward = float(frontier_rewards[chosen_local].item())
+            best_reward = float(frontier_rewards.max().item())
+            abs_gap = abs(best_reward - chosen_reward)
+            is_correct = int(abs_gap <= FAILURE_EPS)
+            has_failure = int(
+                bool(
+                    (frontier_rewards <= (FAILURE_REWARD_VALUE + FAILURE_EPS))
+                    .any()
+                    .item()
+                )
+            )
+
+            chosen_rewards.append(chosen_reward)
+            accuracies.append(is_correct)
+            frontier_has_failure.append(has_failure)
+            frontier_sizes.append(int(e - s))
+            abs_reward_gaps.append(float(abs_gap))
+
+        return {
+            "chosen_rewards": chosen_rewards,
+            "accuracies": accuracies,
+            "frontier_has_failure": frontier_has_failure,
+            "frontier_sizes": frontier_sizes,
+            "abs_reward_gaps": abs_reward_gaps,
         }
 
     def compute_loss(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -466,6 +542,7 @@ class RLFrontierTrainer:
         accuracies: List[int] = []
         frontier_has_failure: List[int] = []
         frontier_sizes: List[int] = []
+        abs_reward_gaps: List[float] = []
 
         with torch.no_grad():
             for raw_batch in loader:
@@ -473,40 +550,27 @@ class RLFrontierTrainer:
                 logits = self.model(**self._build_model_kwargs(batch))
                 frontier_ptr = batch["frontier_ptr"]
                 rewards = batch.get("reward_target", batch["rewards"])
-
-                for i in range(frontier_ptr.numel() - 1):
-                    s = int(frontier_ptr[i].item())
-                    e = int(frontier_ptr[i + 1].item())
-                    if e <= s:
-                        continue
-                    frontier_logits = logits[s:e]
-                    frontier_rewards = rewards[s:e]
-
-                    chosen_local = int(torch.argmax(frontier_logits).item())
-                    chosen_reward = float(frontier_rewards[chosen_local].item())
-                    best_reward = float(frontier_rewards.max().item())
-                    is_correct = int(abs(chosen_reward - best_reward) <= FAILURE_EPS)
-                    has_failure = int(
-                        bool(
-                            (frontier_rewards <= (FAILURE_REWARD_VALUE + FAILURE_EPS))
-                            .any()
-                            .item()
-                        )
-                    )
-
-                    chosen_rewards.append(chosen_reward)
-                    accuracies.append(is_correct)
-                    frontier_has_failure.append(has_failure)
-                    frontier_sizes.append(int(e - s))
+                batch_decisions = self._collect_frontier_decisions(
+                    logits=logits,
+                    rewards=rewards,
+                    frontier_ptr=frontier_ptr,
+                )
+                chosen_rewards.extend(batch_decisions["chosen_rewards"])
+                accuracies.extend(batch_decisions["accuracies"])
+                frontier_has_failure.extend(batch_decisions["frontier_has_failure"])
+                frontier_sizes.extend(batch_decisions["frontier_sizes"])
+                abs_reward_gaps.extend(batch_decisions["abs_reward_gaps"])
 
         regimes = self._build_regime_metrics(
             rewards=chosen_rewards,
             accuracies=accuracies,
             frontier_has_failure=frontier_has_failure,
             frontier_sizes=frontier_sizes,
+            abs_reward_gaps=abs_reward_gaps,
         )
         all_reward_stats = regimes[REGIME_ALL]["reward_stats"]
         all_accuracy_stats = regimes[REGIME_ALL]["accuracy_stats"]
+        all_abs_gap_stats = regimes[REGIME_ALL]["abs_reward_gap_stats"]
 
         metrics: Dict[str, object] = {
             "n_frontiers": len(chosen_rewards),
@@ -514,6 +578,7 @@ class RLFrontierTrainer:
             "accuracies": accuracies,
             "frontier_has_failure": frontier_has_failure,
             "frontier_sizes": frontier_sizes,
+            "abs_reward_gaps": abs_reward_gaps,
             "regimes": regimes,
             "mean_reward": float(all_reward_stats["mean"]),
             "std_reward": float(all_reward_stats["std"]),
@@ -522,6 +587,11 @@ class RLFrontierTrainer:
             "iqr_std_reward": float(all_reward_stats["iqr_std"]),
             "mean_accuracy": float(all_accuracy_stats["mean"]),
             "std_accuracy": float(all_accuracy_stats["std"]),
+            "mean_abs_reward_gap": float(all_abs_gap_stats["mean"]),
+            "std_abs_reward_gap": float(all_abs_gap_stats["std"]),
+            "iqm_abs_reward_gap": float(all_abs_gap_stats["iqm"]),
+            "iqr_abs_reward_gap": float(all_abs_gap_stats["iqr"]),
+            "iqr_std_abs_reward_gap": float(all_abs_gap_stats["iqr_std"]),
             "oracle_accuracy": float(all_accuracy_stats["mean"]),
         }
 
@@ -551,6 +621,9 @@ class RLFrontierTrainer:
             )
             print(
                 f"mean accuracy    : {metrics['mean_accuracy']:.4f} ± {metrics['std_accuracy']:.4f}"
+            )
+            print(
+                f"abs reward gap   : {metrics['mean_abs_reward_gap']:.4f} ± {metrics['std_abs_reward_gap']:.4f}"
             )
 
         return metrics
@@ -587,9 +660,13 @@ class RLFrontierTrainer:
             "eval_epochs": [],
             "eval_iqm_reward": [],
             "eval_iqr_std_reward": [],
+            "eval_iqm_abs_reward_gap": [],
+            "eval_iqr_std_abs_reward_gap": [],
             "eval2_epochs": [],
             "eval2_iqm_reward": [],
             "eval2_iqr_std_reward": [],
+            "eval2_iqm_abs_reward_gap": [],
+            "eval2_iqr_std_abs_reward_gap": [],
         }
 
         eval_regime_history = self._empty_regime_history()
@@ -597,6 +674,7 @@ class RLFrontierTrainer:
 
         best_eval_reward = -float("inf")
         best_eval_epoch = -1
+        best_eval_metrics: Dict[str, object] = {}
         no_improve_eval_steps = 0
         eval_step = 0
 
@@ -644,6 +722,12 @@ class RLFrontierTrainer:
                 history["eval_epochs"].append(epoch + 1)
                 history["eval_iqm_reward"].append(float(eval_metrics["iqm_reward"]))
                 history["eval_iqr_std_reward"].append(float(eval_metrics["iqr_std_reward"]))
+                history["eval_iqm_abs_reward_gap"].append(
+                    float(eval_metrics["iqm_abs_reward_gap"])
+                )
+                history["eval_iqr_std_abs_reward_gap"].append(
+                    float(eval_metrics["iqr_std_abs_reward_gap"])
+                )
                 self._append_regime_history(
                     regime_history=eval_regime_history,
                     epoch=epoch + 1,
@@ -666,6 +750,16 @@ class RLFrontierTrainer:
                     y_lim=(-1.0, 0.0),
                     title="Eval Reward IQM ± IQR-STD",
                 )
+                self._plot_iqm_with_iqr_std_band(
+                    out_path=eval_metrics_dir / "abs_reward_gap_iqm_iqr_std_over_eval_steps.png",
+                    x=history["eval_epochs"],
+                    iqm=history["eval_iqm_abs_reward_gap"],
+                    iqr_std=history["eval_iqr_std_abs_reward_gap"],
+                    xlabel="Epoch (eval checkpoints)",
+                    ylabel="|best reward - taken reward|",
+                    y_lim=(0.0, 1.05),
+                    title="Eval Absolute Reward Gap IQM ± IQR-STD",
+                )
                 self._save_global_regime_history_plots(
                     eval_dir=eval_metrics_dir,
                     eval_name="eval",
@@ -677,6 +771,12 @@ class RLFrontierTrainer:
                     history["eval2_epochs"].append(epoch + 1)
                     history["eval2_iqm_reward"].append(float(eval2_metrics["iqm_reward"]))
                     history["eval2_iqr_std_reward"].append(float(eval2_metrics["iqr_std_reward"]))
+                    history["eval2_iqm_abs_reward_gap"].append(
+                        float(eval2_metrics["iqm_abs_reward_gap"])
+                    )
+                    history["eval2_iqr_std_abs_reward_gap"].append(
+                        float(eval2_metrics["iqr_std_abs_reward_gap"])
+                    )
                     self._append_regime_history(
                         regime_history=eval2_regime_history,
                         epoch=epoch + 1,
@@ -699,6 +799,16 @@ class RLFrontierTrainer:
                         y_lim=(-1.0, 0.0),
                         title="Eval2 Reward IQM ± IQR-STD",
                     )
+                    self._plot_iqm_with_iqr_std_band(
+                        out_path=eval2_metrics_dir / "abs_reward_gap_iqm_iqr_std_over_eval_steps.png",
+                        x=history["eval2_epochs"],
+                        iqm=history["eval2_iqm_abs_reward_gap"],
+                        iqr_std=history["eval2_iqr_std_abs_reward_gap"],
+                        xlabel="Epoch (eval checkpoints)",
+                        ylabel="|best reward - taken reward|",
+                        y_lim=(0.0, 1.05),
+                        title="Eval2 Absolute Reward Gap IQM ± IQR-STD",
+                    )
                     self._save_global_regime_history_plots(
                         eval_dir=eval2_metrics_dir,
                         eval_name="eval2",
@@ -709,7 +819,16 @@ class RLFrontierTrainer:
                 if eval_reward > best_eval_reward:
                     best_eval_reward = eval_reward
                     best_eval_epoch = epoch + 1
+                    best_eval_metrics = dict(eval_metrics)
                     no_improve_eval_steps = 0
+                    self.save_model(
+                        checkpoint / "best.pt",
+                        metrics={
+                            "best_eval_epoch": best_eval_epoch,
+                            "best_eval_reward": best_eval_reward,
+                        },
+                    )
+                    # Keep a conventional named checkpoint for backward compatibility.
                     self.save_model(
                         checkpoint / f"{model_name}.pt",
                         metrics={
@@ -741,6 +860,25 @@ class RLFrontierTrainer:
                     train_loss=f"{self._safe_mean(epoch_batch_losses):.4f}",
                 )
 
+        if best_eval_epoch < 0:
+            # If no eval checkpoint was reached, still persist a canonical best model.
+            self.save_model(
+                checkpoint / "best.pt",
+                metrics={
+                    "best_eval_epoch": None,
+                    "best_eval_reward": None,
+                    "note": "No eval checkpoint reached; saved final training weights.",
+                },
+            )
+            self.save_model(
+                checkpoint / f"{model_name}.pt",
+                metrics={
+                    "best_eval_epoch": None,
+                    "best_eval_reward": None,
+                    "note": "No eval checkpoint reached; saved final training weights.",
+                },
+            )
+
         # Save full histories.
         with (train_metrics_dir / "history.json").open("w", encoding="utf-8") as fh:
             json.dump(
@@ -761,6 +899,8 @@ class RLFrontierTrainer:
                     "epochs": history["eval_epochs"],
                     "iqm_reward": history["eval_iqm_reward"],
                     "iqr_std_reward": history["eval_iqr_std_reward"],
+                    "iqm_abs_reward_gap": history["eval_iqm_abs_reward_gap"],
+                    "iqr_std_abs_reward_gap": history["eval_iqr_std_abs_reward_gap"],
                     "regimes": eval_regime_history,
                     "best_eval_epoch": best_eval_epoch,
                     "best_eval_reward": best_eval_reward,
@@ -774,6 +914,8 @@ class RLFrontierTrainer:
                     "epochs": history["eval2_epochs"],
                     "iqm_reward": history["eval2_iqm_reward"],
                     "iqr_std_reward": history["eval2_iqr_std_reward"],
+                    "iqm_abs_reward_gap": history["eval2_iqm_abs_reward_gap"],
+                    "iqr_std_abs_reward_gap": history["eval2_iqr_std_abs_reward_gap"],
                     "regimes": eval2_regime_history,
                 },
                 fh,
@@ -782,6 +924,18 @@ class RLFrontierTrainer:
 
         with (checkpoint / "history_losses.json").open("w", encoding="utf-8") as fh:
             json.dump(history, fh, indent=2)
+        with (checkpoint / "best_model_performance.json").open("w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "best_model_name": "best.pt",
+                    "selection_metric": "mean_reward",
+                    "best_eval_epoch": best_eval_epoch if best_eval_epoch >= 0 else None,
+                    "best_eval_reward": best_eval_reward if best_eval_epoch >= 0 else None,
+                    "best_metrics": best_eval_metrics if best_eval_epoch >= 0 else {},
+                },
+                fh,
+                indent=2,
+            )
 
         return history
 
