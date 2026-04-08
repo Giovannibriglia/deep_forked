@@ -113,8 +113,6 @@ def main():
     parser.add_argument("--max-regular-distance-for-reward", type=float, default=50.0)
     parser.add_argument(
         "--n-max-dataset-queries",
-        "--max-random-eval-frontiers-for-dataset",
-        dest="n_max_dataset_queries",
         type=int,
         default=1000,
         help=(

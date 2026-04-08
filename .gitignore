@@ -102,6 +102,8 @@ data/*
 **/*.pt
 metrics/
 metrics/*
+data_pytorch/
+data_pytorch/*
 
 #Python Related
 __pycache__/

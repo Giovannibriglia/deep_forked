@@ -977,7 +977,10 @@ class RLFrontierTrainer:
     def to_onnx(self, out_path: str | Path, node_input_dim: int) -> None:
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        n_nodes, n_edges, n_candidates = 8, 12, 4
+        # ONNX tracing may specialize pooling/scatter dimensions to the traced
+        # candidate range; keep this comfortably above common frontier sizes.
+        n_candidates = 32
+        n_nodes, n_edges = max(8, n_candidates), 12
         if self.kind_of_data == "separated" and self.model.use_goal_separate_input:
             wrapper = OnnxFrontierPolicySeparatedWrapper(self.model).eval().cpu()
             n_goal_nodes, n_goal_edges = 6, 8

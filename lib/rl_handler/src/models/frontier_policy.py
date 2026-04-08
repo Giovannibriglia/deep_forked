@@ -97,29 +97,26 @@ class GNNEncoder(nn.Module):
                 raise ValueError(f"Unsupported conv_type: {conv_type}")
 
     def _prepare_node_features(self, node_features: torch.Tensor) -> torch.Tensor:
+        is_tracing = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing()
         x = node_features.to(torch.float32)
         if x.dim() == 1:
             x = x.view(-1, 1)
 
         if self.dataset_type == DATASET_TYPE_HASHED:
-            if x.size(-1) != 1:
+            if (not is_tracing) and x.size(-1) != 1:
                 raise ValueError(
                     f"HASHED dataset expects scalar node IDs. Got shape {tuple(x.shape)}."
                 )
-            # HASHED is the only mode that uses TWO_48_MINUS_1 normalization.
-            if x.numel() > 0:
-                x_min = float(x.min().item())
-                x_max = float(x.max().item())
-                if x_min < 0.0 or x_max > 1.0:
-                    x = (x / TWO_48_MINUS_1).clamp(0.0, 1.0)
-                else:
-                    x = x.clamp(0.0, 1.0)
+            # Keep normalization ONNX-trace-safe by using tensor conditionals
+            # instead of Python scalar extraction.
+            needs_scaling = torch.logical_or(torch.amin(x) < 0.0, torch.amax(x) > 1.0)
+            x = torch.where(needs_scaling, x / TWO_48_MINUS_1, x).clamp(0.0, 1.0)
         elif self.dataset_type in {DATASET_TYPE_MAPPED, DATASET_TYPE_BITMASK}:
             pass
         else:
             raise ValueError(f"Unsupported dataset_type: {self.dataset_type}")
 
-        if x.size(-1) != self.node_input_dim:
+        if (not is_tracing) and x.size(-1) != self.node_input_dim:
             raise ValueError(
                 f"node feature dim mismatch: got {x.size(-1)} expected {self.node_input_dim}"
             )
@@ -131,26 +128,23 @@ class GNNEncoder(nn.Module):
         *,
         device: torch.device,
     ) -> torch.Tensor:
-        if edge_attr.numel() == 0:
-            return torch.zeros((0,), dtype=torch.long, device=device)
-        if edge_attr.dim() == 2:
-            if edge_attr.size(1) != 1:
-                raise ValueError(
-                    f"edge_attr must be categorical IDs with shape [E] or [E, 1], got {tuple(edge_attr.shape)}."
-                )
-            raw_ids = edge_attr[:, 0]
-        elif edge_attr.dim() == 1:
-            raw_ids = edge_attr
-        else:
+        is_tracing = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing()
+        if (not is_tracing) and edge_attr.dim() == 2 and edge_attr.size(1) != 1:
+            raise ValueError(
+                f"edge_attr must be categorical IDs with shape [E] or [E, 1], got {tuple(edge_attr.shape)}."
+            )
+        if (not is_tracing) and edge_attr.dim() not in {1, 2}:
             raise ValueError(
                 f"edge_attr must be 1D/2D categorical IDs, got rank {edge_attr.dim()}."
             )
-        edge_ids = raw_ids.to(device=device, dtype=torch.long).view(-1)
-        if edge_ids.numel() == 0:
-            return edge_ids
+
+        raw_ids = edge_attr.reshape(-1)
+        edge_ids = raw_ids.to(device=device, dtype=torch.long)
+
         # Avoid tracer warnings during ONNX export caused by Python scalar extraction.
         if torch.onnx.is_in_onnx_export() or torch.jit.is_tracing():
             return edge_ids
+
         min_id = int(edge_ids.min().item())
         max_id = int(edge_ids.max().item())
         if min_id < 0:
@@ -167,14 +161,15 @@ class GNNEncoder(nn.Module):
         *,
         device: torch.device,
     ) -> torch.Tensor:
+        is_tracing = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing()
         x = node_features
         if x.dim() == 1:
             x = x.view(-1, 1)
-        if x.size(0) == 0:
+        if (not is_tracing) and x.size(0) == 0:
             return torch.zeros((0,), dtype=torch.long, device=device)
 
         if self.dataset_type in {DATASET_TYPE_HASHED, DATASET_TYPE_MAPPED}:
-            if x.size(-1) != 1:
+            if (not is_tracing) and x.size(-1) != 1:
                 raise ValueError(
                     f"{self.dataset_type} dataset expects scalar node IDs for label embedding, got shape {tuple(x.shape)}."
                 )
@@ -218,11 +213,8 @@ class GNNEncoder(nn.Module):
 
         for conv in self.layers:
             if isinstance(conv, GINEConv):
-                if edge_ids.numel() == 0:
-                    e = x.new_zeros((0, self.edge_emb_dim))
-                else:
-                    e = self.edge_embedding(edge_ids)
-                    e = self.edge_proj(e)
+                e = self.edge_embedding(edge_ids)
+                e = self.edge_proj(e)
                 x = F.relu(conv(x, edge_index, e))
             elif isinstance(conv, RGCNConv):
                 x = F.relu(conv(x, edge_index, edge_ids))
@@ -283,6 +275,7 @@ class FrontierPolicyNetwork(nn.Module):
         pool_membership: Optional[torch.Tensor] = None,
         expected_size: Optional[int] = None,
     ) -> torch.Tensor:
+        is_tracing = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing()
         if membership.dim() != 1:
             raise ValueError(f"membership must be 1D, got shape {tuple(membership.shape)}")
         if expected_size is not None and int(expected_size) < 0:
@@ -319,7 +312,7 @@ class FrontierPolicyNetwork(nn.Module):
             m = membership[mask]
         if m.dim() != 1:
             raise ValueError(f"pool membership vector must be 1D, got shape {tuple(m.shape)}")
-        if x.size(0) != m.numel():
+        if (not is_tracing) and x.size(0) != m.numel():
             raise ValueError(
                 f"Pooled tensor and membership mismatch: x.size(0)={x.size(0)} m.numel()={m.numel()}"
             )
@@ -357,10 +350,24 @@ class FrontierPolicyNetwork(nn.Module):
         self,
         z: torch.Tensor,
         candidate_batch: Optional[torch.Tensor],
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not self.use_global_context:
             return z
         if candidate_batch is None:
+            if mask is not None:
+                is_tracing = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing()
+                mask_vec = mask.to(device=z.device, dtype=torch.bool).view(-1)
+                if (not is_tracing) and mask_vec.numel() != z.size(0):
+                    raise ValueError(
+                        "mask and pooled candidates must have identical lengths when "
+                        "candidate_batch is None."
+                    )
+                active = mask_vec.to(dtype=z.dtype).unsqueeze(-1)
+                denom = active.sum(dim=0, keepdim=True).clamp_min(1.0)
+                ctx_vec = (z * active).sum(dim=0, keepdim=True) / denom
+                ctx = ctx_vec.expand_as(z)
+                return torch.cat([z, ctx], dim=-1)
             ctx = z.mean(dim=0, keepdim=True).expand_as(z)
             return torch.cat([z, ctx], dim=-1)
         if candidate_batch.dim() != 1:
@@ -416,7 +423,7 @@ class FrontierPolicyNetwork(nn.Module):
             pool_membership=pool_membership,
             expected_size=expected_num_candidates,
         )
-        h = self._contextualize(z, candidate_batch)
+        h = self._contextualize(z, candidate_batch, mask=mask)
         if self.use_goal_separate_input:
             if (
                 goal_node_features is not None

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
+import random
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
 
@@ -14,6 +16,7 @@ from src.data import (
     refresh_frontier_sample_targets,
     seed_everything,
 )
+from src.graph_utils import combine_graphs, load_pyg_graph
 from src.models.frontier_policy import FrontierPolicyNetwork
 from src.trainer import RLFrontierTrainer
 
@@ -147,7 +150,16 @@ def parse_args():
         default=False,
         help=(
             "If true and ONNX export is enabled, run one frontier sample through "
-            "both PyTorch and ONNX and save a parity report."
+            "both PyTorch and ONNX and save parity reports."
+        ),
+    )
+    parser.add_argument(
+        "--onnx-frontier-check-size",
+        type=int,
+        default=5,
+        help=(
+            "Frontier size for the additional ONNX order/removal check. "
+            "Candidates are sampled randomly from one CSV-materialized frontier."
         ),
     )
 
@@ -165,13 +177,37 @@ def _paths(args):
     return data_root, model_root
 
 
+def _move_file_if_exists(src: Path, dst: Path) -> None:
+    if not src.exists():
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        dst.unlink()
+    src.replace(dst)
+
+
 def _build_or_load_samples(args):
     data_root, _ = _paths(args)
+    sample_root = data_root / "data_pytorch"
+    sample_root.mkdir(parents=True, exist_ok=True)
+    legacy_sample_paths = {
+        data_root / "train_samples.pt": sample_root / "train_samples.pt",
+        data_root / "eval_samples_random.pt": sample_root / "eval_samples_random.pt",
+        data_root / "eval_samples_stress.pt": sample_root / "eval_samples_stress.pt",
+        data_root / "samples_params.pt": sample_root / "samples_params.pt",
+        data_root / "metrics" / "data" / "train_samples.pt": sample_root / "train_samples.pt",
+        data_root / "metrics" / "data" / "eval_samples_random.pt": sample_root / "eval_samples_random.pt",
+        data_root / "metrics" / "data" / "eval_samples_stress.pt": sample_root / "eval_samples_stress.pt",
+        data_root / "metrics" / "data" / "samples_params.pt": sample_root / "samples_params.pt",
+    }
+    for src, dst in legacy_sample_paths.items():
+        _move_file_if_exists(src, dst)
+
     sample_paths = {
-        "train": data_root / "train_samples.pt",
-        "eval_random": data_root / "eval_samples_random.pt",
-        "eval_stress": data_root / "eval_samples_stress.pt",
-        "params": data_root / "samples_params.pt",
+        "train": sample_root / "train_samples.pt",
+        "eval_random": sample_root / "eval_samples_random.pt",
+        "eval_stress": sample_root / "eval_samples_stress.pt",
+        "params": sample_root / "samples_params.pt",
     }
 
     def _save_split_payload(
@@ -318,6 +354,661 @@ def _infer_num_candidates(sample: Dict[str, Any]) -> int:
     return 0
 
 
+def _values_to_float_list(values: Any) -> list[float]:
+    if values is None:
+        return []
+    if isinstance(values, torch.Tensor):
+        return [float(x) for x in values.detach().cpu().view(-1).tolist()]
+    if isinstance(values, (list, tuple)):
+        out = []
+        for value in values:
+            try:
+                out.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        return out
+    return []
+
+
+def _extract_orderable_candidates(sample: Dict[str, Any]) -> list[Dict[str, Any]]:
+    successor_ids_raw = sample.get("successor_ids")
+    if not isinstance(successor_ids_raw, (list, tuple)):
+        return []
+
+    successor_ids = [str(x) for x in successor_ids_raw]
+    reward_values = _values_to_float_list(sample.get("reward_target", sample.get("rewards")))
+    distance_values = _values_to_float_list(sample.get("distance_raw", sample.get("distances")))
+    if not reward_values:
+        reward_values = [0.0 for _ in successor_ids]
+    if not distance_values:
+        distance_values = [0.0 for _ in successor_ids]
+
+    n = min(len(successor_ids), len(reward_values), len(distance_values))
+    out = []
+    for idx in range(n):
+        out.append(
+            {
+                "source_index": int(idx),
+                "successor_id": successor_ids[idx],
+                "reward": float(reward_values[idx]),
+                "distance": float(distance_values[idx]),
+            }
+        )
+    return out
+
+
+def _build_frontier_sample_from_candidates(
+    ordered_candidates: Sequence[Dict[str, Any]],
+    successor_graphs: Dict[str, Any],
+    goal_graph: Optional[Any],
+    goal_path: str,
+    base_sample: Dict[str, Any],
+    kind_of_data: str,
+    failure_reward_value: float,
+) -> Dict[str, Any]:
+    if not ordered_candidates:
+        raise ValueError("Cannot build a frontier sample from an empty candidate list.")
+
+    frontier_graphs = [successor_graphs[str(c["successor_id"])] for c in ordered_candidates]
+    combined = combine_graphs(
+        frontier_graphs=frontier_graphs,
+        goal_graph=goal_graph,
+        kind_of_data=kind_of_data,
+        action_ids=None,
+    )
+
+    reward_values = [float(c["reward"]) for c in ordered_candidates]
+    distance_values = [float(c["distance"]) for c in ordered_candidates]
+    reward_target = torch.tensor(reward_values, dtype=torch.float32)
+    distance_raw = torch.tensor(distance_values, dtype=torch.float32)
+    is_failure = torch.tensor(
+        [float(r) <= float(failure_reward_value) for r in reward_values],
+        dtype=torch.bool,
+    )
+    oracle_index = int(torch.argmax(reward_target).item())
+
+    sample = {
+        "node_features": combined.node_features,
+        "edge_index": combined.edge_index,
+        "edge_attr": combined.edge_attr,
+        "membership": combined.membership,
+        "action_map": combined.action_map,
+        "successor_ids": [str(c["successor_id"]) for c in ordered_candidates],
+        "reward_target": reward_target,
+        "rewards": reward_target.clone(),
+        "distance_raw": distance_raw,
+        "distances": distance_raw.clone(),
+        "is_failure": is_failure,
+        "oracle_index": torch.tensor(oracle_index, dtype=torch.long),
+        "oracle_reward": reward_target[oracle_index].clone(),
+        "goal_path": str(goal_path),
+        "predecessor_path": str(base_sample.get("predecessor_path", "")),
+        "dataset_id": str(base_sample.get("dataset_id", "")),
+        "frontier_has_failure": bool(is_failure.any().item()),
+    }
+    if "stress_schedule" in base_sample:
+        sample["stress_schedule"] = str(base_sample.get("stress_schedule", ""))
+    if combined.pool_node_index is not None and combined.pool_membership is not None:
+        sample["pool_node_index"] = combined.pool_node_index
+        sample["pool_membership"] = combined.pool_membership
+    if goal_graph is not None:
+        sample["goal_node_features"] = goal_graph.node_features
+        sample["goal_edge_index"] = goal_graph.edge_index
+        sample["goal_edge_attr"] = goal_graph.edge_attr
+    return sample
+
+
+def _infer_static_onnx_output_len(ort_sess: Any) -> Optional[int]:
+    try:
+        out_shape = ort_sess.get_outputs()[0].shape
+        if out_shape and isinstance(out_shape[0], int) and out_shape[0] > 0:
+            return int(out_shape[0])
+    except Exception:
+        return None
+    return None
+
+
+def _run_single_sample_pytorch_and_onnx(
+    trainer: RLFrontierTrainer,
+    sample: Dict[str, Any],
+    kind_of_data: str,
+    ort_sess: Any,
+    np_mod: Any,
+    static_onnx_len: Optional[int],
+) -> Dict[str, Any]:
+    n_candidates = _infer_num_candidates(sample)
+    if n_candidates <= 0:
+        return {
+            "status": "error",
+            "error": "sample has no candidates.",
+            "num_candidates_from_sample": int(n_candidates),
+        }
+
+    required_base = ["node_features", "edge_index", "edge_attr", "membership"]
+    missing_base = [k for k in required_base if k not in sample]
+    if missing_base:
+        return {
+            "status": "error",
+            "error": f"sample is missing required tensors {missing_base}.",
+            "num_candidates_from_sample": int(n_candidates),
+        }
+
+    use_goal_inputs = kind_of_data == "separated" and trainer.model.use_goal_separate_input
+    if use_goal_inputs:
+        goal_keys = ["goal_node_features", "goal_edge_index", "goal_edge_attr"]
+        goal_missing = [k for k in goal_keys if k not in sample]
+        if goal_missing:
+            return {
+                "status": "error",
+                "error": f"sample is missing goal tensors {goal_missing}.",
+                "num_candidates_from_sample": int(n_candidates),
+            }
+
+    node_features = sample["node_features"].to(torch.float32)
+    edge_index = sample["edge_index"].to(torch.int64)
+    edge_attr = sample["edge_attr"].to(torch.int64)
+    membership = sample["membership"].to(torch.int64)
+
+    model_kwargs: Dict[str, Any] = {
+        "node_features": node_features.to(trainer.device),
+        "edge_index": edge_index.to(trainer.device),
+        "edge_attr": edge_attr.to(trainer.device),
+        "membership": membership.to(trainer.device),
+        "candidate_batch": None,
+    }
+    if use_goal_inputs:
+        goal_batch = sample.get("goal_batch")
+        if goal_batch is None:
+            goal_batch = torch.zeros(
+                (int(sample["goal_node_features"].size(0)),),
+                dtype=torch.int64,
+            )
+        else:
+            goal_batch = goal_batch.to(torch.int64)
+        model_kwargs["goal_node_features"] = sample["goal_node_features"].to(
+            trainer.device, dtype=torch.float32
+        )
+        model_kwargs["goal_edge_index"] = sample["goal_edge_index"].to(
+            trainer.device, dtype=torch.int64
+        )
+        model_kwargs["goal_edge_attr"] = sample["goal_edge_attr"].to(
+            trainer.device, dtype=torch.int64
+        )
+        model_kwargs["goal_batch"] = goal_batch.to(trainer.device)
+
+    try:
+        with torch.no_grad():
+            trainer.model.eval()
+            pytorch_logits = trainer.model(**model_kwargs).detach().cpu().to(torch.float32).view(-1)
+        mask = torch.ones((int(pytorch_logits.numel()),), dtype=torch.bool)
+        model_kwargs["mask"] = mask.to(trainer.device)
+        with torch.no_grad():
+            trainer.model.eval()
+            pytorch_logits = trainer.model(**model_kwargs).detach().cpu().to(torch.float32).view(-1)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "error": f"PyTorch inference failed: {exc}",
+            "num_candidates_from_sample": int(n_candidates),
+        }
+
+    def _mask_numpy(mask_len: int, valid_len: int):
+        valid = max(0, min(int(mask_len), int(valid_len)))
+        out = torch.zeros((int(mask_len),), dtype=torch.bool)
+        if valid > 0:
+            out[:valid] = True
+        return out.numpy().astype("bool")
+
+    base_onnx_inputs = {
+        "node_features": node_features.detach().cpu().numpy().astype("float32"),
+        "edge_index": edge_index.detach().cpu().numpy().astype("int64"),
+        "edge_attr": edge_attr.detach().cpu().numpy().astype("int64"),
+        "membership": membership.detach().cpu().numpy().astype("int64"),
+    }
+    if use_goal_inputs:
+        goal_batch = sample.get("goal_batch")
+        if goal_batch is None:
+            goal_batch = torch.zeros(
+                (int(sample["goal_node_features"].size(0)),),
+                dtype=torch.int64,
+            )
+        else:
+            goal_batch = goal_batch.to(torch.int64)
+        base_onnx_inputs["goal_node_features"] = (
+            sample["goal_node_features"].detach().cpu().numpy().astype("float32")
+        )
+        base_onnx_inputs["goal_edge_index"] = (
+            sample["goal_edge_index"].detach().cpu().numpy().astype("int64")
+        )
+        base_onnx_inputs["goal_edge_attr"] = (
+            sample["goal_edge_attr"].detach().cpu().numpy().astype("int64")
+        )
+        base_onnx_inputs["goal_batch"] = goal_batch.detach().cpu().numpy().astype("int64")
+
+    onnx_logits_np = None
+    onnx_mask_len = None
+    last_onnx_error = None
+    mask_attempts = []
+    if static_onnx_len is not None:
+        mask_attempts.append(int(static_onnx_len))
+    if int(pytorch_logits.numel()) > 0 and int(pytorch_logits.numel()) not in mask_attempts:
+        mask_attempts.append(int(pytorch_logits.numel()))
+    if int(n_candidates) > 0 and int(n_candidates) not in mask_attempts:
+        mask_attempts.append(int(n_candidates))
+
+    for mask_len in mask_attempts:
+        try:
+            onnx_inputs = dict(base_onnx_inputs)
+            onnx_inputs["mask"] = _mask_numpy(mask_len=mask_len, valid_len=n_candidates)
+            onnx_logits_np = (
+                np_mod.asarray(ort_sess.run(["logits"], onnx_inputs)[0], dtype=np_mod.float32)
+                .reshape(-1)
+                .astype(np_mod.float32)
+            )
+            onnx_mask_len = int(mask_len)
+            break
+        except Exception as exc:
+            last_onnx_error = exc
+
+    if onnx_logits_np is None:
+        return {
+            "status": "error",
+            "error": f"ONNX inference failed: {last_onnx_error}",
+            "num_candidates_from_sample": int(n_candidates),
+            "num_candidates_from_model": int(pytorch_logits.numel()),
+        }
+
+    valid_for_onnx = max(0, min(int(n_candidates), int(onnx_logits_np.size)))
+    onnx_pred_idx = int(np_mod.argmax(onnx_logits_np[:valid_for_onnx])) if valid_for_onnx > 0 else -1
+    onnx_logits_valid = onnx_logits_np[: min(valid_for_onnx, 5)].tolist()
+
+    valid_for_torch = max(0, min(int(n_candidates), int(pytorch_logits.numel())))
+    pytorch_pred_idx = (
+        int(torch.argmax(pytorch_logits[:valid_for_torch]).item()) if valid_for_torch > 0 else -1
+    )
+
+    successor_ids_raw = sample.get("successor_ids")
+    successor_ids = [str(x) for x in successor_ids_raw] if isinstance(successor_ids_raw, (list, tuple)) else []
+    onnx_pred_successor = (
+        successor_ids[onnx_pred_idx] if 0 <= onnx_pred_idx < len(successor_ids) else None
+    )
+    pytorch_pred_successor = (
+        successor_ids[pytorch_pred_idx] if 0 <= pytorch_pred_idx < len(successor_ids) else None
+    )
+
+    pytorch_logits_np = pytorch_logits.detach().cpu().numpy().astype("float32")
+    max_abs_diff = None
+    if onnx_logits_np.shape == pytorch_logits_np.shape:
+        max_abs_diff = (
+            float(np_mod.max(np_mod.abs(onnx_logits_np - pytorch_logits_np)))
+            if onnx_logits_np.size > 0
+            else 0.0
+        )
+
+    return {
+        "status": "ok",
+        "num_candidates_from_sample": int(n_candidates),
+        "num_candidates_from_model": int(pytorch_logits.numel()),
+        "onnx_mask_len_used": int(onnx_mask_len) if onnx_mask_len is not None else None,
+        "onnx_prediction_index": int(onnx_pred_idx),
+        "onnx_prediction_successor_id": onnx_pred_successor,
+        "onnx_logits": onnx_logits_np.tolist(),
+        "onnx_logits_valid": onnx_logits_valid,
+        "pytorch_prediction_index": int(pytorch_pred_idx),
+        "pytorch_prediction_successor_id": pytorch_pred_successor,
+        "pytorch_logits": pytorch_logits_np.tolist(),
+        "max_abs_logit_diff": max_abs_diff,
+    }
+
+
+def _compare_random_frontier_order_and_shrinking_onnx(
+    trainer: RLFrontierTrainer,
+    train_samples: Sequence[Dict[str, Any]],
+    eval_samples: Sequence[Dict[str, Any]],
+    eval2_samples: Sequence[Dict[str, Any]],
+    eval3_samples: Sequence[Dict[str, Any]],
+    kind_of_data: str,
+    dataset_type: str,
+    seed: int,
+    onnx_frontier_check_size: int,
+    failure_reward_value: float,
+    onnx_path: Path,
+    report_path: Path,
+) -> None:
+    frontier_size = int(onnx_frontier_check_size)
+    if frontier_size <= 0:
+        print(
+            "[warning] Could not run ONNX order/removal check: "
+            f"invalid frontier size {frontier_size}."
+        )
+        return
+    if frontier_size > 8:
+        print(
+            "[warning] Could not run ONNX order/removal check: "
+            f"frontier size {frontier_size} is too large for full permutation logging."
+        )
+        return
+
+    try:
+        import numpy as np
+        import onnxruntime as ort
+    except ImportError as exc:
+        print(
+            "[warning] Skipping ONNX order/removal check: "
+            f"missing dependency ({exc})."
+        )
+        return
+
+    eligible: list[Tuple[str, int, Dict[str, Any], list[Dict[str, Any]]]] = []
+    split_samples = [
+        ("train", train_samples),
+        ("eval_random", eval_samples),
+        ("eval_stress_fifo", eval2_samples),
+        ("eval_stress_lifo", eval3_samples),
+    ]
+    for split_name, split_data in split_samples:
+        for sample_idx, sample in enumerate(split_data):
+            candidates = _extract_orderable_candidates(sample)
+            if len(candidates) < frontier_size:
+                continue
+            if kind_of_data == "separated" and not str(sample.get("goal_path", "")).strip():
+                continue
+            eligible.append((split_name, int(sample_idx), sample, candidates))
+
+    if not eligible:
+        print(
+            "[warning] Could not run ONNX order/removal check: "
+            f"no frontier with at least {frontier_size} candidates."
+        )
+        return
+
+    rng = random.Random(int(seed) + 99173)
+    split_name, split_index, base_sample, base_candidates = rng.choice(eligible)
+    selected_positions = rng.sample(list(range(len(base_candidates))), frontier_size)
+    selected_candidates = [dict(base_candidates[pos]) for pos in selected_positions]
+
+    dataset_type_norm = str(dataset_type).upper()
+    successor_graphs: Dict[str, Any] = {}
+    try:
+        for candidate in selected_candidates:
+            successor_id = str(candidate["successor_id"])
+            if successor_id not in successor_graphs:
+                successor_graphs[successor_id] = load_pyg_graph(
+                    successor_id,
+                    dataset_type=dataset_type_norm,
+                )
+    except Exception as exc:
+        print(
+            "[warning] Could not run ONNX order/removal check: "
+            f"failed to load candidate graph ({exc})."
+        )
+        return
+
+    goal_path = str(base_sample.get("goal_path", "")).strip()
+    goal_graph = None
+    if kind_of_data == "separated":
+        try:
+            goal_graph = load_pyg_graph(goal_path, dataset_type=dataset_type_norm)
+        except Exception as exc:
+            print(
+                "[warning] Could not run ONNX order/removal check: "
+                f"failed to load goal graph ({exc})."
+            )
+            return
+
+    try:
+        sess_options = ort.SessionOptions()
+        sess_options.log_severity_level = 4
+        ort_sess = ort.InferenceSession(
+            onnx_path.as_posix(),
+            sess_options=sess_options,
+            providers=["CPUExecutionProvider"],
+        )
+    except Exception as exc:
+        print(
+            "[warning] Could not run ONNX order/removal check: "
+            f"failed to load ONNX session ({exc})."
+        )
+        return
+    static_onnx_len = _infer_static_onnx_output_len(ort_sess)
+
+    support_probe_results = []
+    max_supported_frontier_size = 0
+    for probe_size in range(frontier_size, 0, -1):
+        probe_candidates = [dict(candidate) for candidate in selected_candidates[:probe_size]]
+        try:
+            probe_sample = _build_frontier_sample_from_candidates(
+                ordered_candidates=probe_candidates,
+                successor_graphs=successor_graphs,
+                goal_graph=goal_graph,
+                goal_path=goal_path,
+                base_sample=base_sample,
+                kind_of_data=kind_of_data,
+                failure_reward_value=float(failure_reward_value),
+            )
+            probe_prediction = _run_single_sample_pytorch_and_onnx(
+                trainer=trainer,
+                sample=probe_sample,
+                kind_of_data=kind_of_data,
+                ort_sess=ort_sess,
+                np_mod=np,
+                static_onnx_len=static_onnx_len,
+            )
+        except Exception as exc:
+            probe_prediction = {
+                "status": "error",
+                "error": f"support probe failed: {exc}",
+            }
+
+        support_probe_results.append(
+            {
+                "frontier_size": int(probe_size),
+                "status": str(probe_prediction.get("status", "error")),
+                "error": (
+                    str(probe_prediction.get("error", ""))
+                    if probe_prediction.get("status") != "ok"
+                    else None
+                ),
+                "onnx_mask_len_used": probe_prediction.get("onnx_mask_len_used"),
+            }
+        )
+        if probe_prediction.get("status") == "ok":
+            max_supported_frontier_size = int(probe_size)
+            break
+
+    if max_supported_frontier_size <= 0:
+        report = {
+            "onnx_path": onnx_path.as_posix(),
+            "seed": int(seed),
+            "frontier_size_requested": int(frontier_size),
+            "frontier_size_effective_for_order_check": 0,
+            "selection_source": "csv_materialized_frontier_sample",
+            "support_probe_results": support_probe_results,
+            "selected_frontier": {
+                "sample_split": split_name,
+                "sample_index": int(split_index),
+                "dataset_id": str(base_sample.get("dataset_id", "")),
+                "predecessor_path": str(base_sample.get("predecessor_path", "")),
+                "goal_path": goal_path,
+                "num_candidates_in_source_frontier": int(len(base_candidates)),
+                "selected_positions_in_source_frontier": [int(i) for i in selected_positions],
+                "selected_source_frontier_indices": [
+                    int(candidate["source_index"]) for candidate in selected_candidates
+                ],
+                "selected_successor_ids": [
+                    str(candidate["successor_id"]) for candidate in selected_candidates
+                ],
+            },
+            "order_permutation_check": {
+                "num_permutations": 0,
+                "results": [],
+            },
+            "shrinking_frontier_check": {
+                "num_steps": 0,
+                "results": [],
+            },
+        }
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        with report_path.open("w", encoding="utf-8") as fh:
+            json.dump(report, fh, indent=2)
+        print(
+            "[warning] Could not run ONNX order/removal check: "
+            "no supported frontier size found for the selected sample. "
+            f"Report written to: {report_path}"
+        )
+        return
+
+    if max_supported_frontier_size < frontier_size:
+        print(
+            "[warning] ONNX order/removal check: requested frontier size "
+            f"{frontier_size} is not fully supported by current ONNX graph; "
+            f"running order permutations with effective size {max_supported_frontier_size}."
+        )
+
+    permutation_candidates = [
+        dict(candidate) for candidate in selected_candidates[:max_supported_frontier_size]
+    ]
+    permutation_results = []
+    for permutation_idx, permutation in enumerate(
+        itertools.permutations(range(max_supported_frontier_size))
+    ):
+        ordered_candidates = [permutation_candidates[pos] for pos in permutation]
+        try:
+            ordered_sample = _build_frontier_sample_from_candidates(
+                ordered_candidates=ordered_candidates,
+                successor_graphs=successor_graphs,
+                goal_graph=goal_graph,
+                goal_path=goal_path,
+                base_sample=base_sample,
+                kind_of_data=kind_of_data,
+                failure_reward_value=float(failure_reward_value),
+            )
+            prediction = _run_single_sample_pytorch_and_onnx(
+                trainer=trainer,
+                sample=ordered_sample,
+                kind_of_data=kind_of_data,
+                ort_sess=ort_sess,
+                np_mod=np,
+                static_onnx_len=static_onnx_len,
+            )
+        except Exception as exc:
+            prediction = {
+                "status": "error",
+                "error": f"failed to build/evaluate permutation: {exc}",
+            }
+
+        permutation_results.append(
+            {
+                "permutation_index": int(permutation_idx),
+                "selected_positions_order": [int(i) for i in permutation],
+                "source_frontier_indices_order": [
+                    int(candidate["source_index"]) for candidate in ordered_candidates
+                ],
+                "successor_ids_order": [
+                    str(candidate["successor_id"]) for candidate in ordered_candidates
+                ],
+                "prediction": prediction,
+            }
+        )
+
+    shrinking_results = []
+    shrinking_candidates = [dict(candidate) for candidate in selected_candidates]
+    removed_from_previous_step = None
+    step = 0
+    while shrinking_candidates:
+        try:
+            shrinking_sample = _build_frontier_sample_from_candidates(
+                ordered_candidates=shrinking_candidates,
+                successor_graphs=successor_graphs,
+                goal_graph=goal_graph,
+                goal_path=goal_path,
+                base_sample=base_sample,
+                kind_of_data=kind_of_data,
+                failure_reward_value=float(failure_reward_value),
+            )
+            prediction = _run_single_sample_pytorch_and_onnx(
+                trainer=trainer,
+                sample=shrinking_sample,
+                kind_of_data=kind_of_data,
+                ort_sess=ort_sess,
+                np_mod=np,
+                static_onnx_len=static_onnx_len,
+            )
+        except Exception as exc:
+            prediction = {
+                "status": "error",
+                "error": f"failed to build/evaluate shrinking frontier: {exc}",
+            }
+
+        shrinking_results.append(
+            {
+                "step": int(step),
+                "frontier_size": int(len(shrinking_candidates)),
+                "removed_from_previous_step": removed_from_previous_step,
+                "source_frontier_indices_order": [
+                    int(candidate["source_index"]) for candidate in shrinking_candidates
+                ],
+                "successor_ids_order": [
+                    str(candidate["successor_id"]) for candidate in shrinking_candidates
+                ],
+                "prediction": prediction,
+            }
+        )
+
+        if len(shrinking_candidates) <= 1:
+            break
+
+        remove_pos = int(rng.randrange(len(shrinking_candidates)))
+        removed_candidate = shrinking_candidates.pop(remove_pos)
+        removed_from_previous_step = {
+            "removed_position": int(remove_pos),
+            "source_frontier_index": int(removed_candidate["source_index"]),
+            "successor_id": str(removed_candidate["successor_id"]),
+        }
+        step += 1
+
+    report = {
+        "onnx_path": onnx_path.as_posix(),
+        "seed": int(seed),
+        "frontier_size_requested": int(frontier_size),
+        "frontier_size_effective_for_order_check": int(max_supported_frontier_size),
+        "selection_source": "csv_materialized_frontier_sample",
+        "support_probe_results": support_probe_results,
+        "selected_frontier": {
+            "sample_split": split_name,
+            "sample_index": int(split_index),
+            "dataset_id": str(base_sample.get("dataset_id", "")),
+            "predecessor_path": str(base_sample.get("predecessor_path", "")),
+            "goal_path": goal_path,
+            "num_candidates_in_source_frontier": int(len(base_candidates)),
+            "selected_positions_in_source_frontier": [int(i) for i in selected_positions],
+            "selected_source_frontier_indices": [
+                int(candidate["source_index"]) for candidate in selected_candidates
+            ],
+            "selected_successor_ids": [
+                str(candidate["successor_id"]) for candidate in selected_candidates
+            ],
+        },
+        "order_permutation_check": {
+            "num_permutations": int(len(permutation_results)),
+            "results": permutation_results,
+        },
+        "shrinking_frontier_check": {
+            "num_steps": int(len(shrinking_results)),
+            "results": shrinking_results,
+        },
+    }
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with report_path.open("w", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2)
+
+    print(
+        "[onnx-check] frontier order/removal report written to: "
+        f"{report_path}"
+    )
+
+
 def _compare_first_example_pytorch_vs_onnx(
     trainer: RLFrontierTrainer,
     train_samples: Sequence[Dict[str, Any]],
@@ -443,8 +1134,11 @@ def _compare_first_example_pytorch_vs_onnx(
         base_onnx_inputs["goal_batch"] = goal_batch.detach().cpu().numpy().astype("int64")
 
     try:
+        sess_options = ort.SessionOptions()
+        sess_options.log_severity_level = 4
         ort_sess = ort.InferenceSession(
             onnx_path.as_posix(),
+            sess_options=sess_options,
             providers=["CPUExecutionProvider"],
         )
     except Exception as exc:  # pragma: no cover - runtime dependent
@@ -830,11 +1524,53 @@ def main(args):
     )
 
     _, model_root = _paths(args)
-    model_ckpt = model_root / f"{args.model_name}.pt"
+    metrics_root = model_root / "metrics"
+    metrics_root.mkdir(parents=True, exist_ok=True)
+    metrics_eval_reports_dir = metrics_root / "eval_reports"
+    metrics_eval_reports_dir.mkdir(parents=True, exist_ok=True)
+    metrics_onnx_reports_dir = metrics_root / "onnx"
+    metrics_onnx_reports_dir.mkdir(parents=True, exist_ok=True)
+
     best_ckpt = model_root / "best.pt"
     onnx_path = model_root / f"{args.model_name}.onnx"
+    model_ckpt = metrics_root / f"{args.model_name}.pt"
+    legacy_model_ckpt = model_root / f"{args.model_name}.pt"
+
+    legacy_to_metrics = {
+        legacy_model_ckpt: model_ckpt,
+        model_root / "history_losses.json": metrics_root / "history_losses.json",
+        model_root / "best_model_performance.json": metrics_root / "best_model_performance.json",
+        model_root / "dataset_split_summary.json": metrics_root / "dataset_split_summary.json",
+        model_root / f"{args.model_name}_eval_random.json": (
+            metrics_eval_reports_dir / f"{args.model_name}_eval_random.json"
+        ),
+        model_root / f"{args.model_name}_eval_stress_fifo.json": (
+            metrics_eval_reports_dir / f"{args.model_name}_eval_stress_fifo.json"
+        ),
+        model_root / f"{args.model_name}_eval_stress_lifo.json": (
+            metrics_eval_reports_dir / f"{args.model_name}_eval_stress_lifo.json"
+        ),
+        model_root / f"{args.model_name}_eval_stress.json": (
+            metrics_eval_reports_dir / f"{args.model_name}_eval_stress.json"
+        ),
+        model_root / f"{args.model_name}_eval.json": (
+            metrics_eval_reports_dir / f"{args.model_name}_eval.json"
+        ),
+        model_root / f"{args.model_name}_eval2.json": (
+            metrics_eval_reports_dir / f"{args.model_name}_eval2.json"
+        ),
+        model_root / f"{args.model_name}_onnx_first_example_check.json": (
+            metrics_onnx_reports_dir / f"{args.model_name}_onnx_first_example_check.json"
+        ),
+        model_root / f"{args.model_name}_onnx_frontier_order_removal_check.json": (
+            metrics_onnx_reports_dir / f"{args.model_name}_onnx_frontier_order_removal_check.json"
+        ),
+    }
+    for src, dst in legacy_to_metrics.items():
+        _move_file_if_exists(src, dst)
 
     if args.train:
+        train_model_name = f"metrics/{args.model_name}"
         trainer.train(
             train_loader=train_loader,
             eval_loader=eval_loader,
@@ -843,17 +1579,37 @@ def main(args):
             eval2_loader_name="eval_stress_fifo",
             n_epochs=args.n_train_epochs,
             checkpoint_dir=model_root.as_posix(),
-            model_name=args.model_name,
+            model_name=train_model_name,
             eval_every=args.eval_every,
             early_stopping_patience_evals=args.early_stopping_patience_evals,
         )
+        _move_file_if_exists(
+            model_root / "history_losses.json",
+            metrics_root / "history_losses.json",
+        )
+        _move_file_if_exists(
+            model_root / "best_model_performance.json",
+            metrics_root / "best_model_performance.json",
+        )
 
-    load_ckpt = best_ckpt if best_ckpt.exists() else model_ckpt
-    if load_ckpt.exists():
+    load_ckpt = None
+    for candidate_path in (best_ckpt, model_ckpt, legacy_model_ckpt):
+        if candidate_path.exists():
+            load_ckpt = candidate_path
+            break
+
+    if load_ckpt is not None:
         loaded = RLFrontierTrainer.load_model(load_ckpt, device=trainer.device)
         trainer.model = loaded.to(trainer.device)
     elif not args.train:
-        raise FileNotFoundError(f"Missing checkpoint: {best_ckpt} or {model_ckpt}")
+        raise FileNotFoundError(
+            f"Missing checkpoint: {best_ckpt} or {model_ckpt} or {legacy_model_ckpt}"
+        )
+    else:
+        raise FileNotFoundError(
+            "Training completed but no checkpoint was found at "
+            f"{best_ckpt}, {model_ckpt}, or {legacy_model_ckpt}."
+        )
 
     eval_data_available = bool(eval_samples or eval2_samples or eval3_samples)
     if args.evaluate and eval_data_available:
@@ -863,18 +1619,30 @@ def main(args):
         )
         eval3_metrics = trainer.evaluate(eval3_loader, verbose=True) if eval3_loader is not None else {}
 
-        with (model_root / f"{args.model_name}_eval_random.json").open("w", encoding="utf-8") as fh:
+        with (metrics_eval_reports_dir / f"{args.model_name}_eval_random.json").open(
+            "w", encoding="utf-8"
+        ) as fh:
             json.dump(eval_metrics, fh, indent=2)
-        with (model_root / f"{args.model_name}_eval_stress_fifo.json").open("w", encoding="utf-8") as fh:
+        with (metrics_eval_reports_dir / f"{args.model_name}_eval_stress_fifo.json").open(
+            "w", encoding="utf-8"
+        ) as fh:
             json.dump(eval2_metrics, fh, indent=2)
-        with (model_root / f"{args.model_name}_eval_stress_lifo.json").open("w", encoding="utf-8") as fh:
+        with (metrics_eval_reports_dir / f"{args.model_name}_eval_stress_lifo.json").open(
+            "w", encoding="utf-8"
+        ) as fh:
             json.dump(eval3_metrics, fh, indent=2)
-        with (model_root / f"{args.model_name}_eval_stress.json").open("w", encoding="utf-8") as fh:
+        with (metrics_eval_reports_dir / f"{args.model_name}_eval_stress.json").open(
+            "w", encoding="utf-8"
+        ) as fh:
             json.dump({"fifo": eval2_metrics, "lifo": eval3_metrics}, fh, indent=2)
         # Backward-compatible names.
-        with (model_root / f"{args.model_name}_eval.json").open("w", encoding="utf-8") as fh:
+        with (metrics_eval_reports_dir / f"{args.model_name}_eval.json").open(
+            "w", encoding="utf-8"
+        ) as fh:
             json.dump(eval_metrics, fh, indent=2)
-        with (model_root / f"{args.model_name}_eval2.json").open("w", encoding="utf-8") as fh:
+        with (metrics_eval_reports_dir / f"{args.model_name}_eval2.json").open(
+            "w", encoding="utf-8"
+        ) as fh:
             json.dump(eval2_metrics, fh, indent=2)
 
         eval_metrics_dir = model_root / "metrics" / "eval_random"
@@ -986,7 +1754,7 @@ def main(args):
             }
             for dataset_id, stats in sorted(train_state_stats_by_dataset.items())
         ]
-    with (model_root / "dataset_split_summary.json").open("w", encoding="utf-8") as fh:
+    with (metrics_root / "dataset_split_summary.json").open("w", encoding="utf-8") as fh:
         json.dump(split_summary, fh, indent=2)
 
     if args.export_onnx:
@@ -999,11 +1767,34 @@ def main(args):
                 eval2_samples=eval2_samples,
                 kind_of_data=args.kind_of_data,
                 onnx_path=onnx_path,
-                report_path=model_root / f"{args.model_name}_onnx_first_example_check.json",
+                report_path=(
+                    metrics_onnx_reports_dir / f"{args.model_name}_onnx_first_example_check.json"
+                ),
+            )
+            _compare_random_frontier_order_and_shrinking_onnx(
+                trainer=trainer,
+                train_samples=train_samples,
+                eval_samples=eval_samples,
+                eval2_samples=eval2_samples,
+                eval3_samples=eval3_samples,
+                kind_of_data=args.kind_of_data,
+                dataset_type=args.dataset_type,
+                seed=int(args.seed),
+                onnx_frontier_check_size=int(args.onnx_frontier_check_size),
+                failure_reward_value=float(args.failure_reward_value),
+                onnx_path=onnx_path,
+                report_path=(
+                    metrics_onnx_reports_dir
+                    / f"{args.model_name}_onnx_frontier_order_removal_check.json"
+                ),
             )
 
     best_epoch = None
-    best_perf_path = model_root / "best_model_performance.json"
+    best_perf_path = metrics_root / "best_model_performance.json"
+    if not best_perf_path.exists():
+        legacy_best_perf = model_root / "best_model_performance.json"
+        if legacy_best_perf.exists():
+            best_perf_path = legacy_best_perf
     if best_perf_path.exists():
         try:
             with best_perf_path.open("r", encoding="utf-8") as fh:
