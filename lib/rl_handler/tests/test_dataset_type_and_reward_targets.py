@@ -16,6 +16,7 @@ if str(RL_HANDLER_ROOT) not in sys.path:
 from src.data import (
     FrontierRow,
     build_frontier_samples,
+    build_stress_eval_frontiers_for_dataset,
     group_clean_frontiers,
     normalize_distance_to_reward,
 )
@@ -87,7 +88,7 @@ class TestDatasetTypeAndRewardTargets(unittest.TestCase):
         self.assertEqual(len(only["rewards"]), 2)
         self.assertGreater(float(max(only["rewards"])), -1.0)
 
-    def test_build_frontier_samples_builds_eval2(self) -> None:
+    def test_build_frontier_samples_builds_random_and_stress_evals(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "training_data" / "prob_0"
             root.mkdir(parents=True, exist_ok=True)
@@ -115,26 +116,98 @@ class TestDatasetTypeAndRewardTargets(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            train_samples, eval_samples, eval2_samples, params = build_frontier_samples(
+            train_samples, eval_samples, eval2_samples, eval3_samples, params = build_frontier_samples(
                 folder_data=(Path(td) / "training_data").as_posix(),
                 list_subset_train=[],
                 kind_of_data="merged",
                 dataset_type="MAPPED",
-                test_size=0.5,
                 seed=42,
-                include_eval2=True,
-                max_random_eval_frontiers_for_dataset=8,
+                n_max_dataset_queries=8,
+                max_size_frontier=5,
             )
 
-            self.assertTrue(len(train_samples) >= 1)
+            self.assertEqual(len(train_samples), 2)
+            self.assertTrue(len(eval_samples) >= 1)
             self.assertTrue(len(eval2_samples) >= 1)
+            self.assertTrue(len(eval3_samples) >= 1)
+            self.assertTrue(len(eval_samples) <= 8)
             self.assertTrue(len(eval2_samples) <= 8)
+            self.assertTrue(len(eval3_samples) <= 8)
             self.assertIn("split_summary", params)
             for sample in eval2_samples:
                 rewards = sample["reward_target"]
                 best = float(rewards.max().item())
                 n_best = int((torch.abs(rewards - best) <= 1e-9).sum().item())
                 self.assertEqual(n_best, 1)
+
+    def test_build_frontier_samples_can_skip_eval_build(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "training_data" / "prob_0"
+            root.mkdir(parents=True, exist_ok=True)
+
+            succ_a = root / "succ_a.dot"
+            succ_b = root / "succ_b.dot"
+            _write_dot(succ_a, nodes=["1", "2"], edges=[("1", "2", 1)])
+            _write_dot(succ_b, nodes=["2", "3"], edges=[("2", "3", 2)])
+
+            csv_path = root / "frontiers.csv"
+            csv_path.write_text(
+                "\n".join(
+                    [
+                        "File Path,Depth,Distance From Goal,Goal,File Path Predecessor,Action",
+                        f"{succ_a.as_posix()},0,0.0,,pred0,0",
+                        f"{succ_b.as_posix()},0,5.0,,pred0,1",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            train_samples, eval_samples, eval2_samples, eval3_samples, params = build_frontier_samples(
+                folder_data=(Path(td) / "training_data").as_posix(),
+                list_subset_train=[],
+                kind_of_data="merged",
+                dataset_type="MAPPED",
+                seed=42,
+                build_eval_data=False,
+            )
+
+            self.assertEqual(len(train_samples), 1)
+            self.assertEqual(len(eval_samples), 0)
+            self.assertEqual(len(eval2_samples), 0)
+            self.assertEqual(len(eval3_samples), 0)
+            self.assertFalse(bool(params.get("build_eval_data", True)))
+
+    def test_stress_eval_builds_distinct_fifo_and_lifo_when_frontier_overflows(self) -> None:
+        clean_frontiers = [
+            {
+                "predecessor_path": "pred0",
+                "goal_path": "",
+                "successor_paths": ["s1", "s2", "s3", "s4"],
+                "distances": [1.0, 2.0, 3.0, 4.0],
+                "depths": [1, 1, 1, 1],
+                "rewards": [0.0, -0.1, -0.2, -0.3],
+            },
+            {
+                "predecessor_path": "s1",
+                "goal_path": "",
+                "successor_paths": ["s5", "s6", "s7"],
+                "distances": [5.0, 6.0, 7.0],
+                "depths": [2, 2, 2],
+                "rewards": [-0.1, -0.2, -0.3],
+            },
+        ]
+        fifo, lifo = build_stress_eval_frontiers_for_dataset(
+            clean_frontiers=clean_frontiers,
+            kind_of_data="merged",
+            n_max_dataset_queries=10,
+            max_size_frontier=4,
+            dataset_tag="synthetic",
+        )
+        self.assertGreaterEqual(len(fifo), 2)
+        self.assertGreaterEqual(len(lifo), 2)
+        self.assertEqual(len(fifo), len(lifo))
+        self.assertEqual(fifo[0]["successor_paths"], lifo[0]["successor_paths"])
+        self.assertNotEqual(fifo[1]["successor_paths"], lifo[1]["successor_paths"])
 
     def test_hashed_node_ids_are_normalized_in_model(self) -> None:
         with tempfile.TemporaryDirectory() as td:

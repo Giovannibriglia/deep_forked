@@ -638,14 +638,16 @@ class RLFrontierTrainer:
         eval_every: int = 1,
         early_stopping_patience_evals: int = 0,
         eval2_loader=None,
+        eval_loader_name: str = "eval",
+        eval2_loader_name: str = "eval2",
     ) -> Dict[str, object]:
         checkpoint = Path(checkpoint_dir)
         self._ensure_dir(checkpoint)
 
         metrics_root = checkpoint / "metrics"
         train_metrics_dir = metrics_root / "train"
-        eval_metrics_dir = metrics_root / "eval"
-        eval2_metrics_dir = metrics_root / "eval2"
+        eval_metrics_dir = metrics_root / str(eval_loader_name)
+        eval2_metrics_dir = metrics_root / str(eval2_loader_name)
         self._ensure_dir(train_metrics_dir)
         self._ensure_dir(eval_metrics_dir)
         self._ensure_dir(eval2_metrics_dir)
@@ -735,7 +737,7 @@ class RLFrontierTrainer:
                 )
                 self._save_eval_step_regime_plots(
                     eval_dir=eval_metrics_dir,
-                    eval_name="eval",
+                    eval_name=str(eval_loader_name),
                     epoch=epoch + 1,
                     eval_step=eval_step,
                     metrics=eval_metrics,
@@ -746,9 +748,9 @@ class RLFrontierTrainer:
                     iqm=history["eval_iqm_reward"],
                     iqr_std=history["eval_iqr_std_reward"],
                     xlabel="Epoch (eval checkpoints)",
-                    ylabel="Eval Reward",
+                    ylabel=f"{str(eval_loader_name)} Reward",
                     y_lim=(-1.0, 0.0),
-                    title="Eval Reward IQM ± IQR-STD",
+                    title=f"{str(eval_loader_name)} Reward IQM ± IQR-STD",
                 )
                 self._plot_iqm_with_iqr_std_band(
                     out_path=eval_metrics_dir / "abs_reward_gap_iqm_iqr_std_over_eval_steps.png",
@@ -758,11 +760,11 @@ class RLFrontierTrainer:
                     xlabel="Epoch (eval checkpoints)",
                     ylabel="|best reward - taken reward|",
                     y_lim=(0.0, 1.05),
-                    title="Eval Absolute Reward Gap IQM ± IQR-STD",
+                    title=f"{str(eval_loader_name)} Absolute Reward Gap IQM ± IQR-STD",
                 )
                 self._save_global_regime_history_plots(
                     eval_dir=eval_metrics_dir,
-                    eval_name="eval",
+                    eval_name=str(eval_loader_name),
                     regime_history=eval_regime_history,
                 )
 
@@ -784,7 +786,7 @@ class RLFrontierTrainer:
                     )
                     self._save_eval_step_regime_plots(
                         eval_dir=eval2_metrics_dir,
-                        eval_name="eval2",
+                        eval_name=str(eval2_loader_name),
                         epoch=epoch + 1,
                         eval_step=eval_step,
                         metrics=eval2_metrics,
@@ -795,9 +797,9 @@ class RLFrontierTrainer:
                         iqm=history["eval2_iqm_reward"],
                         iqr_std=history["eval2_iqr_std_reward"],
                         xlabel="Epoch (eval checkpoints)",
-                        ylabel="Eval2 Reward",
+                        ylabel=f"{str(eval2_loader_name)} Reward",
                         y_lim=(-1.0, 0.0),
-                        title="Eval2 Reward IQM ± IQR-STD",
+                        title=f"{str(eval2_loader_name)} Reward IQM ± IQR-STD",
                     )
                     self._plot_iqm_with_iqr_std_band(
                         out_path=eval2_metrics_dir / "abs_reward_gap_iqm_iqr_std_over_eval_steps.png",
@@ -807,11 +809,11 @@ class RLFrontierTrainer:
                         xlabel="Epoch (eval checkpoints)",
                         ylabel="|best reward - taken reward|",
                         y_lim=(0.0, 1.05),
-                        title="Eval2 Absolute Reward Gap IQM ± IQR-STD",
+                        title=f"{str(eval2_loader_name)} Absolute Reward Gap IQM ± IQR-STD",
                     )
                     self._save_global_regime_history_plots(
                         eval_dir=eval2_metrics_dir,
-                        eval_name="eval2",
+                        eval_name=str(eval2_loader_name),
                         regime_history=eval2_regime_history,
                     )
 

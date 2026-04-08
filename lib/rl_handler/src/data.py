@@ -45,6 +45,8 @@ RANDOM_EVAL_FRONTIER_SIZES = [
 ]
 
 FAILURE_EPS = 1e-9
+STRESS_SCHEDULE_FIFO = "fifo"
+STRESS_SCHEDULE_LIFO = "lifo"
 
 
 @dataclass
@@ -87,7 +89,7 @@ def normalize_distance_to_reward(
     dist = max(0.0, float(distance))
     if dist > max_dist:
         return float(failure_reward_value)
-    return -0.7 * (dist / max_dist)
+    return 0.9 * dist / max_dist
 
 
 def refresh_frontier_sample_targets(
@@ -222,26 +224,6 @@ def group_clean_frontiers(
     return cleaned
 
 
-def split_frontiers(
-    samples: Sequence[Dict[str, Any]],
-    test_size: float = 0.2,
-    seed: int = 42,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    samples = list(samples)
-    if len(samples) <= 1:
-        return samples, []
-
-    rng = random.Random(seed)
-    indices = list(range(len(samples)))
-    rng.shuffle(indices)
-    n_eval = int(round(len(samples) * float(test_size)))
-    n_eval = min(max(1, n_eval), len(samples) - 1)
-    eval_set = set(indices[:n_eval])
-    train = [samples[i] for i in range(len(samples)) if i not in eval_set]
-    eval_ = [samples[i] for i in range(len(samples)) if i in eval_set]
-    return train, eval_
-
-
 def _flatten_candidates(frontiers: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     candidates: List[Dict[str, Any]] = []
     for frontier in frontiers:
@@ -264,6 +246,67 @@ def _flatten_candidates(frontiers: Sequence[Dict[str, Any]]) -> List[Dict[str, A
     return candidates
 
 
+def _frontier_to_candidates(
+    frontier: Dict[str, Any],
+    kind_of_data: str,
+) -> List[Dict[str, Any]]:
+    goal_path = str(frontier.get("goal_path", "")) if kind_of_data == "separated" else ""
+    paths = [str(x) for x in frontier.get("successor_paths", [])]
+    distances = [float(x) for x in frontier.get("distances", [])]
+    depths = [int(x) for x in frontier.get("depths", [])]
+    rewards = [float(x) for x in frontier.get("rewards", [])]
+    n = min(len(paths), len(distances), len(depths), len(rewards))
+    out: List[Dict[str, Any]] = []
+    for i in range(n):
+        out.append(
+            {
+                "successor_path": paths[i],
+                "distance": distances[i],
+                "depth": depths[i],
+                "reward": rewards[i],
+                "goal_path": goal_path,
+            }
+        )
+    return out
+
+
+def _frontier_from_candidate_window(
+    candidates: Sequence[Dict[str, Any]],
+    predecessor_path: str,
+    kind_of_data: str,
+    failure_reward_value: float,
+    stress_schedule: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    if len(candidates) <= 1:
+        return None
+
+    rewards = [float(c["reward"]) for c in candidates]
+    if not rewards:
+        return None
+    if all(_is_failure_reward(r, failure_reward_value) for r in rewards):
+        return None
+
+    goal_path = ""
+    if kind_of_data == "separated":
+        goal_path = str(candidates[0].get("goal_path", ""))
+        if not goal_path:
+            return None
+        if any(str(c.get("goal_path", "")) != goal_path for c in candidates):
+            return None
+
+    out = {
+        "predecessor_path": str(predecessor_path),
+        "goal_path": goal_path,
+        "successor_paths": [str(c["successor_path"]) for c in candidates],
+        "distances": [float(c["distance"]) for c in candidates],
+        "depths": [int(c["depth"]) for c in candidates],
+        "rewards": rewards,
+    }
+    if stress_schedule:
+        out["stress_schedule"] = str(stress_schedule)
+    return out
+
+
 def _deduplicate_candidates(
     candidates: Sequence[Dict[str, Any]],
     kind_of_data: str,
@@ -279,15 +322,15 @@ def _deduplicate_candidates(
     return list(best_by_key.values())
 
 
-def build_random_eval2_frontiers_for_dataset(
+def build_random_eval_frontiers_for_dataset(
     clean_frontiers: Sequence[Dict[str, Any]],
     kind_of_data: str,
-    max_random_eval_frontiers_for_dataset: int,
+    n_max_dataset_queries: int,
     seed: int,
     dataset_tag: str,
     failure_reward_value: float = -1.0,
 ) -> List[Dict[str, Any]]:
-    target = max(0, int(max_random_eval_frontiers_for_dataset))
+    target = max(0, int(n_max_dataset_queries))
     if target == 0:
         return []
 
@@ -350,7 +393,7 @@ def build_random_eval2_frontiers_for_dataset(
 
         random_frontiers.append(
             {
-                "predecessor_path": f"random_eval2_{dataset_tag}_{len(random_frontiers)}",
+                "predecessor_path": f"random_eval_{dataset_tag}_{len(random_frontiers)}",
                 "goal_path": goal,
                 "successor_paths": [str(c["successor_path"]) for c in chosen],
                 "distances": [float(c["distance"]) for c in chosen],
@@ -360,6 +403,96 @@ def build_random_eval2_frontiers_for_dataset(
         )
 
     return random_frontiers
+
+
+def build_stress_eval_frontiers_for_dataset(
+    clean_frontiers: Sequence[Dict[str, Any]],
+    kind_of_data: str,
+    n_max_dataset_queries: int,
+    max_size_frontier: int,
+    dataset_tag: str,
+    failure_reward_value: float = -1.0,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    target = max(0, int(n_max_dataset_queries))
+    if target == 0:
+        return [], []
+
+    max_size = max(2, int(max_size_frontier))
+    frontiers_by_predecessor: Dict[str, Dict[str, Any]] = {}
+    for frontier in clean_frontiers:
+        predecessor_path = str(frontier.get("predecessor_path", "")).strip()
+        if not predecessor_path:
+            continue
+        if predecessor_path not in frontiers_by_predecessor:
+            frontiers_by_predecessor[predecessor_path] = frontier
+    if not frontiers_by_predecessor:
+        return [], []
+
+    predecessor_paths = set(frontiers_by_predecessor.keys())
+    successor_paths = {
+        str(path)
+        for frontier in clean_frontiers
+        for path in frontier.get("successor_paths", [])
+    }
+    root_predecessors = sorted(predecessor_paths - successor_paths)
+    if not root_predecessors:
+        root_predecessors = sorted(predecessor_paths)
+
+    fifo_frontiers: List[Dict[str, Any]] = []
+    lifo_frontiers: List[Dict[str, Any]] = []
+    query_idx = 0
+    for root in root_predecessors:
+        if query_idx >= target:
+            break
+
+        visited = set()
+        current = str(root)
+        cumulative_candidates: List[Dict[str, Any]] = []
+
+        while current in frontiers_by_predecessor and current not in visited and query_idx < target:
+            visited.add(current)
+            frontier = frontiers_by_predecessor[current]
+            layer_candidates = _frontier_to_candidates(frontier, kind_of_data=kind_of_data)
+            if not layer_candidates:
+                break
+
+            cumulative_candidates.extend(layer_candidates)
+            fifo_window = cumulative_candidates[:max_size]
+            lifo_window = cumulative_candidates[-max_size:]
+
+            fifo_frontier = _frontier_from_candidate_window(
+                candidates=fifo_window,
+                predecessor_path=f"stress_fifo_{dataset_tag}_{query_idx}",
+                kind_of_data=kind_of_data,
+                failure_reward_value=float(failure_reward_value),
+                stress_schedule=STRESS_SCHEDULE_FIFO,
+            )
+            if fifo_frontier is not None:
+                fifo_frontiers.append(fifo_frontier)
+
+            lifo_frontier = _frontier_from_candidate_window(
+                candidates=lifo_window,
+                predecessor_path=f"stress_lifo_{dataset_tag}_{query_idx}",
+                kind_of_data=kind_of_data,
+                failure_reward_value=float(failure_reward_value),
+                stress_schedule=STRESS_SCHEDULE_LIFO,
+            )
+            if lifo_frontier is not None:
+                lifo_frontiers.append(lifo_frontier)
+
+            query_idx += 1
+
+            next_predecessor = None
+            for successor_path in frontier.get("successor_paths", []):
+                successor_key = str(successor_path)
+                if successor_key in frontiers_by_predecessor and successor_key not in visited:
+                    next_predecessor = successor_key
+                    break
+            if next_predecessor is None:
+                break
+            current = next_predecessor
+
+    return fifo_frontiers, lifo_frontiers
 
 
 def _build_graph_loader(
@@ -389,15 +522,21 @@ def build_frontier_samples(
     list_subset_train: Sequence[str],
     kind_of_data: str,
     dataset_type: str,
-    test_size: float,
     seed: int,
     max_regular_distance_for_reward: float = 50.0,
     failure_reward_value: float = -1.0,
-    max_random_eval_frontiers_for_dataset: int = 1000,
+    n_max_dataset_queries: int = 1000,
+    max_size_frontier: int = 25,
+    build_eval_data: bool = True,
     enable_graph_cache: bool = True,
-    include_eval2: bool = False,
     **_: Any,
-) -> Any:
+) -> Tuple[
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    Dict[str, Any],
+]:
     root = Path(folder_data)
     dataset_type = str(dataset_type).upper()
     if dataset_type not in VALID_DATASET_TYPES:
@@ -409,8 +548,9 @@ def build_frontier_samples(
         raise ValueError(f"Unsupported kind_of_data: {kind_of_data}")
 
     all_train_frontiers: List[Dict[str, Any]] = []
-    all_eval_frontiers: List[Dict[str, Any]] = []
-    all_eval2_frontiers: List[Dict[str, Any]] = []
+    all_eval_random_frontiers: List[Dict[str, Any]] = []
+    all_eval_stress_fifo_frontiers: List[Dict[str, Any]] = []
+    all_eval_stress_lifo_frontiers: List[Dict[str, Any]] = []
     dataset_summaries: List[Dict[str, Any]] = []
 
     dataset_counter = 0
@@ -434,48 +574,65 @@ def build_frontier_samples(
                         "dataset_id": dataset_id,
                         "frontiers_cleaned": 0,
                         "train_frontiers": 0,
-                        "eval_frontiers": 0,
-                        "eval2_frontiers": 0,
+                        "eval_random_frontiers": 0,
+                        "eval_stress_fifo_frontiers": 0,
+                        "eval_stress_lifo_frontiers": 0,
                     }
                 )
                 dataset_counter += 1
                 continue
 
-            split_seed = int(seed + 7919 * dataset_counter)
-            train_frontiers, eval_frontiers = split_frontiers(
-                cleaned,
-                test_size=float(test_size),
-                seed=split_seed,
-            )
+            train_frontiers = list(cleaned)
 
-            eval2_seed = int(seed + 104729 * dataset_counter + 17)
-            eval2_frontiers = build_random_eval2_frontiers_for_dataset(
-                clean_frontiers=cleaned,
-                kind_of_data=kind_of_data,
-                max_random_eval_frontiers_for_dataset=max_random_eval_frontiers_for_dataset,
-                seed=eval2_seed,
-                dataset_tag=f"{prob_dir.name}_{csv_path.stem}",
-                failure_reward_value=float(failure_reward_value),
-            )
+            if build_eval_data:
+                eval_random_seed = int(seed + 104729 * dataset_counter + 17)
+                eval_random_frontiers = build_random_eval_frontiers_for_dataset(
+                    clean_frontiers=cleaned,
+                    kind_of_data=kind_of_data,
+                    n_max_dataset_queries=int(n_max_dataset_queries),
+                    seed=eval_random_seed,
+                    dataset_tag=f"{prob_dir.name}_{csv_path.stem}",
+                    failure_reward_value=float(failure_reward_value),
+                )
+                eval_stress_fifo_frontiers, eval_stress_lifo_frontiers = (
+                    build_stress_eval_frontiers_for_dataset(
+                        clean_frontiers=cleaned,
+                        kind_of_data=kind_of_data,
+                        n_max_dataset_queries=int(n_max_dataset_queries),
+                        max_size_frontier=int(max_size_frontier),
+                        dataset_tag=f"{prob_dir.name}_{csv_path.stem}",
+                        failure_reward_value=float(failure_reward_value),
+                    )
+                )
+            else:
+                eval_random_frontiers = []
+                eval_stress_fifo_frontiers = []
+                eval_stress_lifo_frontiers = []
 
             for frontier in train_frontiers:
                 frontier["dataset_id"] = dataset_id
-            for frontier in eval_frontiers:
+            for frontier in eval_random_frontiers:
                 frontier["dataset_id"] = dataset_id
-            for frontier in eval2_frontiers:
+            for frontier in eval_stress_fifo_frontiers:
                 frontier["dataset_id"] = dataset_id
+                frontier["stress_schedule"] = STRESS_SCHEDULE_FIFO
+            for frontier in eval_stress_lifo_frontiers:
+                frontier["dataset_id"] = dataset_id
+                frontier["stress_schedule"] = STRESS_SCHEDULE_LIFO
 
             all_train_frontiers.extend(train_frontiers)
-            all_eval_frontiers.extend(eval_frontiers)
-            all_eval2_frontiers.extend(eval2_frontiers)
+            all_eval_random_frontiers.extend(eval_random_frontiers)
+            all_eval_stress_fifo_frontiers.extend(eval_stress_fifo_frontiers)
+            all_eval_stress_lifo_frontiers.extend(eval_stress_lifo_frontiers)
 
             dataset_summaries.append(
                 {
                     "dataset_id": dataset_id,
                     "frontiers_cleaned": len(cleaned),
                     "train_frontiers": len(train_frontiers),
-                    "eval_frontiers": len(eval_frontiers),
-                    "eval2_frontiers": len(eval2_frontiers),
+                    "eval_random_frontiers": len(eval_random_frontiers),
+                    "eval_stress_fifo_frontiers": len(eval_stress_fifo_frontiers),
+                    "eval_stress_lifo_frontiers": len(eval_stress_lifo_frontiers),
                 }
             )
             dataset_counter += 1
@@ -505,7 +662,7 @@ def build_frontier_samples(
             failure_reward_value=float(failure_reward_value),
             graph_loader=graph_loader,
         )
-        for f in tqdm(all_eval_frontiers, desc="Materializing eval frontiers")
+        for f in tqdm(all_eval_random_frontiers, desc="Materializing eval-random frontiers")
     ]
     eval2_samples = [
         _materialize_frontier(
@@ -516,7 +673,18 @@ def build_frontier_samples(
             failure_reward_value=float(failure_reward_value),
             graph_loader=graph_loader,
         )
-        for f in tqdm(all_eval2_frontiers, desc="Materializing eval2 frontiers")
+        for f in tqdm(all_eval_stress_fifo_frontiers, desc="Materializing eval-stress-fifo frontiers")
+    ]
+    eval3_samples = [
+        _materialize_frontier(
+            frontier=f,
+            kind_of_data=kind_of_data,
+            dataset_type=dataset_type,
+            max_regular_distance_for_reward=float(max_regular_distance_for_reward),
+            failure_reward_value=float(failure_reward_value),
+            graph_loader=graph_loader,
+        )
+        for f in tqdm(all_eval_stress_lifo_frontiers, desc="Materializing eval-stress-lifo frontiers")
     ]
 
     params = {
@@ -524,19 +692,28 @@ def build_frontier_samples(
         "kind_of_data": str(kind_of_data),
         "dataset_type": str(dataset_type),
         "seed": int(seed),
-        "test_size": float(test_size),
         "max_regular_distance_for_reward": float(max_regular_distance_for_reward),
         "failure_reward_value": float(failure_reward_value),
-        "max_random_eval_frontiers_for_dataset": int(max_random_eval_frontiers_for_dataset),
+        "n_max_dataset_queries": int(n_max_dataset_queries),
+        "max_size_frontier": int(max_size_frontier),
+        "build_eval_data": bool(build_eval_data),
         "num_frontiers_train": len(train_samples),
+        "num_frontiers_eval_random": len(eval_samples),
+        "num_frontiers_eval_stress_fifo": len(eval2_samples),
+        "num_frontiers_eval_stress_lifo": len(eval3_samples),
         "num_frontiers_eval": len(eval_samples),
         "num_frontiers_eval2": len(eval2_samples),
+        "num_frontiers_eval3": len(eval3_samples),
         "dataset_summaries": dataset_summaries,
         "split_summary": {
             "num_datasets": len(dataset_summaries),
             "num_frontiers_train": len(train_samples),
+            "num_frontiers_eval_random": len(eval_samples),
+            "num_frontiers_eval_stress_fifo": len(eval2_samples),
+            "num_frontiers_eval_stress_lifo": len(eval3_samples),
             "num_frontiers_eval": len(eval_samples),
             "num_frontiers_eval2": len(eval2_samples),
+            "num_frontiers_eval3": len(eval3_samples),
             "dataset_summaries": dataset_summaries,
         },
         "graph_cache_requests": int(graph_load_stats["requests"]),
@@ -548,9 +725,7 @@ def build_frontier_samples(
             else 0.0
         ),
     }
-    if include_eval2:
-        return train_samples, eval_samples, eval2_samples, params
-    return train_samples, eval_samples, params
+    return train_samples, eval_samples, eval2_samples, eval3_samples, params
 
 
 def _materialize_frontier(
@@ -630,6 +805,8 @@ def _materialize_frontier(
         "dataset_id": str(frontier.get("dataset_id", "")),
         "frontier_has_failure": bool(is_failure.any().item()),
     }
+    if "stress_schedule" in frontier:
+        sample["stress_schedule"] = str(frontier.get("stress_schedule", ""))
     if combined.pool_node_index is not None and combined.pool_membership is not None:
         sample["pool_node_index"] = combined.pool_node_index
         sample["pool_membership"] = combined.pool_membership
@@ -872,6 +1049,26 @@ def frontier_collate_fn(batch: Sequence[Dict[str, Any]], pad_frontiers: bool = T
     return out
 
 
+def build_frontier_dataloader(
+    samples: Sequence[Dict[str, Any]],
+    batch_size: int = 8,
+    seed: int = 42,
+    num_workers: int = 0,
+    pad_frontiers: bool = True,
+    shuffle: bool = False,
+) -> DataLoader:
+    generator = torch.Generator()
+    generator.manual_seed(int(seed))
+    return DataLoader(
+        FrontierDataset(samples),
+        batch_size=batch_size,
+        shuffle=bool(shuffle),
+        num_workers=num_workers,
+        collate_fn=lambda x: frontier_collate_fn(x, pad_frontiers=pad_frontiers),
+        generator=generator,
+    )
+
+
 def get_dataloaders(
     train_samples: Sequence[Dict[str, Any]],
     eval_samples: Sequence[Dict[str, Any]],
@@ -881,22 +1078,34 @@ def get_dataloaders(
     num_workers: int = 0,
     pad_frontiers: bool = True,
 ):
-    generator = torch.Generator()
-    generator.manual_seed(seed)
-
-    def _loader(samples: Sequence[Dict[str, Any]], shuffle: bool) -> DataLoader:
-        return DataLoader(
-            FrontierDataset(samples),
+    train_loader = build_frontier_dataloader(
+        samples=train_samples,
+        batch_size=batch_size,
+        seed=int(seed),
+        num_workers=num_workers,
+        pad_frontiers=pad_frontiers,
+        shuffle=True,
+    )
+    eval_loader = build_frontier_dataloader(
+        samples=eval_samples,
+        batch_size=batch_size,
+        seed=int(seed) + 1,
+        num_workers=num_workers,
+        pad_frontiers=pad_frontiers,
+        shuffle=False,
+    )
+    eval2_loader = (
+        build_frontier_dataloader(
+            samples=eval2_samples,
             batch_size=batch_size,
-            shuffle=shuffle,
+            seed=int(seed) + 2,
             num_workers=num_workers,
-            collate_fn=lambda x: frontier_collate_fn(x, pad_frontiers=pad_frontiers),
-            generator=generator,
+            pad_frontiers=pad_frontiers,
+            shuffle=False,
         )
-
-    train_loader = _loader(train_samples, True)
-    eval_loader = _loader(eval_samples, False)
-    eval2_loader = _loader(eval2_samples, False) if eval2_samples is not None else None
+        if eval2_samples is not None
+        else None
+    )
     return train_loader, eval_loader, eval2_loader
 
 
@@ -905,6 +1114,7 @@ def save_samples(
     train_samples: Sequence[Dict[str, Any]],
     eval_samples: Sequence[Dict[str, Any]],
     eval2_samples: Optional[Sequence[Dict[str, Any]]] = None,
+    eval3_samples: Optional[Sequence[Dict[str, Any]]] = None,
     params: Optional[Dict[str, Any]] = None,
 ) -> Path:
     out_path = Path(out_path)
@@ -914,6 +1124,10 @@ def save_samples(
             "train_samples": list(train_samples),
             "eval_samples": list(eval_samples),
             "eval2_samples": list(eval2_samples or []),
+            "eval3_samples": list(eval3_samples or []),
+            "eval_random_samples": list(eval_samples),
+            "eval_stress_fifo_samples": list(eval2_samples or []),
+            "eval_stress_lifo_samples": list(eval3_samples or []),
             "params": params or {},
         },
         out_path,
@@ -924,6 +1138,10 @@ def save_samples(
 def load_saved_samples(path: str | Path) -> Dict[str, Any]:
     payload = torch.load(path, weights_only=False)
     payload.setdefault("eval2_samples", [])
+    payload.setdefault("eval3_samples", [])
+    payload.setdefault("eval_random_samples", payload.get("eval_samples", []))
+    payload.setdefault("eval_stress_fifo_samples", payload.get("eval2_samples", []))
+    payload.setdefault("eval_stress_lifo_samples", payload.get("eval3_samples", []))
     payload.setdefault("params", {})
     return payload
 

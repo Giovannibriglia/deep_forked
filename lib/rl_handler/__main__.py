@@ -8,11 +8,10 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 import torch
 
 from src.data import (
+    build_frontier_dataloader,
     build_frontier_samples,
     get_dataloaders,
-    load_saved_samples,
     refresh_frontier_sample_targets,
-    save_samples,
     seed_everything,
 )
 from src.models.frontier_policy import FrontierPolicyNetwork
@@ -62,8 +61,18 @@ def parse_args():
             "'separated': Goal CSV path is loaded for each frontier."
         ),
     )
-    parser.add_argument("--test-size", type=float, default=0.2)
-    parser.add_argument("--max-random-eval-frontiers-for-dataset", type=int, default=100)
+    parser.add_argument(
+        "--n-max-dataset-queries",
+        type=int,
+        default=1000,
+        help="Maximum number of random/stress evaluation queries generated per dataset.",
+    )
+    parser.add_argument(
+        "--max-size-frontier",
+        type=int,
+        default=25,
+        help="Maximum frontier size for stress evaluation query scheduling (FIFO/LIFO).",
+    )
     parser.add_argument(
         "--max-failure-states-per-dataset",
         type=ratio_0_1,
@@ -77,7 +86,7 @@ def parse_args():
 
     parser.add_argument("--batch-size", type=int, default=9092)
     parser.add_argument("--n-train-epochs", type=int, default=200)
-    parser.add_argument("--eval-every", type=int, default=10)
+    parser.add_argument("--eval-every", type=int, default=20)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -120,6 +129,15 @@ def parse_args():
     parser.add_argument("--failure-reward-value", type=float, default=-1.0)
 
     parser.add_argument("--build-data", type=str2bool, default=True)
+    parser.add_argument(
+        "--build-eval-data",
+        type=str2bool,
+        default=True,
+        help=(
+            "If true and --evaluate is true, rebuild evaluation samples "
+            "(random + stress) before running evaluation."
+        ),
+    )
     parser.add_argument("--train", type=str2bool, default=True)
     parser.add_argument("--evaluate", type=str2bool, default=True)
     parser.add_argument("--export-onnx", type=str2bool, default=True)
@@ -149,30 +167,99 @@ def _paths(args):
 
 def _build_or_load_samples(args):
     data_root, _ = _paths(args)
-    samples_path = data_root / "samples.pt"
+    sample_paths = {
+        "train": data_root / "train_samples.pt",
+        "eval_random": data_root / "eval_samples_random.pt",
+        "eval_stress": data_root / "eval_samples_stress.pt",
+        "params": data_root / "samples_params.pt",
+    }
 
-    if args.build_data:
-        train_samples, eval_samples, eval2_samples, params = build_frontier_samples(
+    def _save_split_payload(
+        train_samples: Sequence[Dict[str, Any]],
+        eval_random_samples: Sequence[Dict[str, Any]],
+        eval_stress_fifo_samples: Sequence[Dict[str, Any]],
+        eval_stress_lifo_samples: Sequence[Dict[str, Any]],
+        params: Dict[str, Any],
+    ) -> None:
+        torch.save(list(train_samples), sample_paths["train"])
+        torch.save(list(eval_random_samples), sample_paths["eval_random"])
+        torch.save(
+            {
+                "fifo_samples": list(eval_stress_fifo_samples),
+                "lifo_samples": list(eval_stress_lifo_samples),
+            },
+            sample_paths["eval_stress"],
+        )
+        torch.save(dict(params or {}), sample_paths["params"])
+
+    should_build_train_data = bool(args.build_data)
+    should_build_eval_data = bool(args.evaluate and args.build_eval_data)
+
+    if should_build_train_data or should_build_eval_data:
+        (
+            train_samples,
+            eval_random_samples,
+            eval_stress_fifo_samples,
+            eval_stress_lifo_samples,
+            params,
+        ) = build_frontier_samples(
             folder_data=args.folder_raw_data,
             list_subset_train=args.subset_train,
             kind_of_data=args.kind_of_data,
             dataset_type=args.dataset_type,
-            test_size=args.test_size,
             seed=args.seed,
             max_regular_distance_for_reward=args.max_regular_distance_for_reward,
             failure_reward_value=args.failure_reward_value,
-            max_random_eval_frontiers_for_dataset=args.max_random_eval_frontiers_for_dataset,
-            include_eval2=True,
+            n_max_dataset_queries=int(args.n_max_dataset_queries),
+            max_size_frontier=int(args.max_size_frontier),
+            build_eval_data=bool(should_build_eval_data),
         )
-        save_samples(
-            samples_path,
-            train_samples,
-            eval_samples,
-            eval2_samples=eval2_samples,
-            params=params,
+        torch.save(list(train_samples), sample_paths["train"])
+        torch.save(dict(params or {}), sample_paths["params"])
+        if should_build_eval_data:
+            _save_split_payload(
+                train_samples=train_samples,
+                eval_random_samples=eval_random_samples,
+                eval_stress_fifo_samples=eval_stress_fifo_samples,
+                eval_stress_lifo_samples=eval_stress_lifo_samples,
+                params=params,
+            )
+
+    if not sample_paths["train"].exists():
+        raise FileNotFoundError(
+            f"Missing training samples file: {sample_paths['train']}. "
+            "Run with --build-data true."
         )
-    payload = load_saved_samples(samples_path)
-    return payload, samples_path
+
+    train_samples = torch.load(sample_paths["train"], weights_only=False)
+    params = (
+        torch.load(sample_paths["params"], weights_only=False)
+        if sample_paths["params"].exists()
+        else {}
+    )
+
+    if sample_paths["eval_random"].exists() and sample_paths["eval_stress"].exists():
+        eval_random_samples = torch.load(sample_paths["eval_random"], weights_only=False)
+        stress_payload = torch.load(sample_paths["eval_stress"], weights_only=False)
+        if isinstance(stress_payload, dict):
+            eval_stress_fifo_samples = list(stress_payload.get("fifo_samples", []))
+            eval_stress_lifo_samples = list(stress_payload.get("lifo_samples", []))
+        else:
+            eval_stress_fifo_samples = list(stress_payload or [])
+            eval_stress_lifo_samples = []
+    else:
+        eval_random_samples = []
+        eval_stress_fifo_samples = []
+        eval_stress_lifo_samples = []
+
+    payload = {
+        "train_samples": list(train_samples),
+        "eval_random_samples": list(eval_random_samples),
+        "eval_stress_fifo_samples": list(eval_stress_fifo_samples),
+        "eval_stress_lifo_samples": list(eval_stress_lifo_samples),
+        "params": dict(params or {}),
+    }
+    return payload, sample_paths
 
 
 def _infer_num_edge_labels(samples):
@@ -574,12 +661,66 @@ def _limit_failure_frontiers_in_train_dataset(
     }
 
 
+def _count_sample_states(sample: Dict[str, Any]) -> Tuple[int, int]:
+    is_failure = sample.get("is_failure")
+    if isinstance(is_failure, torch.Tensor):
+        all_states = int(is_failure.numel())
+        failure_states = int(is_failure.to(torch.long).sum().item()) if all_states > 0 else 0
+        return failure_states, all_states
+    if isinstance(is_failure, (list, tuple)):
+        all_states = int(len(is_failure))
+        failure_states = int(sum(1 for x in is_failure if bool(x)))
+        return failure_states, all_states
+
+    reward_target = sample.get("reward_target", sample.get("rewards"))
+    if isinstance(reward_target, torch.Tensor):
+        return 0, int(reward_target.numel())
+    if isinstance(reward_target, (list, tuple)):
+        return 0, int(len(reward_target))
+    return 0, 0
+
+
+def _build_train_state_stats(
+    train_samples: Sequence[Dict[str, Any]],
+) -> Tuple[Dict[str, int], Dict[str, Dict[str, int]]]:
+    overall_failure_states = 0
+    overall_all_states = 0
+    per_dataset: Dict[str, Dict[str, int]] = {}
+
+    for sample in train_samples:
+        dataset_id = str(sample.get("dataset_id", ""))
+        failure_states, all_states = _count_sample_states(sample)
+        overall_failure_states += int(failure_states)
+        overall_all_states += int(all_states)
+
+        stats = per_dataset.setdefault(
+            dataset_id,
+            {
+                "train_frontiers_after_filter": 0,
+                "train_n_failure_states": 0,
+                "train_n_all_states": 0,
+            },
+        )
+        stats["train_frontiers_after_filter"] += 1
+        stats["train_n_failure_states"] += int(failure_states)
+        stats["train_n_all_states"] += int(all_states)
+
+    return (
+        {
+            "train_n_failure_states": int(overall_failure_states),
+            "train_n_all_states": int(overall_all_states),
+        },
+        per_dataset,
+    )
+
+
 def main(args):
     seed_everything(args.seed)
-    payload, samples_path = _build_or_load_samples(args)
+    payload, sample_paths = _build_or_load_samples(args)
     train_samples = payload.get("train_samples", [])
-    eval_samples = payload.get("eval_samples", [])
-    eval2_samples = payload.get("eval2_samples", [])
+    eval_samples = payload.get("eval_random_samples", [])
+    eval2_samples = payload.get("eval_stress_fifo_samples", [])
+    eval3_samples = payload.get("eval_stress_lifo_samples", [])
 
     refresh_frontier_sample_targets(
         train_samples,
@@ -599,6 +740,12 @@ def main(args):
         max_regular_distance_for_reward=float(args.max_regular_distance_for_reward),
         failure_reward_value=float(args.failure_reward_value),
     )
+    refresh_frontier_sample_targets(
+        eval3_samples,
+        m_failed_state=0.0,
+        max_regular_distance_for_reward=float(args.max_regular_distance_for_reward),
+        failure_reward_value=float(args.failure_reward_value),
+    )
     train_samples, train_filter_stats = _limit_failure_frontiers_in_train_dataset(
         train_samples=train_samples,
         max_failure_states_per_dataset=float(args.max_failure_states_per_dataset),
@@ -611,13 +758,25 @@ def main(args):
         f"{train_filter_stats['n_with_failure_kept']} | total_kept="
         f"{train_filter_stats['n_total_kept']}"
     )
+    train_state_stats_overall, train_state_stats_by_dataset = _build_train_state_stats(
+        train_samples
+    )
+    print(
+        "[dataset-filter] train states | failure/all="
+        f"{train_state_stats_overall['train_n_failure_states']}/"
+        f"{train_state_stats_overall['train_n_all_states']}"
+    )
 
     if not train_samples:
-        raise ValueError(f"No training frontiers loaded from {samples_path}.")
+        raise ValueError(f"No training frontiers loaded from {sample_paths['train']}.")
     if not eval_samples:
-        print("[warning] Eval split is empty; evaluation metrics will be trivial.")
+        print("[warning] Random eval split is empty; random evaluation metrics will be trivial.")
     if not eval2_samples:
-        print("[warning] Eval2 split is empty; eval2 metrics will be trivial.")
+        print("[warning] Stress FIFO split is empty; stress FIFO evaluation metrics will be trivial.")
+    if not eval3_samples:
+        print("[warning] Stress LIFO split is empty; stress LIFO evaluation metrics will be trivial.")
+    if args.evaluate and not args.build_eval_data:
+        print("[info] --build-eval-data is false: skipping eval data rebuild, using saved eval files only.")
 
     train_loader, eval_loader, eval2_loader = get_dataloaders(
         train_samples=train_samples,
@@ -628,6 +787,14 @@ def main(args):
         num_workers=args.num_workers,
         pad_frontiers=True,
     )
+    eval3_loader = build_frontier_dataloader(
+        samples=eval3_samples,
+        batch_size=args.batch_size,
+        seed=int(args.seed) + 3,
+        num_workers=args.num_workers,
+        pad_frontiers=True,
+        shuffle=False,
+    )
 
     node_input_dim = int(train_samples[0]["node_features"].size(1))
     use_goal_separate_input = (
@@ -635,7 +802,9 @@ def main(args):
         if args.use_goal_separate_input is None
         else bool(args.use_goal_separate_input)
     )
-    num_edge_labels = _infer_num_edge_labels(train_samples + eval_samples + eval2_samples)
+    num_edge_labels = _infer_num_edge_labels(
+        train_samples + eval_samples + eval2_samples + eval3_samples
+    )
 
     model = FrontierPolicyNetwork(
         node_input_dim=node_input_dim,
@@ -670,6 +839,8 @@ def main(args):
             train_loader=train_loader,
             eval_loader=eval_loader,
             eval2_loader=eval2_loader,
+            eval_loader_name="eval_random",
+            eval2_loader_name="eval_stress_fifo",
             n_epochs=args.n_train_epochs,
             checkpoint_dir=model_root.as_posix(),
             model_name=args.model_name,
@@ -684,34 +855,62 @@ def main(args):
     elif not args.train:
         raise FileNotFoundError(f"Missing checkpoint: {best_ckpt} or {model_ckpt}")
 
-    if args.evaluate:
+    eval_data_available = bool(eval_samples or eval2_samples or eval3_samples)
+    if args.evaluate and eval_data_available:
         eval_metrics = trainer.evaluate(eval_loader, verbose=True)
-        eval2_metrics = trainer.evaluate(eval2_loader, verbose=True) if eval2_loader is not None else {}
+        eval2_metrics = (
+            trainer.evaluate(eval2_loader, verbose=True) if eval2_loader is not None else {}
+        )
+        eval3_metrics = trainer.evaluate(eval3_loader, verbose=True) if eval3_loader is not None else {}
 
+        with (model_root / f"{args.model_name}_eval_random.json").open("w", encoding="utf-8") as fh:
+            json.dump(eval_metrics, fh, indent=2)
+        with (model_root / f"{args.model_name}_eval_stress_fifo.json").open("w", encoding="utf-8") as fh:
+            json.dump(eval2_metrics, fh, indent=2)
+        with (model_root / f"{args.model_name}_eval_stress_lifo.json").open("w", encoding="utf-8") as fh:
+            json.dump(eval3_metrics, fh, indent=2)
+        with (model_root / f"{args.model_name}_eval_stress.json").open("w", encoding="utf-8") as fh:
+            json.dump({"fifo": eval2_metrics, "lifo": eval3_metrics}, fh, indent=2)
+        # Backward-compatible names.
         with (model_root / f"{args.model_name}_eval.json").open("w", encoding="utf-8") as fh:
             json.dump(eval_metrics, fh, indent=2)
         with (model_root / f"{args.model_name}_eval2.json").open("w", encoding="utf-8") as fh:
             json.dump(eval2_metrics, fh, indent=2)
 
-        eval_metrics_dir = model_root / "metrics" / "eval"
-        eval2_metrics_dir = model_root / "metrics" / "eval2"
+        eval_metrics_dir = model_root / "metrics" / "eval_random"
+        eval2_metrics_dir = model_root / "metrics" / "eval_stress_fifo"
+        eval3_metrics_dir = model_root / "metrics" / "eval_stress_lifo"
         eval_metrics_dir.mkdir(parents=True, exist_ok=True)
         eval2_metrics_dir.mkdir(parents=True, exist_ok=True)
+        eval3_metrics_dir.mkdir(parents=True, exist_ok=True)
         with (eval_metrics_dir / "final_metrics.json").open("w", encoding="utf-8") as fh:
             json.dump(eval_metrics, fh, indent=2)
         with (eval2_metrics_dir / "final_metrics.json").open("w", encoding="utf-8") as fh:
             json.dump(eval2_metrics, fh, indent=2)
+        with (eval3_metrics_dir / "final_metrics.json").open("w", encoding="utf-8") as fh:
+            json.dump(eval3_metrics, fh, indent=2)
+    elif args.evaluate:
+        print(
+            "[warning] Evaluation requested but no eval samples are available. "
+            "Set --build-eval-data true (and provide raw data) to generate eval sets."
+        )
 
     params = payload.get("params", {})
     split_summary = params.get("split_summary") or {
         "num_frontiers_train": len(train_samples),
-        "num_frontiers_eval": len(eval_samples),
-        "num_frontiers_eval2": len(eval2_samples),
+        "num_frontiers_eval_random": len(eval_samples),
+        "num_frontiers_eval_stress_fifo": len(eval2_samples),
+        "num_frontiers_eval_stress_lifo": len(eval3_samples),
     }
     split_summary = dict(split_summary)
     split_summary["num_frontiers_train"] = len(train_samples)
+    split_summary["num_frontiers_eval_random"] = len(eval_samples)
+    split_summary["num_frontiers_eval_stress_fifo"] = len(eval2_samples)
+    split_summary["num_frontiers_eval_stress_lifo"] = len(eval3_samples)
+    # Backward-compatible counters.
     split_summary["num_frontiers_eval"] = len(eval_samples)
     split_summary["num_frontiers_eval2"] = len(eval2_samples)
+    split_summary["num_frontiers_eval3"] = len(eval3_samples)
     split_summary["train_no_failure_frontiers"] = int(train_filter_stats["n_no_failure"])
     split_summary["train_with_failure_frontiers_total"] = int(
         train_filter_stats["n_with_failure_total"]
@@ -719,7 +918,74 @@ def main(args):
     split_summary["train_with_failure_frontiers_kept"] = int(
         train_filter_stats["n_with_failure_kept"]
     )
+    split_summary["train_n_failure_states"] = int(
+        train_state_stats_overall["train_n_failure_states"]
+    )
+    split_summary["train_n_all_states"] = int(train_state_stats_overall["train_n_all_states"])
+    split_summary["train_failure_states_over_all_states"] = (
+        f"{train_state_stats_overall['train_n_failure_states']}/"
+        f"{train_state_stats_overall['train_n_all_states']}"
+    )
+    split_summary["train_failure_state_rate"] = (
+        float(
+            train_state_stats_overall["train_n_failure_states"]
+            / train_state_stats_overall["train_n_all_states"]
+        )
+        if int(train_state_stats_overall["train_n_all_states"]) > 0
+        else 0.0
+    )
     split_summary["max_failure_states_per_dataset"] = float(args.max_failure_states_per_dataset)
+    existing_dataset_summaries = split_summary.get("dataset_summaries")
+    if isinstance(existing_dataset_summaries, list):
+        merged_dataset_summaries = []
+        seen_dataset_ids = set()
+        for dataset_entry in existing_dataset_summaries:
+            row = dict(dataset_entry)
+            dataset_id = str(row.get("dataset_id", ""))
+            stats = train_state_stats_by_dataset.get(
+                dataset_id,
+                {
+                    "train_frontiers_after_filter": 0,
+                    "train_n_failure_states": 0,
+                    "train_n_all_states": 0,
+                },
+            )
+            row.update(stats)
+            row["train_failure_states_over_all_states"] = (
+                f"{stats['train_n_failure_states']}/{stats['train_n_all_states']}"
+            )
+            merged_dataset_summaries.append(row)
+            seen_dataset_ids.add(dataset_id)
+
+        for dataset_id in sorted(train_state_stats_by_dataset.keys()):
+            if dataset_id in seen_dataset_ids:
+                continue
+            stats = train_state_stats_by_dataset[dataset_id]
+            merged_dataset_summaries.append(
+                {
+                    "dataset_id": dataset_id,
+                    "train_frontiers_after_filter": int(stats["train_frontiers_after_filter"]),
+                    "train_n_failure_states": int(stats["train_n_failure_states"]),
+                    "train_n_all_states": int(stats["train_n_all_states"]),
+                    "train_failure_states_over_all_states": (
+                        f"{stats['train_n_failure_states']}/{stats['train_n_all_states']}"
+                    ),
+                }
+            )
+        split_summary["dataset_summaries"] = merged_dataset_summaries
+    else:
+        split_summary["dataset_summaries"] = [
+            {
+                "dataset_id": dataset_id,
+                "train_frontiers_after_filter": int(stats["train_frontiers_after_filter"]),
+                "train_n_failure_states": int(stats["train_n_failure_states"]),
+                "train_n_all_states": int(stats["train_n_all_states"]),
+                "train_failure_states_over_all_states": (
+                    f"{stats['train_n_failure_states']}/{stats['train_n_all_states']}"
+                ),
+            }
+            for dataset_id, stats in sorted(train_state_stats_by_dataset.items())
+        ]
     with (model_root / "dataset_split_summary.json").open("w", encoding="utf-8") as fh:
         json.dump(split_summary, fh, indent=2)
 
@@ -749,10 +1015,18 @@ def main(args):
     with (model_root / f"{args.model_name}_info.txt").open("w", encoding="utf-8") as fh:
         for key, value in vars(args).items():
             fh.write(f"{key} = {value}\n")
-        fh.write(f"samples_path = {samples_path}\n")
+        fh.write(f"samples_train_path = {sample_paths['train']}\n")
+        fh.write(f"samples_eval_random_path = {sample_paths['eval_random']}\n")
+        fh.write(f"samples_eval_stress_path = {sample_paths['eval_stress']}\n")
+        fh.write(f"samples_params_path = {sample_paths['params']}\n")
         fh.write(f"n_train_samples = {len(train_samples)}\n")
+        fh.write(f"n_eval_random_samples = {len(eval_samples)}\n")
+        fh.write(f"n_eval_stress_fifo_samples = {len(eval2_samples)}\n")
+        fh.write(f"n_eval_stress_lifo_samples = {len(eval3_samples)}\n")
+        # Backward-compatible counters.
         fh.write(f"n_eval_samples = {len(eval_samples)}\n")
         fh.write(f"n_eval2_samples = {len(eval2_samples)}\n")
+        fh.write(f"n_eval3_samples = {len(eval3_samples)}\n")
         fh.write(f"model_checkpoint = {load_ckpt}\n")
         fh.write(f"best_checkpoint = {best_ckpt}\n")
         fh.write(f"best model epoch = {best_epoch}\n")

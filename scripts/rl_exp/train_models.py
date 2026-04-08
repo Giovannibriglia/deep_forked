@@ -20,13 +20,14 @@ def run_training(
     no_goal,
     dataset_type,
     max_regular_distance_for_reward,
-    max_random_eval_frontiers_for_dataset,
+    n_max_dataset_queries,
     lr,
     weight_decay,
     max_grad_norm,
     early_stopping_patience_evals,
     failure_reward_value,
     build_data,
+    build_eval_data,
 ):
     if not os.path.isdir(training_data_folder):
         print(f"[ERROR] Missing training folder: {training_data_folder}")
@@ -61,8 +62,10 @@ def run_training(
         str(failure_reward_value),
         "--max-regular-distance-for-reward",
         str(max_regular_distance_for_reward),
-        "--max-random-eval-frontiers-for-dataset",
-        str(max_random_eval_frontiers_for_dataset),
+        "--n-max-dataset-queries",
+        str(n_max_dataset_queries),
+        "--build-eval-data",
+        str(bool(build_eval_data)).lower(),
         "--lr",
         str(lr),
         "--weight-decay",
@@ -108,17 +111,36 @@ def main():
     parser.add_argument("--no_goal", action="store_true")
     parser.add_argument("--dataset_type", choices=["MAPPED", "HASHED", "BITMASK"], default="HASHED")
     parser.add_argument("--max-regular-distance-for-reward", type=float, default=50.0)
-    parser.add_argument("--max-random-eval-frontiers-for-dataset", type=int, default=1000)
+    parser.add_argument(
+        "--n-max-dataset-queries",
+        "--max-random-eval-frontiers-for-dataset",
+        dest="n_max_dataset_queries",
+        type=int,
+        default=1000,
+        help=(
+            "Max eval queries per dataset for random and stress evaluation; "
+            "accepts legacy alias --max-random-eval-frontiers-for-dataset."
+        ),
+    )
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--failure-reward-value", type=float, default=-1.0)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--early-stopping-patience-evals", type=int, default=8)
+    parser.add_argument("--early-stopping-patience-evals", type=int, default=10)
     parser.add_argument(
         "--build-data",
         choices=["true", "false"],
         default="true",
-        help="Whether to rebuild samples.pt before training.",
+        help="Whether to rebuild training samples before training.",
+    )
+    parser.add_argument(
+        "--build-eval-data",
+        choices=["true", "false"],
+        default="true",
+        help=(
+            "Whether to rebuild eval sample files "
+            "(eval_samples_random.pt and eval_samples_stress.pt) before evaluation."
+        ),
     )
     args = parser.parse_args()
 
@@ -136,13 +158,14 @@ def main():
                 args.no_goal,
                 args.dataset_type,
                 args.max_regular_distance_for_reward,
-                args.max_random_eval_frontiers_for_dataset,
+                args.n_max_dataset_queries,
                 args.lr,
                 args.weight_decay,
                 args.max_grad_norm,
                 args.early_stopping_patience_evals,
                 args.failure_reward_value,
                 args.build_data.lower() == "true",
+                args.build_eval_data.lower() == "true",
             )
             for folder in folders
         ]
