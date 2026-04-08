@@ -1,46 +1,223 @@
-# RL Handler
+# Offline RL for Frontier Policy over Graphs
 
-## 0) Overall Idea
-`rl_handler` is an offline RL frontier selector: given one frontier (a set of successor graphs from the same predecessor), it assigns a score to each candidate and picks the best one.
+![rl_handler architecture](architecture.png)
 
-`[FIGURE PLACEHOLDER: pipeline from CSV/DOT -> graph composition -> GNN -> logits -> selected action]`
+`rl_handler` is an offline reinforcement learning pipeline that learns to pick the best
+successor graph from a frontier (a set of candidates produced from the same predecessor).
 
-The model is trained to maximize expected reward over each frontier, where rewards are derived from distance-to-goal values.
+```text
+CSV + DOT -> Frontier Samples -> GNN Policy -> Candidate Logits -> argmax Action
+```
 
-## 1) Pre-processing
-1. Read CSVs (`File Path`, `Depth`, `Distance From Goal`, `File Path Predecessor`, and `Goal` only for `separated` mode).
-2. Group by predecessor to build frontiers, remove singleton frontiers, remove all-failure frontiers, and reject ambiguous goal mappings in `separated`.
-3. Load DOT graphs into PyG tensors (`node_features`, `edge_index`, `edge_attr`) via `graph_utils.load_pyg_graph`.
-4. Compose each frontier with `combine_graphs`:
-   `merged`: merge successors by shared node identity (goal is assumed already embedded in each successor graph).
-   `separated`: keep successors disconnected and load goal graph as separate tensors.
-5. Build sample tensors:
-   candidate rewards (`reward_target`), failures (`is_failure`), oracle (`oracle_index`, `oracle_reward`), and candidate mapping (`action_map`).
-6. Collate batches with frontier-aware indexing (`candidate_batch`, `frontier_ptr`) plus optional goal tensors and merged pooling tensors.
+The training objective is to maximize expected reward over each frontier:
 
-## 2) Algorithm
-1. Encode nodes with a GNN encoder (`GINE`/`RGCN`/`GCN`) using node and edge categorical embeddings.
-2. Pool node embeddings to one embedding per candidate graph.
-3. If `use_global_context=true`, concatenate each candidate embedding with the mean embedding of its frontier.
-4. If `use_goal_separate_input=true` and goal tensors are present, concatenate pooled goal embedding as an extra branch.
-5. Pass through an MLP head to get one scalar per candidate (`logit`).
-6. Training loss maximizes frontier expected reward:
-   `p_i = softmax(logits_i)` within each frontier, `loss = - mean_frontier(sum_i p_i * reward_i)`.
+$$
+p_i = \operatorname{softmax}(s_i)
+$$
 
-## 3) What It Returns (Logits and Context Semantics)
-- Forward output is a 1D tensor of logits: one raw score per candidate.
-- A higher logit means stronger preference before normalization.
-- Selection is `argmax(logits)` (or `argmax(softmax(logits))`, equivalent).
-- With `use_global_context=true`, each candidate score depends on all candidates in the same frontier (because the context term is a frontier mean).
-- With `use_global_context=false`, that explicit frontier-level coupling is removed.
-- Context aggregation is order-independent (mean pooling is permutation-invariant), but it is graph-dependent: changing candidate graphs (or removing one candidate) changes context and can change all logits.
+$$
+\mathcal{L} = - \mathbb{E}_{\text{frontier}} \left[\sum_i p_i \, r_i\right]
+$$ 
 
-## 4) ONNX Usage (Merged vs Separated)
-Export:
-1. `merged`: `python __main__.py --kind-of-data merged --export-onnx true`
-2. `separated`: `python __main__.py --kind-of-data separated --use-goal-separate-input true --export-onnx true`
+## What this module provides
 
-How to combine a frontier of three successor graphs (`s1`, `s2`, `s3`):
+- Frontier dataset building from raw CSV/DOT data
+- GNN-based policy training (`gine`, `rgcn`, `gcn`)
+- Evaluation on random and stress frontier splits
+- ONNX export for C++ inference
+- Optional PyTorch-vs-ONNX parity and frontier order/removal checks
+
+## Data and preprocessing
+
+The dataset builder:
+
+1. Reads CSV rows with `File Path`, `Depth`, `Distance From Goal`,
+   `File Path Predecessor`, and `Goal` (required in `separated` mode).
+2. Groups candidates by predecessor to form frontiers.
+3. Drops invalid frontiers:
+   - singleton frontiers
+   - all-failure frontiers
+   - ambiguous goal mappings in `separated` mode
+4. Loads each DOT graph into PyTorch Geometric tensors:
+   - `node_features`
+   - `edge_index`
+   - `edge_attr`
+
+Node encoding depends on `--dataset_type`:
+
+- `HASHED`: scalar node IDs (raw or already normalized). In-model normalization is applied if needed.
+- `MAPPED`: scalar mapped IDs.
+- `BITMASK`: binary node vectors.
+
+`edge_attr` must always be integer edge-label IDs consistent with training.
+
+## Graph composition modes
+
+Graph composition must be identical in training and deployment.
+
+Let a frontier have $K$ candidates. For candidate $k \in \{0, \ldots, K-1\}$, define:
+
+- $X_k \in \mathbb{R}^{N_k \times F}$: node features
+- $E_k \in \mathbb{N}^{2 \times M_k}$: edge indices
+- $A_k \in \mathbb{N}^{M_k \times 1}$: edge attributes
+
+Mask is always built from the number of valid candidates in the current frontier:
+
+$$
+\text{mask}[k] =
+\begin{cases}
+\text{True}, & k < n_{\text{candidates}} \\
+\text{False}, & k \ge n_{\text{candidates}}
+\end{cases}
+$$
+
+### `merged`
+
+Concept: candidates are merged into one global graph by shared node identity.
+
+How tensors are built:
+
+1. Build a local-to-global node mapping $\phi_k$ for each candidate graph.
+2. Create global `node_features` from unique nodes encountered across all candidates.
+3. Remap each candidate edge with global indices and deduplicate edge triplets:
+
+$$
+T = \operatorname{unique}\left\{(\phi_k(u), \phi_k(v), a) : (u,v,a) \in (E_k, A_k)\right\}
+$$
+
+4. Split triplets into:
+   - `edge_index`: first two fields of each triplet in $T$
+   - `edge_attr`: third field of each triplet in $T$ (same row order)
+5. Build `membership` with one owner candidate per global node (first candidate that introduced that node).
+6. Build optional pooling helpers (used by the training pipeline when nodes are shared):
+   - `pool_node_index`: global node index repeated once per candidate occurrence
+   - `pool_membership`: matching candidate id for each repeated occurrence
+
+So `merged` keeps one shared node table, while still allowing per-candidate pooling.
+
+### `separated`
+
+Concept: candidates stay disconnected and are concatenated block-by-block.
+
+How tensors are built:
+
+1. Concatenate node features:
+
+$$
+\text{node\_features} =
+\begin{bmatrix}
+X_0 \\
+X_1 \\
+\vdots \\
+X_{K-1}
+\end{bmatrix}
+$$
+
+2. Compute node offsets:
+
+$$
+o_k = \sum_{j<k} N_j
+$$
+
+3. Shift each edge index and concatenate:
+
+$$
+\text{edge\_index} = [E_0 + o_0,\ E_1 + o_1,\ \ldots,\ E_{K-1} + o_{K-1}]
+$$
+
+4. Concatenate edge attributes:
+
+$$
+\text{edge\_attr} =
+\begin{bmatrix}
+A_0 \\
+A_1 \\
+\vdots \\
+A_{K-1}
+\end{bmatrix}
+$$
+
+5. Build membership by repeating each candidate id for its nodes:
+
+$$
+\text{membership} =
+[\,\underbrace{0,\ldots,0}_{N_0},\ \underbrace{1,\ldots,1}_{N_1},\ \ldots,\ \underbrace{K-1,\ldots,K-1}_{N_{K-1}}\,]
+$$
+
+6. Goal is passed as a separate graph branch:
+   - `goal_node_features = X_g`
+   - `goal_edge_index = E_g`
+   - `goal_edge_attr = A_g`
+   - `goal_batch = 0` for every goal node in single-frontier inference
+
+If multiple goals are batched together, `goal_batch` contains the goal graph id per node.
+
+### `merged` vs `separated`
+
+| Feature | `merged` | `separated` |
+| --- | --- | --- |
+| Candidate graph topology | merged into one graph | disconnected concatenation |
+| Node sharing across candidates | yes | no |
+| Goal handling | inside successor graphs | separate goal input branch |
+| Additional ONNX goal inputs | no | yes |
+
+## Model input contract (PyTorch / ONNX)
+
+Core tensors:
+
+| Tensor | Shape | DType | Meaning |
+| --- | --- | --- | --- |
+| `node_features` | `[N, F]` | `float32` | Node feature matrix |
+| `edge_index` | `[2, E]` | `int64` | Edge list (`src`, `dst`) |
+| `edge_attr` | `[E, 1]` | `int64` | Edge label ID per edge |
+| `membership` | `[N]` | `int64` | Candidate index for each node |
+| `mask` | `[K]` | `bool` | Valid candidate slots |
+
+Additional tensors in `separated` mode:
+
+| Tensor | Shape | DType | Meaning |
+| --- | --- | --- | --- |
+| `goal_node_features` | `[GN, F]` | `float32` | Goal graph node features |
+| `goal_edge_index` | `[2, GE]` | `int64` | Goal graph edges |
+| `goal_edge_attr` | `[GE, 1]` | `int64` | Goal graph edge labels |
+| `goal_batch` | `[GN]` | `int64` | Goal graph batch assignment |
+
+Output:
+
+- Logits shape: $[K]$
+- Action selection:
+
+$$
+a = \arg\max_{k < n_{\text{candidates}}} \, \text{logits}_k
+$$
+
+Plain-text equivalent:
+
+```text
+action = argmax(logits[:n_candidates])
+```
+
+## What the model returns (logits and context semantics)
+
+- Forward output is one scalar logit per candidate.
+- A larger logit means stronger model preference before normalization.
+- Selection is `argmax(logits)` over valid candidates.
+- With `--use-global-context true`, each candidate score depends on all candidates in that frontier.
+- With `--use-global-context false`, explicit frontier-level context concatenation is disabled.
+
+## ONNX usage (merged vs separated)
+
+Export examples:
+
+```bash
+# merged
+python3 lib/rl_handler/__main__.py --kind-of-data merged --export-onnx true
+
+# separated
+python3 lib/rl_handler/__main__.py --kind-of-data separated --use-goal-separate-input true --export-onnx true
+```
+
+Minimal inference input examples:
 
 ```python
 from src.graph_utils import load_pyg_graph, combine_graphs
@@ -52,23 +229,22 @@ g3 = load_pyg_graph("s3.dot", dataset_type="HASHED")
 n_candidates = 3
 mask = np.array([True, True, True], dtype=bool)
 
-# merged regime (goal already embedded in successors)
+# merged: goal already inside successor graphs
 merged = combine_graphs(
     frontier_graphs=[g1, g2, g3],
     goal_graph=None,
     kind_of_data="merged",
     action_ids=[0, 1, 2],
 )
-
 onnx_inputs_merged = {
     "node_features": merged.node_features.numpy().astype("float32"),
     "edge_index": merged.edge_index.numpy().astype("int64"),
     "edge_attr": merged.edge_attr.numpy().astype("int64"),
     "membership": merged.membership.numpy().astype("int64"),
-    "mask": mask,  # len == number of valid candidates
+    "mask": mask,
 }
 
-# separated regime (goal passed as separate branch)
+# separated: goal passed as separate branch
 goal = load_pyg_graph("goal.dot", dataset_type="HASHED")
 separated = combine_graphs(
     frontier_graphs=[g1, g2, g3],
@@ -76,7 +252,6 @@ separated = combine_graphs(
     kind_of_data="separated",
     action_ids=[0, 1, 2],
 )
-
 onnx_inputs_separated = {
     "node_features": separated.node_features.numpy().astype("float32"),
     "edge_index": separated.edge_index.numpy().astype("int64"),
@@ -90,26 +265,67 @@ onnx_inputs_separated = {
 }
 ```
 
-What `combine_graphs` returns:
-- Common fields (both regimes): `node_features`, `edge_index`, `edge_attr`, `membership`, `action_map`.
-- `merged` may also return `pool_node_index` and `pool_membership` (used in PyTorch batching to preserve candidate pooling when nodes are shared).
-- `separated` requires the external goal tensors (`goal_*`) when ONNX model was exported with `use_goal_separate_input=true`.
+## Quick start
 
-ONNX expected input structure:
-- `merged`: `node_features [N,D] float32`, `edge_index [2,E] int64`, `edge_attr [E,1] int64`, `membership [N] int64`, `mask [F] bool`.
-- `separated`: same + `goal_node_features [GN,D] float32`, `goal_edge_index [2,GE] int64`, `goal_edge_attr [GE,1] int64`, `goal_batch [GN] int64`.
+From the repository root:
 
-Output usage:
-1. Run ONNX and read `logits`.
-2. Use the valid prefix `logits[:n_candidates]`.
-3. Pick `argmax` on that prefix.
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r lib/rl_handler/requirements.txt
+python3 lib/rl_handler/__main__.py --help
+```
 
-Note: in `merged`, if heavy node-sharing exists, ONNX output sizing can depend on traced/static assumptions. The project runtime handles this by probing mask lengths and still selecting from the valid prefix.
+Example: merged mode training + eval + ONNX export
 
-## 5) Parser (`__main__.py::parse_args`)
-Complete parameter reference (default + effect):
+```bash
+python3 lib/rl_handler/__main__.py \
+  --folder-raw-data <path/to/training_data> \
+  --subset-train <dataset_a> <dataset_b> \
+  --dir-save-data <path/to/output_data> \
+  --dir-save-model <path/to/output_models> \
+  --kind-of-data merged \
+  --dataset_type HASHED
+```
 
-### Paths and Naming
+Example: separated mode (goal as separate input branch)
+
+```bash
+python3 lib/rl_handler/__main__.py \
+  --folder-raw-data <path/to/training_data> \
+  --subset-train <dataset_a> <dataset_b> \
+  --dir-save-data <path/to/output_data> \
+  --dir-save-model <path/to/output_models> \
+  --kind-of-data separated \
+  --use-goal-separate-input true
+```
+
+## Generated artifacts
+
+Main outputs (inside `--dir-save-data` / `--dir-save-model`, optionally under `--experiment-name`):
+
+- `data_pytorch/train_samples.pt`
+- `data_pytorch/eval_samples_random.pt`
+- `data_pytorch/eval_samples_stress.pt`
+- `data_pytorch/samples_params.pt`
+- `best.pt`
+- `metrics/<model_name>.pt`
+- `<model_name>.onnx`
+- `metrics/eval_reports/*.json`
+- `metrics/onnx/*.json` (when ONNX checks are enabled)
+
+## Deployment checklist
+
+- Keep graph composition identical to training mode (`merged` or `separated`).
+- Keep edge-label integer mapping identical to training.
+- Ensure `edge_index` references valid node rows in `node_features`.
+- Ensure `membership` correctly groups nodes by candidate.
+- Ensure `mask` enables only valid candidate slots.
+
+## CLI reference (`__main__.py::parse_args`)
+
+### Paths and naming
+
 | Parameter | Default | Effect |
 | --- | --- | --- |
 | `--subset-train` | `[]` | Restrict training to specific dataset subfolders. |
@@ -119,7 +335,8 @@ Complete parameter reference (default + effect):
 | `--experiment-name` | `""` | Optional subdirectory under save roots (run isolation). |
 | `--model-name` | `frontier_policy` | Base filename for model/ONNX/report artifacts. |
 
-### Data Semantics and Dataset Build
+### Data semantics and dataset build
+
 | Parameter | Default | Effect |
 | --- | --- | --- |
 | `--dataset_type` | `HASHED` | Node encoding mode: `HASHED`, `MAPPED`, `BITMASK`. |
@@ -127,13 +344,14 @@ Complete parameter reference (default + effect):
 | `--n-max-dataset-queries` | `1000` | Max random/stress eval queries generated per dataset. |
 | `--max-size-frontier` | `25` | Max frontier size in stress FIFO/LIFO scheduling. |
 | `--max-failure-states-per-dataset` | `0.3` | Caps train frontiers with failures (ratio to no-failure train frontiers). |
-| `--reward-formulation` | `negative_distance` | Reward mode label (pipeline currently uses distance-derived rewards). |
+| `--reward-formulation` | `negative_distance` | Reward mode label (pipeline uses distance-derived rewards). |
 | `--max-regular-distance-for-reward` | `50.0` | Distance threshold used for reward scaling and failure cut. |
 | `--failure-reward-value` | `-1.0` | Reward assigned to failure states (`distance > max_regular_distance`). |
 | `--build-data` | `true` | Rebuild materialized train/eval samples from raw data. |
 | `--build-eval-data` | `true` | Rebuild random + stress eval sets (used when `--evaluate true`). |
 
-### Training and Optimization
+### Training and optimization
+
 | Parameter | Default | Effect |
 | --- | --- | --- |
 | `--batch-size` | `9092` | Dataloader batch size (number of frontiers per step). |
@@ -146,7 +364,8 @@ Complete parameter reference (default + effect):
 | `--max-grad-norm` | `0.0` | Gradient clipping threshold (`>0` enables clipping). |
 | `--early-stopping-patience-evals` | `0` | Early stop after N eval checkpoints without reward improvement (`0` disables). |
 
-### Model Architecture
+### Model architecture
+
 | Parameter | Default | Effect |
 | --- | --- | --- |
 | `--gnn-layers` | `3` | Number of message-passing layers in encoder. |
@@ -157,9 +376,10 @@ Complete parameter reference (default + effect):
 | `--num-node-labels` | `4096` | Size of node label embedding table. |
 | `--use-global-context` | `true` | Concatenate frontier context (mean candidate embedding) in policy head. |
 | `--mlp-depth` | `2` | Depth of policy MLP head. |
-| `--use-goal-separate-input` | `None` | Enables separate goal branch; if unset: auto `true` for `separated`, else `false`. |
+| `--use-goal-separate-input` | `None` | Separate goal branch. If unset: auto `true` for `separated`, else `false`. |
 
-### Execution, Evaluation, ONNX
+### Execution, evaluation, ONNX
+
 | Parameter | Default | Effect |
 | --- | --- | --- |
 | `--train` | `true` | Run training loop. |
