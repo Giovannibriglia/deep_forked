@@ -4,21 +4,35 @@ import argparse
 import itertools
 import json
 import random
+from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
 
+import networkx as nx
+import pydot
 import torch
+from tqdm import tqdm
 
 from src.data import (
     build_frontier_dataloader,
     build_frontier_samples,
     get_dataloaders,
+    group_clean_frontiers,
+    normalize_distance_to_reward,
+    read_frontier_csv,
     refresh_frontier_sample_targets,
     seed_everything,
 )
-from src.graph_utils import combine_graphs, load_pyg_graph
+from src.graph_utils import VALID_DATASET_TYPES, combine_graphs, load_pyg_graph
 from src.models.frontier_policy import FrontierPolicyNetwork
-from src.trainer import RLFrontierTrainer
+from src.trainer import (
+    FAILURE_EPS,
+    FAILURE_REWARD_VALUE,
+    REGIME_ALL,
+    REGIME_ORDER,
+    RLFrontierTrainer,
+)
 
 
 def str2bool(v):
@@ -143,6 +157,15 @@ def parse_args():
     )
     parser.add_argument("--train", type=str2bool, default=True)
     parser.add_argument("--evaluate", type=str2bool, default=True)
+    parser.add_argument(
+        "--evaluate-new",
+        type=str2bool,
+        default=False,
+        help=(
+            "If true and <model_root>/test_data exists, evaluate the exported ONNX "
+            "model per dataset and save reports under metrics/eval_test_data."
+        ),
+    )
     parser.add_argument("--export-onnx", type=str2bool, default=True)
     parser.add_argument(
         "--if-try-example",
@@ -1444,6 +1467,710 @@ def _build_train_state_stats(
     )
 
 
+def _sample_rewards_tensor(sample: Dict[str, Any]) -> torch.Tensor:
+    rewards = sample.get("reward_target", sample.get("rewards"))
+    if isinstance(rewards, torch.Tensor):
+        return rewards.detach().cpu().to(torch.float32).view(-1)
+    if rewards is None:
+        return torch.zeros((0,), dtype=torch.float32)
+    try:
+        return torch.tensor(rewards, dtype=torch.float32).view(-1)
+    except (TypeError, ValueError):
+        return torch.zeros((0,), dtype=torch.float32)
+
+
+def _build_eval_metrics_from_frontier_decisions(
+    trainer: RLFrontierTrainer,
+    chosen_rewards: Sequence[float],
+    accuracies: Sequence[int],
+    frontier_has_failure: Sequence[int],
+    frontier_sizes: Sequence[int],
+    abs_reward_gaps: Sequence[float],
+) -> Dict[str, object]:
+    regimes = trainer._build_regime_metrics(
+        rewards=chosen_rewards,
+        accuracies=accuracies,
+        frontier_has_failure=frontier_has_failure,
+        frontier_sizes=frontier_sizes,
+        abs_reward_gaps=abs_reward_gaps,
+    )
+    all_reward_stats = regimes[REGIME_ALL]["reward_stats"]
+    all_accuracy_stats = regimes[REGIME_ALL]["accuracy_stats"]
+    all_abs_gap_stats = regimes[REGIME_ALL]["abs_reward_gap_stats"]
+
+    metrics: Dict[str, object] = {
+        "n_frontiers": len(chosen_rewards),
+        "chosen_rewards": [float(x) for x in chosen_rewards],
+        "accuracies": [int(x) for x in accuracies],
+        "frontier_has_failure": [int(x) for x in frontier_has_failure],
+        "frontier_sizes": [int(x) for x in frontier_sizes],
+        "abs_reward_gaps": [float(x) for x in abs_reward_gaps],
+        "regimes": regimes,
+        "mean_reward": float(all_reward_stats["mean"]),
+        "std_reward": float(all_reward_stats["std"]),
+        "iqm_reward": float(all_reward_stats["iqm"]),
+        "iqr_reward": float(all_reward_stats["iqr"]),
+        "iqr_std_reward": float(all_reward_stats["iqr_std"]),
+        "mean_accuracy": float(all_accuracy_stats["mean"]),
+        "std_accuracy": float(all_accuracy_stats["std"]),
+        "mean_abs_reward_gap": float(all_abs_gap_stats["mean"]),
+        "std_abs_reward_gap": float(all_abs_gap_stats["std"]),
+        "iqm_abs_reward_gap": float(all_abs_gap_stats["iqm"]),
+        "iqr_abs_reward_gap": float(all_abs_gap_stats["iqr"]),
+        "iqr_std_abs_reward_gap": float(all_abs_gap_stats["iqr_std"]),
+        "oracle_accuracy": float(all_accuracy_stats["mean"]),
+    }
+
+    n_frontiers = len(chosen_rewards)
+    n_failure_frontiers = int(sum(frontier_has_failure))
+    metrics["n_mixed_frontiers"] = n_failure_frontiers
+    metrics["n_failure_frontiers"] = n_failure_frontiers
+    metrics["failure_frontier_rate"] = (
+        float(n_failure_frontiers / n_frontiers) if n_frontiers > 0 else 0.0
+    )
+    metrics["n_failure_choices_on_mixed"] = 0
+    metrics["failure_choice_rate_on_mixed"] = 0.0
+    metrics["normalized_regret_mean"] = 0.0
+    metrics["normalized_regret_std"] = 0.0
+    metrics["normalized_regrets"] = [0.0 for _ in chosen_rewards]
+    return metrics
+
+
+def _run_onnx_single_frontier(
+    sample: Dict[str, Any],
+    ort_sess: Any,
+    np_mod: Any,
+    static_onnx_len: Optional[int],
+    use_goal_inputs: bool,
+) -> Dict[str, Any]:
+    n_candidates = _infer_num_candidates(sample)
+    if n_candidates <= 0:
+        return {"status": "error", "error": "sample has no candidates."}
+
+    rewards_t = _sample_rewards_tensor(sample)
+    if rewards_t.numel() <= 0:
+        return {"status": "error", "error": "sample has no reward targets."}
+    n_valid = max(0, min(int(n_candidates), int(rewards_t.numel())))
+    if n_valid <= 0:
+        return {"status": "error", "error": "sample has no valid reward-target candidates."}
+
+    required_base = ["node_features", "edge_index", "edge_attr", "membership"]
+    missing_base = [k for k in required_base if k not in sample]
+    if missing_base:
+        return {
+            "status": "error",
+            "error": f"sample is missing required tensors {missing_base}.",
+        }
+
+    base_onnx_inputs = {
+        "node_features": (
+            sample["node_features"].detach().cpu().to(torch.float32).numpy().astype("float32")
+        ),
+        "edge_index": (
+            sample["edge_index"].detach().cpu().to(torch.int64).numpy().astype("int64")
+        ),
+        "edge_attr": sample["edge_attr"].detach().cpu().to(torch.int64).numpy().astype("int64"),
+        "membership": (
+            sample["membership"].detach().cpu().to(torch.int64).numpy().astype("int64")
+        ),
+    }
+
+    if use_goal_inputs:
+        goal_keys = ["goal_node_features", "goal_edge_index", "goal_edge_attr"]
+        goal_missing = [k for k in goal_keys if k not in sample]
+        if goal_missing:
+            return {
+                "status": "error",
+                "error": f"sample is missing goal tensors {goal_missing}.",
+            }
+        goal_batch = sample.get("goal_batch")
+        if goal_batch is None:
+            goal_batch = torch.zeros(
+                (int(sample["goal_node_features"].size(0)),),
+                dtype=torch.int64,
+            )
+        else:
+            goal_batch = goal_batch.to(torch.int64)
+
+        base_onnx_inputs["goal_node_features"] = (
+            sample["goal_node_features"]
+            .detach()
+            .cpu()
+            .to(torch.float32)
+            .numpy()
+            .astype("float32")
+        )
+        base_onnx_inputs["goal_edge_index"] = (
+            sample["goal_edge_index"].detach().cpu().to(torch.int64).numpy().astype("int64")
+        )
+        base_onnx_inputs["goal_edge_attr"] = (
+            sample["goal_edge_attr"].detach().cpu().to(torch.int64).numpy().astype("int64")
+        )
+        base_onnx_inputs["goal_batch"] = (
+            goal_batch.detach().cpu().to(torch.int64).numpy().astype("int64")
+        )
+
+    def _mask_numpy(mask_len: int, valid_len: int):
+        valid = max(0, min(int(mask_len), int(valid_len)))
+        out = torch.zeros((int(mask_len),), dtype=torch.bool)
+        if valid > 0:
+            out[:valid] = True
+        return out.numpy().astype("bool")
+
+    mask_attempts = []
+    if static_onnx_len is not None and int(static_onnx_len) > 0:
+        mask_attempts.append(int(static_onnx_len))
+    if int(n_candidates) not in mask_attempts:
+        mask_attempts.append(int(n_candidates))
+    if int(n_valid) not in mask_attempts:
+        mask_attempts.append(int(n_valid))
+
+    onnx_logits_np = None
+    onnx_mask_len = None
+    last_onnx_error = None
+    for mask_len in mask_attempts:
+        try:
+            onnx_inputs = dict(base_onnx_inputs)
+            onnx_inputs["mask"] = _mask_numpy(mask_len=mask_len, valid_len=n_valid)
+            onnx_logits_np = (
+                np_mod.asarray(ort_sess.run(["logits"], onnx_inputs)[0], dtype=np_mod.float32)
+                .reshape(-1)
+                .astype(np_mod.float32)
+            )
+            onnx_mask_len = int(mask_len)
+            break
+        except Exception as exc:
+            last_onnx_error = exc
+
+    if onnx_logits_np is None:
+        return {"status": "error", "error": f"ONNX inference failed: {last_onnx_error}"}
+
+    valid_for_onnx = max(0, min(int(n_valid), int(onnx_logits_np.size)))
+    if valid_for_onnx <= 0:
+        return {"status": "error", "error": "ONNX returned no valid logits."}
+
+    pred_idx = int(np_mod.argmax(onnx_logits_np[:valid_for_onnx]))
+    chosen_reward = float(rewards_t[pred_idx].item())
+    best_reward = float(rewards_t[:n_valid].max().item())
+    abs_gap = abs(best_reward - chosen_reward)
+    has_failure = int(
+        bool(
+            (rewards_t[:n_valid] <= float(FAILURE_REWARD_VALUE + FAILURE_EPS))
+            .any()
+            .item()
+        )
+    )
+    is_correct = int(abs_gap <= float(FAILURE_EPS))
+
+    return {
+        "status": "ok",
+        "chosen_reward": float(chosen_reward),
+        "accuracy": int(is_correct),
+        "frontier_has_failure": int(has_failure),
+        "frontier_size": int(n_valid),
+        "abs_reward_gap": float(abs_gap),
+        "onnx_prediction_index": int(pred_idx),
+        "onnx_mask_len_used": int(onnx_mask_len) if onnx_mask_len is not None else None,
+    }
+
+
+def _evaluate_onnx_dataset_samples(
+    trainer: RLFrontierTrainer,
+    samples: Sequence[Dict[str, Any]],
+    dataset_label: str,
+    ort_sess: Any,
+    np_mod: Any,
+    static_onnx_len: Optional[int],
+    use_goal_inputs: bool,
+) -> Dict[str, Any]:
+    chosen_rewards: list[float] = []
+    accuracies: list[int] = []
+    frontier_has_failure: list[int] = []
+    frontier_sizes: list[int] = []
+    abs_reward_gaps: list[float] = []
+    failed_frontiers: list[Dict[str, Any]] = []
+
+    for idx, sample in enumerate(
+        tqdm(samples, desc=f"Evaluating {dataset_label}", leave=False)
+    ):
+        result = _run_onnx_single_frontier(
+            sample=sample,
+            ort_sess=ort_sess,
+            np_mod=np_mod,
+            static_onnx_len=static_onnx_len,
+            use_goal_inputs=use_goal_inputs,
+        )
+        if result.get("status") != "ok":
+            failed_frontiers.append(
+                {
+                    "sample_index": int(idx),
+                    "dataset_id": str(sample.get("dataset_id", "")),
+                    "predecessor_path": str(sample.get("predecessor_path", "")),
+                    "error": str(result.get("error", "unknown error")),
+                }
+            )
+            continue
+
+        chosen_rewards.append(float(result["chosen_reward"]))
+        accuracies.append(int(result["accuracy"]))
+        frontier_has_failure.append(int(result["frontier_has_failure"]))
+        frontier_sizes.append(int(result["frontier_size"]))
+        abs_reward_gaps.append(float(result["abs_reward_gap"]))
+
+    metrics = _build_eval_metrics_from_frontier_decisions(
+        trainer=trainer,
+        chosen_rewards=chosen_rewards,
+        accuracies=accuracies,
+        frontier_has_failure=frontier_has_failure,
+        frontier_sizes=frontier_sizes,
+        abs_reward_gaps=abs_reward_gaps,
+    )
+    metrics["n_attempted_frontiers"] = int(len(samples))
+    metrics["n_failed_frontiers"] = int(len(failed_frontiers))
+    metrics["n_evaluated_frontiers"] = int(len(chosen_rewards))
+    if failed_frontiers:
+        metrics["failed_frontiers"] = failed_frontiers
+    return metrics
+
+
+@dataclass
+class _EvalGraphTensors:
+    node_features: torch.Tensor
+    edge_index: torch.Tensor
+    edge_attr: torch.Tensor
+    node_names: torch.Tensor
+
+
+def _strip_quotes(v: Any) -> str:
+    return str(v).replace('"', "").strip()
+
+
+def _parse_numeric_node_label_eval(node_obj: object) -> float:
+    if isinstance(node_obj, (int, float)):
+        return float(node_obj)
+    if isinstance(node_obj, str):
+        return float(node_obj.strip())
+    raise TypeError(f"Unsupported node label type: {type(node_obj)}")
+
+
+def _load_graph_tensors_no_pyg(path: str, dataset_type: str) -> _EvalGraphTensors:
+    dataset_type_norm = str(dataset_type).upper()
+    if dataset_type_norm not in VALID_DATASET_TYPES:
+        raise ValueError(
+            f"Unsupported dataset_type '{dataset_type}'. "
+            f"Expected one of {sorted(VALID_DATASET_TYPES)}."
+        )
+
+    dot_src = Path(path).read_text()
+    dot = pydot.graph_from_dot_data(dot_src)[0]
+    graph_nx = nx.nx_pydot.from_pydot(dot)
+
+    nodes = list(graph_nx.nodes())
+    node_to_idx = {node_id: idx for idx, node_id in enumerate(nodes)}
+
+    if dataset_type_norm == "BITMASK":
+        explicit_len = graph_nx.graph.get("bit_len", None)
+        if explicit_len is not None:
+            explicit_len = int(_strip_quotes(explicit_len))
+
+        first = nodes[0] if nodes else None
+        inferred_len = len(first) if isinstance(first, (str, list, tuple)) else None
+        bit_len = explicit_len if explicit_len is not None else inferred_len
+        if bit_len is None:
+            raise ValueError("Cannot infer bit length from graph nodes.")
+
+        def _to_bits(node_obj: object, expected_len: int | None) -> list[int]:
+            if isinstance(node_obj, str):
+                s = node_obj.strip()
+                if not set(s) <= {"0", "1"}:
+                    raise ValueError(f"Node '{node_obj}' is not a bitstring.")
+                if expected_len is not None and len(s) != expected_len:
+                    raise ValueError(f"Inconsistent bit length for node '{node_obj}'.")
+                return [int(ch) for ch in s]
+            if isinstance(node_obj, (list, tuple)):
+                bits = [int(x) for x in node_obj]
+                if not set(bits) <= {0, 1}:
+                    raise ValueError(f"Node '{node_obj}' has non-binary values.")
+                if expected_len is not None and len(bits) != expected_len:
+                    raise ValueError(f"Inconsistent bit length for node '{node_obj}'.")
+                return bits
+            if isinstance(node_obj, int):
+                if expected_len is None:
+                    raise ValueError("bit_len is required for int node labels.")
+                return [int(ch) for ch in format(node_obj, f"0{expected_len}b")]
+            raise TypeError(f"Unsupported node label type: {type(node_obj)}")
+
+        rows = [_to_bits(node, bit_len) for node in nodes]
+        node_bits = torch.tensor(rows, dtype=torch.bool)
+        node_features = node_bits.to(torch.float32)
+        node_names = node_features.clone()
+    else:
+        raw_ids = [_parse_numeric_node_label_eval(node) for node in nodes]
+        node_names = torch.tensor(raw_ids, dtype=torch.float32)
+        node_features = node_names.view(-1, 1).to(torch.float32)
+
+    edge_rows: list[list[int]] = []
+    edge_attrs: list[list[int]] = []
+    for src, dst, edge_data in graph_nx.edges(data=True):
+        src_idx = int(node_to_idx[src])
+        dst_idx = int(node_to_idx[dst])
+        edge_label = int(_strip_quotes(edge_data.get("label", "0")))
+        edge_rows.append([src_idx, dst_idx])
+        edge_attrs.append([edge_label])
+
+    if edge_rows:
+        edge_index = torch.tensor(edge_rows, dtype=torch.long).t().contiguous()
+        edge_attr = torch.tensor(edge_attrs, dtype=torch.int64)
+    else:
+        edge_index = torch.zeros((2, 0), dtype=torch.long)
+        edge_attr = torch.zeros((0, 1), dtype=torch.int64)
+
+    return _EvalGraphTensors(
+        node_features=node_features,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        node_names=node_names,
+    )
+
+
+def _materialize_frontier_no_pyg(
+    frontier: Dict[str, Any],
+    kind_of_data: str,
+    dataset_type: str,
+    max_regular_distance_for_reward: float,
+    failure_reward_value: float,
+    graph_loader: Any,
+) -> Dict[str, Any]:
+    if kind_of_data not in {"merged", "separated"}:
+        raise ValueError(f"Unsupported kind_of_data: {kind_of_data}")
+
+    successor_graphs = [graph_loader(path) for path in frontier["successor_paths"]]
+    goal_graph = None
+    if kind_of_data == "separated":
+        goal_path = str(frontier.get("goal_path", ""))
+        if not goal_path:
+            raise ValueError("Missing Goal path for kind_of_data='separated'.")
+        goal_graph = graph_loader(goal_path)
+
+    combined = combine_graphs(
+        frontier_graphs=successor_graphs,
+        goal_graph=goal_graph,
+        kind_of_data=kind_of_data,
+        action_ids=None,
+    )
+
+    distances = torch.tensor(frontier["distances"], dtype=torch.float32)
+    if "rewards" in frontier and frontier["rewards"] is not None:
+        reward_values = [float(x) for x in frontier["rewards"]]
+    else:
+        reward_values = [
+            normalize_distance_to_reward(
+                distance=float(d),
+                max_regular_distance=float(max_regular_distance_for_reward),
+                failure_reward_value=float(failure_reward_value),
+            )
+            for d in frontier["distances"]
+        ]
+    reward_targets = torch.tensor(reward_values, dtype=torch.float32)
+    is_failure = torch.tensor(
+        [float(r) <= float(failure_reward_value + FAILURE_EPS) for r in reward_values],
+        dtype=torch.bool,
+    )
+    best_idx = int(torch.argmax(reward_targets).item())
+
+    sample = {
+        "node_features": combined.node_features,
+        "edge_index": combined.edge_index,
+        "edge_attr": combined.edge_attr,
+        "membership": combined.membership,
+        "action_map": combined.action_map,
+        "successor_ids": [str(p) for p in frontier["successor_paths"]],
+        "reward_target": reward_targets,
+        "rewards": reward_targets.clone(),
+        "distance_raw": distances,
+        "distances": distances.clone(),
+        "is_failure": is_failure,
+        "oracle_index": torch.tensor(best_idx, dtype=torch.long),
+        "oracle_reward": reward_targets[best_idx].clone(),
+        "goal_path": str(frontier.get("goal_path", "")),
+        "predecessor_path": str(frontier.get("predecessor_path", "")),
+        "dataset_id": str(frontier.get("dataset_id", "")),
+        "frontier_has_failure": bool(is_failure.any().item()),
+    }
+    if "stress_schedule" in frontier:
+        sample["stress_schedule"] = str(frontier.get("stress_schedule", ""))
+    if combined.pool_node_index is not None and combined.pool_membership is not None:
+        sample["pool_node_index"] = combined.pool_node_index
+        sample["pool_membership"] = combined.pool_membership
+    if goal_graph is not None:
+        sample["goal_node_features"] = goal_graph.node_features
+        sample["goal_edge_index"] = goal_graph.edge_index
+        sample["goal_edge_attr"] = goal_graph.edge_attr
+    return sample
+
+
+def _build_test_data_datasets(
+    test_data_root: Path,
+    kind_of_data: str,
+    dataset_type: str,
+    max_regular_distance_for_reward: float,
+    failure_reward_value: float,
+) -> list[Dict[str, Any]]:
+    dataset_type_norm = str(dataset_type).upper()
+    dataset_entries: list[Tuple[str, Path]] = []
+    for problem_dir in sorted(p for p in test_data_root.iterdir() if p.is_dir()):
+        for csv_path in sorted(p for p in problem_dir.iterdir() if p.suffix.lower() == ".csv"):
+            dataset_entries.append((problem_dir.name, csv_path))
+
+    graph_cache: Dict[str, Any] = {}
+
+    def _load_graph(graph_path: str) -> Any:
+        key = str(graph_path)
+        if key in graph_cache:
+            return graph_cache[key]
+        graph = _load_graph_tensors_no_pyg(key, dataset_type=dataset_type_norm)
+        graph_cache[key] = graph
+        return graph
+
+    out: list[Dict[str, Any]] = []
+    for problem_name, csv_path in dataset_entries:
+        rows = read_frontier_csv(csv_path=csv_path, kind_of_data=kind_of_data)
+        clean_frontiers = group_clean_frontiers(
+            rows=rows,
+            kind_of_data=kind_of_data,
+            max_regular_distance_for_reward=float(max_regular_distance_for_reward),
+            failure_reward_value=float(failure_reward_value),
+        )
+        dataset_id = f"{problem_name}/{csv_path.name}"
+        for frontier in clean_frontiers:
+            frontier["dataset_id"] = dataset_id
+
+        samples = [
+            _materialize_frontier_no_pyg(
+                frontier=frontier,
+                kind_of_data=kind_of_data,
+                dataset_type=dataset_type_norm,
+                max_regular_distance_for_reward=float(max_regular_distance_for_reward),
+                failure_reward_value=float(failure_reward_value),
+                graph_loader=_load_graph,
+            )
+            for frontier in tqdm(
+                clean_frontiers,
+                desc=f"Materializing {dataset_id}",
+                leave=False,
+            )
+        ]
+
+        out.append(
+            {
+                "problem_name": str(problem_name),
+                "dataset_id": str(dataset_id),
+                "csv_name": str(csv_path.name),
+                "csv_stem": str(csv_path.stem),
+                "n_rows": int(len(rows)),
+                "n_frontiers_kept": int(len(samples)),
+                "samples": samples,
+            }
+        )
+    return out
+
+
+def _save_test_dataset_plots(
+    trainer: RLFrontierTrainer,
+    problem_dir: Path,
+    dataset_csv_stem: str,
+    dataset_title: str,
+    metrics: Dict[str, Any],
+) -> list[str]:
+    regimes = metrics.get("regimes")
+    if not isinstance(regimes, dict):
+        return []
+
+    generated_plot_paths: list[str] = []
+    for regime in REGIME_ORDER:
+        regime_metrics = regimes.get(regime)
+        if not isinstance(regime_metrics, dict):
+            continue
+
+        reward_curve = regime_metrics.get("reward_by_size", {})
+        reward_plot = (
+            problem_dir / f"{dataset_csv_stem}_{regime}_reward_by_frontier_size_iqm_iqrstd.png"
+        )
+        trainer._plot_frontier_size_curve_with_band(
+            out_path=reward_plot,
+            sizes=[int(x) for x in reward_curve.get("sizes", [])],
+            iqm=[float(x) for x in reward_curve.get("iqm", [])],
+            iqr_std=[float(x) for x in reward_curve.get("iqr_std", [])],
+            ylabel="Reward",
+            y_lim=(-1.0, 0.05),
+            title=f"{dataset_title} | {regime} | Reward by Frontier Size (IQM ± IQR-STD)",
+        )
+        generated_plot_paths.append(reward_plot.as_posix())
+
+        accuracy_curve = regime_metrics.get("accuracy_by_size", {})
+        accuracy_plot = (
+            problem_dir / f"{dataset_csv_stem}_{regime}_accuracy_by_frontier_size_iqm_iqrstd.png"
+        )
+        trainer._plot_frontier_size_curve_with_band(
+            out_path=accuracy_plot,
+            sizes=[int(x) for x in accuracy_curve.get("sizes", [])],
+            iqm=[float(x) for x in accuracy_curve.get("iqm", [])],
+            iqr_std=[float(x) for x in accuracy_curve.get("iqr_std", [])],
+            ylabel="Accuracy",
+            y_lim=(-0.05, 1.05),
+            title=f"{dataset_title} | {regime} | Accuracy by Frontier Size (IQM ± IQR-STD)",
+        )
+        generated_plot_paths.append(accuracy_plot.as_posix())
+
+        best_minus_achieved_curve = regime_metrics.get("abs_reward_gap_by_size", {})
+        best_minus_achieved_plot = (
+            problem_dir
+            / f"{dataset_csv_stem}_{regime}_best_minus_achieved_reward_by_frontier_size_iqm_iqrstd.png"
+        )
+        trainer._plot_frontier_size_curve_with_band(
+            out_path=best_minus_achieved_plot,
+            sizes=[int(x) for x in best_minus_achieved_curve.get("sizes", [])],
+            iqm=[float(x) for x in best_minus_achieved_curve.get("iqm", [])],
+            iqr_std=[float(x) for x in best_minus_achieved_curve.get("iqr_std", [])],
+            ylabel="best reward achievable - reward achieved",
+            y_lim=(0.0, 1.05),
+            title=(
+                f"{dataset_title} | {regime} | "
+                "Best Achievable Reward - Achieved Reward by Frontier Size (IQM ± IQR-STD)"
+            ),
+        )
+        generated_plot_paths.append(best_minus_achieved_plot.as_posix())
+
+    return generated_plot_paths
+
+
+def _evaluate_onnx_on_test_data(
+    trainer: RLFrontierTrainer,
+    onnx_path: Path,
+    test_data_root: Path,
+    metrics_root: Path,
+    kind_of_data: str,
+    dataset_type: str,
+    max_regular_distance_for_reward: float,
+    failure_reward_value: float,
+) -> None:
+    try:
+        import numpy as np
+        import onnxruntime as ort
+    except ImportError as exc:
+        raise ImportError(
+            f"--evaluate-new requires numpy and onnxruntime. Missing dependency: {exc}"
+        ) from exc
+
+    sess_options = ort.SessionOptions()
+    sess_options.log_severity_level = 4
+    ort_sess = ort.InferenceSession(
+        onnx_path.as_posix(),
+        sess_options=sess_options,
+        providers=["CPUExecutionProvider"],
+    )
+    static_onnx_len = _infer_static_onnx_output_len(ort_sess)
+    onnx_input_names = {str(x.name) for x in ort_sess.get_inputs()}
+    use_goal_inputs = "goal_node_features" in onnx_input_names
+
+    datasets = _build_test_data_datasets(
+        test_data_root=test_data_root,
+        kind_of_data=kind_of_data,
+        dataset_type=dataset_type,
+        max_regular_distance_for_reward=float(max_regular_distance_for_reward),
+        failure_reward_value=float(failure_reward_value),
+    )
+    if not datasets:
+        print(f"[warning] No CSV datasets found under test_data root: {test_data_root}")
+        return
+
+    eval_root = metrics_root / "eval_test_data"
+    eval_root.mkdir(parents=True, exist_ok=True)
+    problem_summaries: Dict[str, list[Dict[str, Any]]] = defaultdict(list)
+    all_dataset_rows: list[Dict[str, Any]] = []
+
+    for dataset in tqdm(datasets, desc="Evaluating test_data datasets"):
+        problem_name = str(dataset["problem_name"])
+        dataset_id = str(dataset["dataset_id"])
+        dataset_label = dataset_id
+        dataset_metrics = _evaluate_onnx_dataset_samples(
+            trainer=trainer,
+            samples=dataset["samples"],
+            dataset_label=dataset_label,
+            ort_sess=ort_sess,
+            np_mod=np,
+            static_onnx_len=static_onnx_len,
+            use_goal_inputs=use_goal_inputs,
+        )
+        dataset_metrics["dataset_id"] = dataset_id
+        dataset_metrics["problem_name"] = problem_name
+        dataset_metrics["csv_name"] = str(dataset["csv_name"])
+        dataset_metrics["n_rows"] = int(dataset["n_rows"])
+        dataset_metrics["n_frontiers_after_cleaning"] = int(dataset["n_frontiers_kept"])
+        dataset_metrics["onnx_path"] = onnx_path.as_posix()
+        dataset_metrics["onnx_static_output_len"] = (
+            int(static_onnx_len) if static_onnx_len is not None else None
+        )
+        dataset_metrics["onnx_requires_goal_inputs"] = bool(use_goal_inputs)
+
+        problem_dir = eval_root / problem_name
+        problem_dir.mkdir(parents=True, exist_ok=True)
+        plot_files = _save_test_dataset_plots(
+            trainer=trainer,
+            problem_dir=problem_dir,
+            dataset_csv_stem=str(dataset["csv_stem"]),
+            dataset_title=str(dataset_id),
+            metrics=dataset_metrics,
+        )
+        dataset_metrics["plot_files"] = plot_files
+        dataset_metrics_path = problem_dir / f"{dataset['csv_stem']}_final_metrics.json"
+        with dataset_metrics_path.open("w", encoding="utf-8") as fh:
+            json.dump(dataset_metrics, fh, indent=2)
+
+        row = {
+            "problem_name": problem_name,
+            "dataset_id": dataset_id,
+            "csv_name": str(dataset["csv_name"]),
+            "metrics_path": dataset_metrics_path.as_posix(),
+            "n_rows": int(dataset["n_rows"]),
+            "n_frontiers_after_cleaning": int(dataset["n_frontiers_kept"]),
+            "n_evaluated_frontiers": int(dataset_metrics.get("n_evaluated_frontiers", 0)),
+            "n_failed_frontiers": int(dataset_metrics.get("n_failed_frontiers", 0)),
+            "mean_reward": float(dataset_metrics.get("mean_reward", 0.0)),
+            "mean_accuracy": float(dataset_metrics.get("mean_accuracy", 0.0)),
+            "plot_files": plot_files,
+        }
+        problem_summaries[problem_name].append(row)
+        all_dataset_rows.append(row)
+
+    for problem_name, rows in problem_summaries.items():
+        with (eval_root / problem_name / "summary.json").open("w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "problem_name": problem_name,
+                    "n_datasets": int(len(rows)),
+                    "datasets": rows,
+                },
+                fh,
+                indent=2,
+            )
+
+    with (eval_root / "summary.json").open("w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "onnx_path": onnx_path.as_posix(),
+                "test_data_root": test_data_root.as_posix(),
+                "n_problems": int(len(problem_summaries)),
+                "n_datasets": int(len(all_dataset_rows)),
+                "datasets": all_dataset_rows,
+            },
+            fh,
+            indent=2,
+        )
+
+    print(f"[eval-test-data] ONNX evaluation reports written to: {eval_root}")
+
+
 def main(args):
     seed_everything(args.seed)
     payload, sample_paths = _build_or_load_samples(args)
@@ -1827,6 +2554,32 @@ def main(args):
                     metrics_onnx_reports_dir
                     / f"{args.model_name}_onnx_frontier_order_removal_check.json"
                 ),
+            )
+
+    if args.evaluate_new:
+        test_data_root = model_root / "test_data"
+        if not test_data_root.exists() or not test_data_root.is_dir():
+            print(
+                "[info] --evaluate-new enabled but test_data directory was not found at: "
+                f"{test_data_root}"
+            )
+        else:
+            if not onnx_path.exists():
+                raise FileNotFoundError(
+                    f"--evaluate-new requires ONNX model at {onnx_path}. "
+                    "Enable --export-onnx true or provide the file."
+                )
+            _evaluate_onnx_on_test_data(
+                trainer=trainer,
+                onnx_path=onnx_path,
+                test_data_root=test_data_root,
+                metrics_root=metrics_root,
+                kind_of_data=args.kind_of_data,
+                dataset_type=args.dataset_type,
+                max_regular_distance_for_reward=float(
+                    args.max_regular_distance_for_reward
+                ),
+                failure_reward_value=float(args.failure_reward_value),
             )
 
     best_epoch = None
