@@ -2,11 +2,11 @@ import os
 import argparse
 import subprocess
 
-def find_domains_with_training(batch_dir):
-    """Recursively find all folders under batch_dir that contain a 'Training' folder."""
+def find_domains_with_training(batch_dir, training_folder):
+    """Recursively find all folders under batch_dir that contain the selected training folder."""
     domains = []
     for root, dirs, files in os.walk(batch_dir):
-        if "Training" in dirs:
+        if training_folder in dirs:
             rel_path = os.path.relpath(root, batch_dir)
             domains.append(rel_path)
     return sorted(domains)
@@ -25,6 +25,25 @@ def main():
     parser.add_argument("--max_retries", type=int, default=15, help="Maximum attempts per instance in the called script (default: 15)")
     parser.add_argument("--dataset_type", choices=["MAPPED", "HASHED", "BITMASK"], default="HASHED",
                         help="How node labels are represented: MAPPED, HASHED, or BITMASK.")
+    parser.add_argument(
+        "--dataset-name",
+        dest="dataset_name",
+        default="training_data",
+        help="Output dataset folder name under _models/<domain_name>/ (default: training_data)",
+    )
+    parser.add_argument(
+        "--dataset-max-creation",
+        dest="dataset_max_creation",
+        type=int,
+        default=60000,
+        help="Maximum number of creations for dataset generation (default: 60000)",
+    )
+    parser.add_argument(
+        "--training-folder",
+        dest="training_folder",
+        default="Training",
+        help="Input folder name under each domain containing training instances (default: Training)",
+    )
     # Path to the called script (your adapted one)
     parser.add_argument("--script_path", default="scripts/gnn_exp/create_training_data.py",
                         help="Path to the per-domain Python script to invoke.")
@@ -36,12 +55,16 @@ def main():
         print(f"Error: {batch_path} is not a valid directory.")
         return
 
-    domains = find_domains_with_training(batch_path)
+    domains = find_domains_with_training(batch_path, args.training_folder)
     if not domains:
-        print("No domains with Training folders found (even recursively).")
+        print(
+            f"No domains with '{args.training_folder}' folders found (even recursively)."
+        )
         return
 
-    print(f"Found {len(domains)} domain(s) with Training folders.")
+    print(
+        f"Found {len(domains)} domain(s) with '{args.training_folder}' folders."
+    )
 
 
     print(f"[INFO] Base RNG seed: {args.seed}")
@@ -53,7 +76,7 @@ def main():
         f"[INFO] On success, per-dataset logs and seed summaries will be placed inside each dataset folder."
     )
     print(
-        f"[INFO] Successful seeds will be appended to: {batch_path}/_models/<domain_name>/training_data/seeds.txt"
+        f"[INFO] Successful seeds will be appended to: {batch_path}/_models/<domain_name>/{args.dataset_name}/seeds.txt"
     )
 
     for domain_rel_path in domains:
@@ -72,6 +95,9 @@ def main():
             "--seed", str(args.seed),
             "--max_retries", str(args.max_retries),
             "--dataset_type", str(args.dataset_type),
+            "--dataset-name", str(args.dataset_name),
+            "--dataset-max-creation", str(args.dataset_max_creation),
+            "--training-folder", str(args.training_folder),
         ]
         if args.no_goal:
             cmd.append("--no_goal")

@@ -14,8 +14,8 @@ import hashlib
 LOG_LOCK = threading.Lock()
 
 
-def create_models_folder(base_folder, domain_name):
-    models_folder = os.path.join(base_folder, "_models", domain_name, "training_data")
+def create_models_folder(base_folder, domain_name, dataset_name):
+    models_folder = os.path.join(base_folder, "_models", domain_name, dataset_name)
     os.makedirs(models_folder, exist_ok=True)
     return models_folder
 
@@ -53,7 +53,14 @@ def save_attempt_log(logs_dir, instance_name, seed, output):
 
 
 def run_cpp_once(
-        deep_exe, file_path, no_goal, depth, discard_factor, seed, dataset_type
+        deep_exe,
+        file_path,
+        no_goal,
+        depth,
+        discard_factor,
+        seed,
+        dataset_type,
+        dataset_max_creation,
 ):
     """Run the C++ tool once with a given seed. Returns (exit_code, output_string)."""
     command = [
@@ -64,6 +71,7 @@ def run_cpp_once(
         "--dataset_depth", str(depth),
         "--dataset_discard_factor", str(discard_factor),
         "--dataset_seed", str(seed),
+        "--dataset_max_creation", str(dataset_max_creation),
         "--dataset_type", str(dataset_type),
     ]
     if no_goal:
@@ -200,6 +208,7 @@ def process_file_with_retries(
         no_goal,
         depth,
         discard_factor,
+        dataset_max_creation,
         base_seed,
         max_retries,
         dataset_type,
@@ -221,7 +230,14 @@ def process_file_with_retries(
         try:
             print(f"[PROCESSING] {file_name} with seed {seed}")
             exit_code, output = run_cpp_once(
-                deep_exe, file_path, no_goal, depth, discard_factor, seed, dataset_type
+                deep_exe,
+                file_path,
+                no_goal,
+                depth,
+                discard_factor,
+                seed,
+                dataset_type,
+                dataset_max_creation,
             )
 
         except Exception as e:
@@ -294,6 +310,7 @@ def run_cpp_on_training_files_multithreaded(
         no_goal,
         depth,
         discard_factor,
+        dataset_max_creation,
         base_seed,
         max_retries,
         dataset_type,
@@ -301,7 +318,7 @@ def run_cpp_on_training_files_multithreaded(
         logs_dir,
 ):
     if not os.path.isdir(training_folder):
-        raise FileNotFoundError(f"Training folder not found: {training_folder}")
+        raise FileNotFoundError(f"Input training folder not found: {training_folder}")
 
     files = sorted(
         os.path.join(training_folder, f)
@@ -321,6 +338,7 @@ def run_cpp_on_training_files_multithreaded(
             no_goal,
             depth,
             discard_factor,
+            dataset_max_creation,
             base_seed,
             max_retries,
             dataset_type,
@@ -338,23 +356,23 @@ def run_cpp_on_training_files_multithreaded(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Run deep executable on all files in <base_folder>/<domain_name>/Training and "
-            "store results in <base_folder>/_models/<domain_name>/training_data/.\n"
+            "Run deep executable on all files in <base_folder>/<domain_name>/<training_folder> and "
+            "store results in <base_folder>/_models/<domain_name>/<dataset_name>/.\n"
             "Each instance gets its own RNG seeded from --seed (default 42) to generate per-attempt seeds.\n"
             "Up to --max_retries (default 15) attempts per instance. Successful seeds are stored in:\n"
             "  - <dataset>/SEEDS.txt (per-dataset summary)\n"
-            "  - <base_folder>/_models/<domain_name>/training_data/seeds.txt (aggregate)\n"
+            "  - <base_folder>/_models/<domain_name>/<dataset_name>/seeds.txt (aggregate)\n"
             "IMPORTANT: Run from the root of the project folder."
         ),
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
         "base_folder",
-        help="Root folder containing the <domain_name>/Training and _models/ folders",
+        help="Root folder containing the <domain_name>/<training_folder> and _models/ folders",
     )
     parser.add_argument(
         "domain_name",
-        help="Domain name (folder under base_folder containing 'Training')",
+        help="Domain name (folder under base_folder containing the training folder)",
     )
     parser.add_argument("deep_exe", help="Path to the deep C++ executable")
     parser.add_argument(
@@ -394,13 +412,34 @@ def main():
         default="HASHED",
         help="Specifies how node labels are represented in dataset generation.",
     )
+    parser.add_argument(
+        "--dataset-name",
+        dest="dataset_name",
+        default="training_data",
+        help="Output dataset folder name under _models/<domain_name>/ (default: training_data)",
+    )
+    parser.add_argument(
+        "--dataset-max-creation",
+        dest="dataset_max_creation",
+        type=int,
+        default=60000,
+        help="Maximum number of creations for dataset generation (default: 60000)",
+    )
+    parser.add_argument(
+        "--training-folder",
+        dest="training_folder",
+        default="Training",
+        help="Input folder name under <domain_name> containing training instances (default: Training)",
+    )
 
     args = parser.parse_args()
 
     domain_folder = os.path.join(args.base_folder, args.domain_name)
-    training_folder = os.path.join(domain_folder, "Training")
+    training_folder = os.path.join(domain_folder, args.training_folder)
 
-    models_folder = create_models_folder(args.base_folder, args.domain_name)
+    models_folder = create_models_folder(
+        args.base_folder, args.domain_name, args.dataset_name
+    )
     failed_root, logs_dir = ensure_failed_dirs(args.base_folder, args.domain_name)
 
     run_cpp_on_training_files_multithreaded(
@@ -410,6 +449,7 @@ def main():
         args.no_goal,
         args.depth,
         args.discard_factor,
+        args.dataset_max_creation,
         args.seed,
         args.max_retries,
         args.dataset_type,
