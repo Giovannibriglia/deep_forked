@@ -124,7 +124,7 @@ def main():
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--failure-reward-value", type=float, default=-1.0)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--early-stopping-patience-evals", type=int, default=10)
+    parser.add_argument("--early-stopping-patience-evals", type=int, default=50)
     parser.add_argument(
         "--build-data",
         choices=["true", "false"],

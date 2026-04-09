@@ -147,7 +147,7 @@ def parse_args():
     parser.add_argument(
         "--if-try-example",
         type=str2bool,
-        default=False,
+        default=True,
         help=(
             "If true and ONNX export is enabled, run one frontier sample through "
             "both PyTorch and ONNX and save parity reports."
@@ -1304,6 +1304,22 @@ def _sample_has_failure_state(sample: Dict[str, Any]) -> bool:
     return False
 
 
+def _sample_has_failure_and_solution_state(sample: Dict[str, Any]) -> bool:
+    failure_vec = sample.get("is_failure")
+    if isinstance(failure_vec, torch.Tensor):
+        if failure_vec.numel() == 0:
+            return False
+        failure_mask = failure_vec.to(torch.bool).view(-1)
+        return bool(failure_mask.any().item() and (~failure_mask).any().item())
+    if isinstance(failure_vec, (list, tuple)):
+        if not failure_vec:
+            return False
+        has_failure = any(bool(x) for x in failure_vec)
+        has_solution = any(not bool(x) for x in failure_vec)
+        return bool(has_failure and has_solution)
+    return False
+
+
 def _limit_failure_frontiers_in_train_dataset(
     train_samples: Sequence[Dict[str, Any]],
     max_failure_states_per_dataset: float,
@@ -1314,15 +1330,20 @@ def _limit_failure_frontiers_in_train_dataset(
             "n_total": 0,
             "n_no_failure": 0,
             "n_with_failure_total": 0,
+            "n_with_failure_and_solution_total": 0,
             "n_with_failure_kept": 0,
+            "n_with_failure_and_solution_kept": 0,
             "n_total_kept": 0,
         }
 
     no_failure_indices = []
     with_failure_indices = []
+    with_failure_and_solution_indices = []
     for idx, sample in enumerate(train_samples):
         if _sample_has_failure_state(sample):
             with_failure_indices.append(idx)
+            if _sample_has_failure_and_solution_state(sample):
+                with_failure_and_solution_indices.append(idx)
         else:
             no_failure_indices.append(idx)
 
@@ -1345,12 +1366,17 @@ def _limit_failure_frontiers_in_train_dataset(
     filtered_train_samples = [
         sample for idx, sample in enumerate(train_samples) if idx in kept_indices
     ]
+    selected_failure_and_solution_indices = (
+        selected_failure_indices & set(with_failure_and_solution_indices)
+    )
 
     return filtered_train_samples, {
         "n_total": len(train_samples),
         "n_no_failure": len(no_failure_indices),
         "n_with_failure_total": len(with_failure_indices),
+        "n_with_failure_and_solution_total": len(with_failure_and_solution_indices),
         "n_with_failure_kept": len(selected_failure_indices),
+        "n_with_failure_and_solution_kept": len(selected_failure_and_solution_indices),
         "n_total_kept": len(filtered_train_samples),
     }
 
@@ -1379,23 +1405,30 @@ def _build_train_state_stats(
 ) -> Tuple[Dict[str, int], Dict[str, Dict[str, int]]]:
     overall_failure_states = 0
     overall_all_states = 0
+    overall_failure_and_solution_frontiers = 0
     per_dataset: Dict[str, Dict[str, int]] = {}
 
     for sample in train_samples:
         dataset_id = str(sample.get("dataset_id", ""))
         failure_states, all_states = _count_sample_states(sample)
+        failure_and_solution_frontier = _sample_has_failure_and_solution_state(sample)
         overall_failure_states += int(failure_states)
         overall_all_states += int(all_states)
+        if failure_and_solution_frontier:
+            overall_failure_and_solution_frontiers += 1
 
         stats = per_dataset.setdefault(
             dataset_id,
             {
                 "train_frontiers_after_filter": 0,
+                "train_with_failure_and_solution_frontiers_after_filter": 0,
                 "train_n_failure_states": 0,
                 "train_n_all_states": 0,
             },
         )
         stats["train_frontiers_after_filter"] += 1
+        if failure_and_solution_frontier:
+            stats["train_with_failure_and_solution_frontiers_after_filter"] += 1
         stats["train_n_failure_states"] += int(failure_states)
         stats["train_n_all_states"] += int(all_states)
 
@@ -1403,6 +1436,9 @@ def _build_train_state_stats(
         {
             "train_n_failure_states": int(overall_failure_states),
             "train_n_all_states": int(overall_all_states),
+            "train_with_failure_and_solution_frontiers_after_filter": int(
+                overall_failure_and_solution_frontiers
+            ),
         },
         per_dataset,
     )
@@ -1449,7 +1485,10 @@ def main(args):
         "[dataset-filter] train frontiers | no_failure="
         f"{train_filter_stats['n_no_failure']} | with_failure_total="
         f"{train_filter_stats['n_with_failure_total']} | with_failure_kept="
-        f"{train_filter_stats['n_with_failure_kept']} | total_kept="
+        f"{train_filter_stats['n_with_failure_kept']} | with_failure_and_solution_total="
+        f"{train_filter_stats['n_with_failure_and_solution_total']} | "
+        "with_failure_and_solution_kept="
+        f"{train_filter_stats['n_with_failure_and_solution_kept']} | total_kept="
         f"{train_filter_stats['n_total_kept']}"
     )
     train_state_stats_overall, train_state_stats_by_dataset = _build_train_state_stats(
@@ -1553,12 +1592,6 @@ def main(args):
         model_root / f"{args.model_name}_eval_stress.json": (
             metrics_eval_reports_dir / f"{args.model_name}_eval_stress.json"
         ),
-        model_root / f"{args.model_name}_eval.json": (
-            metrics_eval_reports_dir / f"{args.model_name}_eval.json"
-        ),
-        model_root / f"{args.model_name}_eval2.json": (
-            metrics_eval_reports_dir / f"{args.model_name}_eval2.json"
-        ),
         model_root / f"{args.model_name}_onnx_first_example_check.json": (
             metrics_onnx_reports_dir / f"{args.model_name}_onnx_first_example_check.json"
         ),
@@ -1635,15 +1668,6 @@ def main(args):
             "w", encoding="utf-8"
         ) as fh:
             json.dump({"fifo": eval2_metrics, "lifo": eval3_metrics}, fh, indent=2)
-        # Backward-compatible names.
-        with (metrics_eval_reports_dir / f"{args.model_name}_eval.json").open(
-            "w", encoding="utf-8"
-        ) as fh:
-            json.dump(eval_metrics, fh, indent=2)
-        with (metrics_eval_reports_dir / f"{args.model_name}_eval2.json").open(
-            "w", encoding="utf-8"
-        ) as fh:
-            json.dump(eval2_metrics, fh, indent=2)
 
         eval_metrics_dir = model_root / "metrics" / "eval_random"
         eval2_metrics_dir = model_root / "metrics" / "eval_stress_fifo"
@@ -1686,6 +1710,15 @@ def main(args):
     split_summary["train_with_failure_frontiers_kept"] = int(
         train_filter_stats["n_with_failure_kept"]
     )
+    split_summary["train_with_failure_and_solution_frontiers_total"] = int(
+        train_filter_stats["n_with_failure_and_solution_total"]
+    )
+    split_summary["train_with_failure_and_solution_frontiers_kept"] = int(
+        train_filter_stats["n_with_failure_and_solution_kept"]
+    )
+    split_summary["train_with_failure_and_solution_frontiers_after_filter"] = int(
+        train_state_stats_overall["train_with_failure_and_solution_frontiers_after_filter"]
+    )
     split_summary["train_n_failure_states"] = int(
         train_state_stats_overall["train_n_failure_states"]
     )
@@ -1714,6 +1747,7 @@ def main(args):
                 dataset_id,
                 {
                     "train_frontiers_after_filter": 0,
+                    "train_with_failure_and_solution_frontiers_after_filter": 0,
                     "train_n_failure_states": 0,
                     "train_n_all_states": 0,
                 },
@@ -1733,6 +1767,9 @@ def main(args):
                 {
                     "dataset_id": dataset_id,
                     "train_frontiers_after_filter": int(stats["train_frontiers_after_filter"]),
+                    "train_with_failure_and_solution_frontiers_after_filter": int(
+                        stats["train_with_failure_and_solution_frontiers_after_filter"]
+                    ),
                     "train_n_failure_states": int(stats["train_n_failure_states"]),
                     "train_n_all_states": int(stats["train_n_all_states"]),
                     "train_failure_states_over_all_states": (
@@ -1746,6 +1783,9 @@ def main(args):
             {
                 "dataset_id": dataset_id,
                 "train_frontiers_after_filter": int(stats["train_frontiers_after_filter"]),
+                "train_with_failure_and_solution_frontiers_after_filter": int(
+                    stats["train_with_failure_and_solution_frontiers_after_filter"]
+                ),
                 "train_n_failure_states": int(stats["train_n_failure_states"]),
                 "train_n_all_states": int(stats["train_n_all_states"]),
                 "train_failure_states_over_all_states": (
