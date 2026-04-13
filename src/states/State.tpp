@@ -61,6 +61,11 @@ const StateRepr &State<StateRepr>::get_representation() const {
   return m_representation;
 }
 
+template<StateRepresentation StateRepr>
+const GraphTensor & State<StateRepr>::get_tensor_representation() const {
+  return m_representation.get_tensor_representation();
+}
+
 template <StateRepresentation StateRepr>
 State<StateRepr> &State<StateRepr>::operator=(const State &to_assign) {
   set_representation(to_assign.get_representation());

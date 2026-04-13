@@ -19,6 +19,7 @@
 #include <concepts>
 
 #include "actions/Action.h"
+#include "neuralnets/GraphNN.h"
 #include "utilities/Define.h"
 
 /**
@@ -57,6 +58,12 @@ concept StateRepresentation =
        * @brief Reduces the state using bisimulation contraction.
        */
       { rep.contract_with_bisimulation() };
+
+
+       /**
+       * @brief Compute the tensor for the m_representation.
+       */
+       { rep.get_tensor_representation() } -> std::same_as<GraphTensor>;
 
       /**
        * @brief Successor computation method.
@@ -138,6 +145,11 @@ public:
    *
    * @return the m_representation of *this*.*/
   [[nodiscard]] const StateRepr &get_representation() const;
+
+ /** \brief Getter of \ref m_tensor_representation.
+ *
+ * @return the m_tensor_representation of *this*.*/
+ [[nodiscard]] const GraphTensor &get_tensor_representation() const;
 
   /** \brief Function that add and \ref ActionId to \ref m_executed_actions_id.
    *
@@ -299,7 +311,7 @@ private:
    * One of the Possible representation for a State */
   StateRepr m_representation;
 
-  /** \brief The list of executed Action to get from the initial state to
+ /** \brief The list of executed Action to get from the initial state to
    * *this*.
    *
    * Is a std::vector because we can repeat the same action.

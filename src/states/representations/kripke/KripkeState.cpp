@@ -693,6 +693,18 @@ void KripkeState::contract_with_bisimulation() {
   b.calc_min_bisimilar(*this);
 }
 
+
+GraphTensor KripkeState::get_tensor_representation() {
+  if (m_computed_tensor_representation)
+    return m_tensor_representation;
+  else {
+
+
+    m_computed_tensor_representation = true;
+  }
+}
+
+
 // --- Constructors ---
 
 KripkeState::KripkeState(const KripkeState &other)
