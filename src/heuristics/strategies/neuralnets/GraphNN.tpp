@@ -160,7 +160,8 @@ void GraphNN<StateRepr>::initialize_onnx_model() {
 template <StateRepresentation StateRepr>
 int GraphNN<StateRepr>::get_score(State<StateRepr> &state) {
   const auto state_tensor = state.get_tensor_representation();
-  //const auto state_tensor = state_to_tensor_minimal(state.get_representation());
+  // const auto state_tensor =
+  // state_to_tensor_minimal(state.get_representation());
 
 #ifdef DEBUG
   if (ArgumentParser::get_instance().get_verbose()) {

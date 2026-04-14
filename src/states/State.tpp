@@ -61,8 +61,8 @@ const StateRepr &State<StateRepr>::get_representation() const {
   return m_representation;
 }
 
-template<StateRepresentation StateRepr>
-const GraphTensor & State<StateRepr>::get_tensor_representation() {
+template <StateRepresentation StateRepr>
+const GraphTensor &State<StateRepr>::get_tensor_representation() {
   return m_representation.get_tensor_representation();
 }
 

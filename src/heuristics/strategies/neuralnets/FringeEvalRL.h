@@ -79,7 +79,8 @@ public:
    * \param states The set of states to evaluate.
    * \return The relative score for the states in the fringe.
    */
-  [[nodiscard]] std::vector<float> get_score(const std::vector<State<StateRepr>> &states);
+  [[nodiscard]] std::vector<float>
+  get_score(const std::vector<State<StateRepr>> &states);
 
   /** \brief Deleted copy constructor (singleton pattern). */
   FringeEvalRL(const FringeEvalRL &) = delete;
@@ -105,10 +106,10 @@ private:
       Configuration::get_instance()
           .get_GNN_model_path(); ///< Path to the RL model
 
-
   ///// --- ONNX Runtime inference components ---
-  Ort::Env m_env{ORT_LOGGING_LEVEL_ERROR,
-                 "FringeEvalRLEnv"}; ///< ONNX Runtime environment for Fringe inference.
+  Ort::Env m_env{
+      ORT_LOGGING_LEVEL_ERROR,
+      "FringeEvalRLEnv"}; ///< ONNX Runtime environment for Fringe inference.
   Ort::SessionOptions m_session_options; ///< ONNX Runtime session options.
   std::unique_ptr<Ort::Session>
       m_session; ///< Pointer to the ONNX Runtime session.
@@ -125,9 +126,9 @@ private:
   bool m_model_loaded =
       false; ///< Indicates whether the ONNX model has been loaded.
 
-
   /**
-   * \brief Converts a set of KripkeState (Fringe) to a minimal GraphTensor representation.
+   * \brief Converts a set of KripkeState (Fringe) to a minimal GraphTensor
+   * representation.
    *
    * This function transforms the given Fringe into a FringeTensor,
    * extracting only the essential information required for GNN input.
@@ -136,8 +137,8 @@ private:
    * \return A FringeTensor containing the minimal tensor representation of the
    * graph.
    */
-  [[nodiscard]] FringeTensor fringe_to_tensor_minimal(const std::vector<State<StateRepr>> &states);
-
+  [[nodiscard]] FringeTensor
+  fringe_to_tensor_minimal(const std::vector<State<StateRepr>> &states);
 
   /**
    * \brief Initializes the ONNX Runtime model for GNN inference.
@@ -160,7 +161,6 @@ private:
    * \return The output score from the GNN model as a float.
    */
   float run_inference(const GraphTensor &tensor) const;
-
 };
 
 #include "FringeEvalRL.tpp"

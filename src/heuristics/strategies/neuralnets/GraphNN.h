@@ -1,8 +1,8 @@
 #pragma once
 #include "KripkeState.h"
 #include "State.h"
+#include "argparse/Configuration.h"
 #include "neuralnets/GraphTensor.h"
-#include  "argparse/Configuration.h"
 #include <onnxruntime_cxx_api.h>
 #include <string>
 #include <unordered_map>
@@ -33,17 +33,17 @@ public:
 
   static void create_instance();
 
-    /**
- * \brief Converts a KripkeState to a minimal GraphTensor representation.
- *
- * This function transforms the given KripkeState into a GraphTensor,
- * extracting only the essential information required for GNN input.
- *
- * \param kstate The KripkeState to convert.
- * \return A GraphTensor containing the minimal tensor representation of the
- * graph.
- */
-    [[nodiscard]] GraphTensor state_to_tensor_minimal(const KripkeState &kstate);
+  /**
+   * \brief Converts a KripkeState to a minimal GraphTensor representation.
+   *
+   * This function transforms the given KripkeState into a GraphTensor,
+   * extracting only the essential information required for GNN input.
+   *
+   * \param kstate The KripkeState to convert.
+   * \return A GraphTensor containing the minimal tensor representation of the
+   * graph.
+   */
+  [[nodiscard]] GraphTensor state_to_tensor_minimal(const KripkeState &kstate);
 
   /**
    * \brief Get the score for a given state using the neural network heuristic
@@ -159,7 +159,6 @@ private:
 
   float m_normalization_intercept =
       0.0f; ///< Normalization intercept for the GNN model output.
-
 
   /**
    * \brief Checks the consistency between a GraphTensor and the original state

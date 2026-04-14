@@ -20,26 +20,26 @@
  * exported to ONNX format.
  */
 struct GraphTensor {
-    std::vector<int64_t> edge_src;
-    ///< [1, num_edges] -- First dimension.
-    ///< Symbolic source node ID for each edge.
-    std::vector<int64_t>
-        edge_dst; ///< [1, num_edges] -- Second dimension. Symbolic destination
-    ///< node ID for each edge.
+  std::vector<int64_t> edge_src;
+  ///< [1, num_edges] -- First dimension.
+  ///< Symbolic source node ID for each edge.
+  std::vector<int64_t>
+      edge_dst; ///< [1, num_edges] -- Second dimension. Symbolic destination
+  ///< node ID for each edge.
 
-    /// edge_src and edge_dest are used to create edge_index -> list <edge_source,
-    /// edge_target> -> [2, num_edges]
+  /// edge_src and edge_dest are used to create edge_index -> list <edge_source,
+  /// edge_target> -> [2, num_edges]
 
-    std::vector<int64_t>
-        edge_attrs; ///< [1, num_edges] Edge attributes or labels,
+  std::vector<int64_t>
+      edge_attrs; ///< [1, num_edges] Edge attributes or labels,
 
-    ///< aligned with edge_ids.
-    std::vector<uint64_t> real_node_ids;
-    ///< [num_nodes, 1] Mapping from symbolic
-    ///< node IDs to real/hashed node IDs.
-    ///< aligned with edge_ids.
+  ///< aligned with edge_ids.
+  std::vector<uint64_t> real_node_ids;
+  ///< [num_nodes, 1] Mapping from symbolic
+  ///< node IDs to real/hashed node IDs.
+  ///< aligned with edge_ids.
 
-    std::vector<uint8_t> real_node_ids_bitmask;
-    ///< Special Case: BITMASK nodes have BITMASKS as real IDs (lists of 0-1)
-    ///< flattened in a single vector (use uint for easier conversion)
+  std::vector<uint8_t> real_node_ids_bitmask;
+  ///< Special Case: BITMASK nodes have BITMASKS as real IDs (lists of 0-1)
+  ///< flattened in a single vector (use uint for easier conversion)
 };
