@@ -14,8 +14,8 @@
 #include "KripkeWorld.h"
 #include "actions/Action.h"
 #include "bisimulation/Bisimulation.h"
-#include "heuristics/strategies/neuralnets/GraphNN.h"
 #include "utilities/Define.h"
+#include "neuralnets/GraphTensor.h"
 
 class KripkeState {
 public:
@@ -160,10 +160,9 @@ public:
   /** \brief Function that applies bisimulation contraction to this*/
   void contract_with_bisimulation();
 
-    /** \brief Function that return the Tensor representation of this
-     * @return The tensor representation of this as GraphTensor
-     */
-  [[nodiscard]] GraphTensor get_tensor_representation();
+
+
+  [[nodiscard]] const GraphTensor & get_tensor_representation();
 
   /**
    * @brief Compacts the repetition indices of all worlds in ascending numeric
@@ -208,10 +207,11 @@ private:
   KripkeWorldPointer m_pointed;
   /** \brief Beliefs of each agent in every world. */
   KripkeWorldPointersTransitiveMap m_beliefs;
+
     /** \brief Tensor version of this for the various NN-based heuristics */
     GraphTensor m_tensor_representation;
-    /** Guard to indicate wheter the GraphTensor needs to be computed*/
-    bool m_computed_tensor_representation;
+    /** Guard to indicate whether the GraphTensor needs to be computed*/
+    bool m_computed_tensor_representation = false;
 
   // --- Internal helpers ---
   /** \brief Add a world to the Kripke structure.

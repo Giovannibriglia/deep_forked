@@ -1,51 +1,11 @@
 #pragma once
 #include "KripkeState.h"
 #include "State.h"
-#include "neuralnets/GraphNN.h"
+#include "neuralnets/GraphTensor.h"
+#include  "argparse/Configuration.h"
 #include <onnxruntime_cxx_api.h>
 #include <string>
 #include <unordered_map>
-
-/**
- * \struct GraphTensor
- * \brief Represents a graph in tensor format for input to a Graph Neural
- * Network (GNN) using ONNX.
- *
- * This structure encapsulates the graph as a set of arrays:
- * - edge_src: 1D array of symbolic source node IDs for each edge.
- * - edge_dst: 1D array of symbolic destination node IDs for each edge.
- * - edge_attrs: 1D array of edge attributes or labels, aligned with edges.
- * - real_node_ids: 1D array mapping symbolic node IDs to their corresponding
- * - real_node_ids_bitmask: flatten multiDim array mapping symbolic node IDs to
- * their corresponding BITMASK IDs.
- *
- * All arrays are designed for compatibility with ONNX Runtime and GNN models
- * exported to ONNX format.
- */
-struct GraphTensor {
-  std::vector<int64_t> edge_src;
-  ///< [1, num_edges] -- First dimension.
-  ///< Symbolic source node ID for each edge.
-  std::vector<int64_t>
-      edge_dst; ///< [1, num_edges] -- Second dimension. Symbolic destination
-                ///< node ID for each edge.
-
-  /// edge_src and edge_dest are used to create edge_index -> list <edge_source,
-  /// edge_target> -> [2, num_edges]
-
-  std::vector<int64_t>
-      edge_attrs; ///< [1, num_edges] Edge attributes or labels,
-
-  ///< aligned with edge_ids.
-  std::vector<uint64_t> real_node_ids;
-  ///< [num_nodes, 1] Mapping from symbolic
-  ///< node IDs to real/hashed node IDs.
-  ///< aligned with edge_ids.
-
-  std::vector<uint8_t> real_node_ids_bitmask;
-  ///< Special Case: BITMASK nodes have BITMASKS as real IDs (lists of 0-1)
-  ///< flattened in a single vector (use uint for easier conversion)
-};
 
 /**
  * \class GraphNN
@@ -73,13 +33,25 @@ public:
 
   static void create_instance();
 
+    /**
+ * \brief Converts a KripkeState to a minimal GraphTensor representation.
+ *
+ * This function transforms the given KripkeState into a GraphTensor,
+ * extracting only the essential information required for GNN input.
+ *
+ * \param kstate The KripkeState to convert.
+ * \return A GraphTensor containing the minimal tensor representation of the
+ * graph.
+ */
+    [[nodiscard]] GraphTensor state_to_tensor_minimal(const KripkeState &kstate);
+
   /**
    * \brief Get the score for a given state using the neural network heuristic
    * using native C++ code \tparam StateRepr The state representation type.
    * \param state The state to evaluate.
    * \return The heuristic score for the state.
    */
-  [[nodiscard]] int get_score(const State<StateRepr> &state);
+  [[nodiscard]] int get_score(State<StateRepr> &state);
 
   /*
    * \brief Get the score for a given state using the neural network heuristic
@@ -188,17 +160,6 @@ private:
   float m_normalization_intercept =
       0.0f; ///< Normalization intercept for the GNN model output.
 
-  /**
-   * \brief Converts a KripkeState to a minimal GraphTensor representation.
-   *
-   * This function transforms the given KripkeState into a GraphTensor,
-   * extracting only the essential information required for GNN input.
-   *
-   * \param kstate The KripkeState to convert.
-   * \return A GraphTensor containing the minimal tensor representation of the
-   * graph.
-   */
-  [[nodiscard]] GraphTensor state_to_tensor_minimal(const KripkeState &kstate);
 
   /**
    * \brief Checks the consistency between a GraphTensor and the original state
