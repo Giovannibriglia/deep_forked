@@ -45,6 +45,13 @@ public:
    */
   [[nodiscard]] GraphTensor state_to_tensor_minimal(const KripkeState &kstate);
 
+
+    /**
+     * \brief Getter for the filed m_goal_graph_tensor
+     */
+    [[nodiscard]] GraphTensor get_goal_tensor() const;
+
+
   /**
    * \brief Get the score for a given state using the neural network heuristic
    * using native C++ code \tparam StateRepr The state representation type.

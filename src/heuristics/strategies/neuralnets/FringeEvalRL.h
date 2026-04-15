@@ -22,6 +22,10 @@
  * their corresponding BITMASK IDs.
  *
  */
+
+static constexpr size_t MAX_ELEMENTS_IN_RL_FRINGE =
+    32; /// \brief maximum number of states in the fringe
+
 struct FringeTensor {
   std::vector<int64_t> edge_src;
   ///< [1, num_edges] -- First dimension.
@@ -41,6 +45,17 @@ struct FringeTensor {
   ///< [num_nodes, 1] Mapping from symbolic
   ///< node IDs to real/hashed node IDs.
   ///< aligned with edge_ids.
+
+
+    std::vector<uint64_t> membership;
+    ///< [num_states, 1] mapping each state to the corresponding start of the array in real_nodes_ids.
+
+
+    std::vector<uint8_t> active_states = std::vector<uint8_t>(MAX_ELEMENTS_IN_RL_FRINGE, 0);
+    ///< [32, 1] boolean masks that it is set to 1 for each active state.
+
+    std::vector<int64_t> candidate_batch;
+    ///< A zero for each node (kworlds and goal nodes) for internal operation.
 
   std::vector<uint8_t> real_node_ids_bitmask;
   ///< Special Case: BITMASK nodes have BITMASKS as real IDs (lists of 0-1)

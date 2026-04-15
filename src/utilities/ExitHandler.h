@@ -174,6 +174,8 @@ public:
              ///< MAX_REPETITION_BITS bits.
     FringeEvalBitmaskGOALError =
         907, ///< Error indicating that the GOAL encoding is not working.
+      FringeNotImplementedError =
+    919, ///< Error indicating that functionality has not been implemented yet.
 
     // --- State/Action Related (1000-1019) ---
     StateActionNotExecutableError =

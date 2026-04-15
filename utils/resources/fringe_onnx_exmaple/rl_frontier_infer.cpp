@@ -33,7 +33,7 @@ struct CandidateGraphTensor {
 
 struct CombinedFrontierGraphTensor {
   int64_t feat_dim = 1;
-  std::vector<float> node_features;      // [N, F]
+  std::vector<int64_t> node_features;      // [N, F]
   std::vector<int64_t> edge_src;         // [E]
   std::vector<int64_t> edge_dst;         // [E]
   std::vector<int64_t> edge_attr;        // [E]

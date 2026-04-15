@@ -157,6 +157,13 @@ void GraphNN<StateRepr>::initialize_onnx_model() {
   }
 }
 
+
+template <StateRepresentation StateRepr>
+GraphTensor GraphNN<StateRepr>::get_goal_tensor() const {
+  return m_goal_graph_tensor;
+}
+
+
 template <StateRepresentation StateRepr>
 int GraphNN<StateRepr>::get_score(State<StateRepr> &state) {
   const auto state_tensor = state.get_tensor_representation();
@@ -363,7 +370,6 @@ float GraphNN<StateRepr>::run_inference(const GraphTensor &tensor) const {
       memory_info, state_batch_data.data(), state_batch_data.size(),
       state_batch_shape.data(), state_batch_shape.size());
 
-  // Prepare input tensors
   // Prepare input tensors
   std::vector<Ort::Value> input_tensors;
   if (is_bitmask) {
