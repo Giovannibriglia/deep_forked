@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import os
 import random
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -88,6 +89,12 @@ def normalize_distance_to_reward(
     max_dist = max(1e-9, float(max_regular_distance))
     dist = max(0.0, float(distance))
     if dist > max_dist:
+        warnings.warn(
+            "normalize_distance_to_reward: received distance greater than "
+            "max_regular_distance; mapping to failure_reward_value.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return float(failure_reward_value)
     return 0.9 * dist / max_dist
 

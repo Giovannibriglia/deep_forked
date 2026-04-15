@@ -73,27 +73,11 @@ Mask is always built from the number of valid candidates in the current frontier
 
 ### `merged`
 
-Concept: candidates are merged into one global graph by shared node identity.
+Concept: candidates stay disconnected and are concatenated block-by-block
+(same composition style as `separated`).
 
-How tensors are built:
-
-1. Build a local-to-global node mapping $\phi_k$ for each candidate graph.
-2. Create global `node_features` from unique nodes encountered across all candidates.
-3. Remap each candidate edge with global indices and deduplicate edge triplets:
-
-   ```math
-   T = \operatorname{unique}\left\{(\phi_k(u), \phi_k(v), a) : (u,v,a) \in (E_k, A_k)\right\}
-   ```
-
-4. Split triplets into:
-   - `edge_index`: first two fields of each triplet in $T$
-   - `edge_attr`: third field of each triplet in $T$ (same row order)
-5. Build `membership` with one owner candidate per global node (first candidate that introduced that node).
-6. Build optional pooling helpers (used by the training pipeline when nodes are shared):
-   - `pool_node_index`: global node index repeated once per candidate occurrence
-   - `pool_membership`: matching candidate id for each repeated occurrence
-
-So `merged` keeps one shared node table, while still allowing per-candidate pooling.
+Difference from `separated`: no goal branch is passed to model forward in
+`merged`, because goal information is already encoded in successor states.
 
 ### `separated`
 
@@ -156,9 +140,9 @@ If multiple goals are batched together, `goal_batch` contains the goal graph id 
 
 | Feature                        | `merged`                | `separated`                |
 |--------------------------------|-------------------------|----------------------------|
-| Candidate graph topology       | merged into one graph   | disconnected concatenation |
-| Node sharing across candidates | yes                     | no                         |
-| Goal handling                  | inside successor graphs | separate goal input branch |
+| Candidate graph topology       | disconnected concatenation | disconnected concatenation |
+| Node sharing across candidates | no                         | no                         |
+| Goal handling                  | inside successor graphs    | separate goal input branch |
 | Additional ONNX goal inputs    | no                      | yes                        |
 
 ## Model input contract (PyTorch / ONNX)

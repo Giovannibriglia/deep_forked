@@ -18,7 +18,13 @@ VALID_DATASET_TYPES = {
     DATASET_TYPE_MAPPED,
     DATASET_TYPE_BITMASK,
 }
-TWO_48_MINUS_1 = float(2**48 - 1)
+TWO_64_MINUS_1 = float(2**64 - 1)
+U64_MAX = (1 << 64) - 1
+I64_MIN = -(1 << 63)
+I64_MAX = (1 << 63) - 1
+U64_CHUNK_BITS = 32
+U64_CHUNK_BASE = 1 << U64_CHUNK_BITS
+U64_CHUNK_MASK = U64_CHUNK_BASE - 1
 
 
 @dataclass
@@ -55,12 +61,33 @@ def _normalize_dataset_type(
     return DATASET_TYPE_HASHED
 
 
-def _parse_numeric_node_label(node_obj: object) -> float:
-    if isinstance(node_obj, (int, float)):
-        return float(node_obj)
+def _parse_numeric_node_label(node_obj: object) -> int:
+    if isinstance(node_obj, bool):
+        raise TypeError("Boolean node labels are not supported.")
+    if isinstance(node_obj, int):
+        return int(node_obj)
+    if isinstance(node_obj, float):
+        if not float(node_obj).is_integer():
+            raise ValueError(f"Node label '{node_obj}' is not an integer.")
+        return int(node_obj)
     if isinstance(node_obj, str):
-        return float(node_obj.strip())
+        s = node_obj.strip()
+        try:
+            return int(s)
+        except ValueError:
+            parsed = float(s)
+            if not parsed.is_integer():
+                raise ValueError(f"Node label '{node_obj}' is not an integer.")
+            return int(parsed)
     raise TypeError(f"Unsupported node label type: {type(node_obj)}")
+
+
+def _split_uint64(value: int, *, context: str) -> tuple[int, int]:
+    if value < 0 or value > U64_MAX:
+        raise ValueError(f"{context} is out of uint64 range [0, {U64_MAX}].")
+    hi = value >> U64_CHUNK_BITS
+    lo = value & U64_CHUNK_MASK
+    return int(hi), int(lo)
 
 
 def _nx_to_pyg(G: nx.DiGraph, dataset_type: str) -> Data:
@@ -111,16 +138,27 @@ def _nx_to_pyg(G: nx.DiGraph, dataset_type: str) -> Data:
         data.node_names = data.node_bits.to(torch.float32)
         data.node_features = data.node_bits.to(torch.float32)
     else:
-        raw_ids = [_parse_numeric_node_label(n) for n in G.nodes()]
-        data.node_names = torch.tensor(raw_ids, dtype=torch.float32)
         if dataset_type == DATASET_TYPE_HASHED:
-            # Keep raw IDs; HASHED normalization is handled in-model.
-            node_feats = data.node_names
+            rows: list[list[int]] = []
+            for node in G.nodes():
+                parsed = _parse_numeric_node_label(node)
+                hi, lo = _split_uint64(parsed, context=f"Node '{node}'")
+                rows.append([hi, lo])
+            node_chunks = torch.tensor(rows, dtype=torch.int64)
+            data.node_names = node_chunks.clone()
+            data.node_features = node_chunks
         elif dataset_type == DATASET_TYPE_MAPPED:
-            node_feats = data.node_names
+            raw_ids = [_parse_numeric_node_label(n) for n in G.nodes()]
+            for node, raw_id in zip(G.nodes(), raw_ids):
+                if raw_id < I64_MIN or raw_id > I64_MAX:
+                    raise ValueError(
+                        f"Node '{node}' is out of int64 range [{I64_MIN}, {I64_MAX}] "
+                        "for MAPPED dataset."
+                    )
+            data.node_names = torch.tensor(raw_ids, dtype=torch.int64)
+            data.node_features = data.node_names.view(-1, 1).to(torch.int64)
         else:
             raise ValueError(f"Unsupported dataset_type: {dataset_type}")
-        data.node_features = node_feats.view(-1, 1).to(torch.float32)
 
     return data
 
@@ -181,14 +219,18 @@ def _compose_disconnected(
     }
 
 
-def _node_keys(graph: Data) -> List[Tuple[float, ...]]:
+def _node_keys(graph: Data) -> List[Tuple[int | float, ...]]:
     names = getattr(graph, "node_names", None)
     if names is None:
         names = graph.node_features
     names = names.detach().cpu()
     if names.dim() == 1:
-        return [(float(v.item()),) for v in names]
-    return [tuple(float(x.item()) for x in row) for row in names]
+        if names.dtype.is_floating_point:
+            return [(float(v.item()),) for v in names]
+        return [(int(v.item()),) for v in names]
+    if names.dtype.is_floating_point:
+        return [tuple(float(x.item()) for x in row) for row in names]
+    return [tuple(int(x.item()) for x in row) for row in names]
 
 
 def _edge_attr_tuple(edge_attr: torch.Tensor, idx: int) -> Tuple[int, ...]:
@@ -200,7 +242,7 @@ def _compose_merged_shared_goal(graphs: List[Data]) -> Dict[str, torch.Tensor]:
     # Nodes are merged by stable identity (node_names when available). If two
     # graphs share central goal nodes, they map to the same merged node.
     node_features_rows: List[torch.Tensor] = []
-    key_to_index: Dict[Tuple[float, ...], int] = {}
+    key_to_index: Dict[Tuple[int | float, ...], int] = {}
     # Membership keeps one owner candidate per merged node to stay compatible
     # with the existing model input contract (single membership tensor).
     owner_membership: List[int] = []
@@ -289,17 +331,16 @@ def combine_graphs(
         raise ValueError(f"Unsupported kind_of_data: {kind_of_data}")
 
     if kind_of_data == "merged":
-        # Goal is embedded in successors; compose into one graph by shared node/edge
-        # identity. If no overlap exists, this naturally falls back to concatenation.
-        out = _compose_merged_shared_goal(frontier_graphs)
+        # Keep merged candidates disconnected like separated composition.
+        # Unlike separated mode, no goal branch is passed to the model because
+        # the goal is already encoded in successor states.
+        out = _compose_separated_disconnected(frontier_graphs)
         return CombinedFrontierGraph(
             node_features=out["node_features"],
             edge_index=out["edge_index"],
             edge_attr=out["edge_attr"],
             membership=out["membership"],
             action_map=action_tensor,
-            pool_node_index=out["pool_node_index"],
-            pool_membership=out["pool_membership"],
         )
 
     if goal_graph is None:

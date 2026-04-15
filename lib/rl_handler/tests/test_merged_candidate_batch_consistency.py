@@ -20,7 +20,6 @@ from src.models.frontier_policy import FrontierPolicyNetwork
 class TestMergedCandidateBatchConsistency(unittest.TestCase):
     @staticmethod
     def _build_identical_graph() -> Data:
-        # Two candidates with identical node identities force merged deduplication.
         return Data(
             node_features=torch.tensor([[1.0], [2.0]], dtype=torch.float32),
             node_names=torch.tensor([11.0, 22.0], dtype=torch.float32),
@@ -28,7 +27,7 @@ class TestMergedCandidateBatchConsistency(unittest.TestCase):
             edge_attr=torch.tensor([[1.0]], dtype=torch.float32),
         )
 
-    def _build_sample(self, include_pool: bool) -> dict:
+    def _build_sample(self) -> dict:
         g0 = self._build_identical_graph()
         g1 = self._build_identical_graph()
         combined = combine_graphs(
@@ -54,9 +53,6 @@ class TestMergedCandidateBatchConsistency(unittest.TestCase):
             "predecessor_path": "synthetic.dot",
             "frontier_has_failure": False,
         }
-        if include_pool:
-            sample["pool_node_index"] = combined.pool_node_index
-            sample["pool_membership"] = combined.pool_membership
         return sample
 
     @staticmethod
@@ -76,20 +72,27 @@ class TestMergedCandidateBatchConsistency(unittest.TestCase):
             edge_attr=batch["edge_attr"],
             membership=batch["membership"],
             candidate_batch=batch["candidate_batch"],
-            pool_node_index=batch.get("pool_node_index"),
-            pool_membership=batch.get("pool_membership"),
         )
 
-    def test_merged_with_pool_tensors_keeps_candidate_alignment(self) -> None:
-        sample = self._build_sample(include_pool=True)
-        batch = frontier_collate_fn([sample], pad_frontiers=True)
-        self.assertIn("pool_node_index", batch)
-        self.assertIn("pool_membership", batch)
-        logits = self._run_forward(batch)
-        self.assertEqual(int(logits.numel()), int(batch["candidate_batch"].numel()))
+    def test_merged_composition_keeps_candidates_disconnected(self) -> None:
+        sample = self._build_sample()
+        self.assertIsNone(sample.get("pool_node_index"))
+        self.assertIsNone(sample.get("pool_membership"))
+        self.assertTrue(
+            torch.equal(
+                sample["membership"],
+                torch.tensor([0, 0, 1, 1], dtype=torch.long),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                sample["edge_index"],
+                torch.tensor([[0, 2], [1, 3]], dtype=torch.long),
+            )
+        )
 
-    def test_legacy_merged_without_pool_tensors_does_not_mismatch(self) -> None:
-        sample = self._build_sample(include_pool=False)
+    def test_merged_batch_forward_does_not_require_pool_tensors(self) -> None:
+        sample = self._build_sample()
         batch = frontier_collate_fn([sample], pad_frontiers=True)
         self.assertNotIn("pool_node_index", batch)
         self.assertNotIn("pool_membership", batch)

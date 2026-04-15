@@ -34,6 +34,13 @@ from src.trainer import (
     RLFrontierTrainer,
 )
 
+U64_MAX = (1 << 64) - 1
+I64_MIN = -(1 << 63)
+I64_MAX = (1 << 63) - 1
+U64_CHUNK_BITS = 32
+U64_CHUNK_BASE = 1 << U64_CHUNK_BITS
+U64_CHUNK_MASK = U64_CHUNK_BASE - 1
+
 
 def str2bool(v):
     if isinstance(v, bool):
@@ -54,6 +61,12 @@ def ratio_0_1(v):
     if ratio < 0.0 or ratio > 1.0:
         raise argparse.ArgumentTypeError("Expected a value in [0.0, 1.0].")
     return ratio
+
+
+def _node_feature_dtypes_for_dataset(dataset_type: str) -> tuple[torch.dtype, str]:
+    if str(dataset_type).upper() == "BITMASK":
+        return torch.float32, "float32"
+    return torch.int64, "int64"
 
 
 def parse_args():
@@ -527,7 +540,10 @@ def _run_single_sample_pytorch_and_onnx(
                 "num_candidates_from_sample": int(n_candidates),
             }
 
-    node_features = sample["node_features"].to(torch.float32)
+    node_feature_dtype, node_feature_np_dtype = _node_feature_dtypes_for_dataset(
+        trainer.model.dataset_type
+    )
+    node_features = sample["node_features"].to(node_feature_dtype)
     edge_index = sample["edge_index"].to(torch.int64)
     edge_attr = sample["edge_attr"].to(torch.int64)
     membership = sample["membership"].to(torch.int64)
@@ -549,7 +565,7 @@ def _run_single_sample_pytorch_and_onnx(
         else:
             goal_batch = goal_batch.to(torch.int64)
         model_kwargs["goal_node_features"] = sample["goal_node_features"].to(
-            trainer.device, dtype=torch.float32
+            trainer.device, dtype=node_feature_dtype
         )
         model_kwargs["goal_edge_index"] = sample["goal_edge_index"].to(
             trainer.device, dtype=torch.int64
@@ -583,7 +599,7 @@ def _run_single_sample_pytorch_and_onnx(
         return out.numpy().astype("bool")
 
     base_onnx_inputs = {
-        "node_features": node_features.detach().cpu().numpy().astype("float32"),
+        "node_features": node_features.detach().cpu().numpy().astype(node_feature_np_dtype),
         "edge_index": edge_index.detach().cpu().numpy().astype("int64"),
         "edge_attr": edge_attr.detach().cpu().numpy().astype("int64"),
         "membership": membership.detach().cpu().numpy().astype("int64"),
@@ -598,7 +614,12 @@ def _run_single_sample_pytorch_and_onnx(
         else:
             goal_batch = goal_batch.to(torch.int64)
         base_onnx_inputs["goal_node_features"] = (
-            sample["goal_node_features"].detach().cpu().numpy().astype("float32")
+            sample["goal_node_features"]
+            .detach()
+            .cpu()
+            .to(node_feature_dtype)
+            .numpy()
+            .astype(node_feature_np_dtype)
         )
         base_onnx_inputs["goal_edge_index"] = (
             sample["goal_edge_index"].detach().cpu().numpy().astype("int64")
@@ -1072,7 +1093,10 @@ def _compare_first_example_pytorch_vs_onnx(
         )
         return
 
-    node_features = sample["node_features"].to(torch.float32)
+    node_feature_dtype, node_feature_np_dtype = _node_feature_dtypes_for_dataset(
+        trainer.model.dataset_type
+    )
+    node_features = sample["node_features"].to(node_feature_dtype)
     edge_index = sample["edge_index"].to(torch.int64)
     edge_attr = sample["edge_attr"].to(torch.int64)
     membership = sample["membership"].to(torch.int64)
@@ -1095,7 +1119,7 @@ def _compare_first_example_pytorch_vs_onnx(
         else:
             goal_batch = goal_batch.to(torch.int64)
         model_kwargs["goal_node_features"] = sample["goal_node_features"].to(
-            trainer.device, dtype=torch.float32
+            trainer.device, dtype=node_feature_dtype
         )
         model_kwargs["goal_edge_index"] = sample["goal_edge_index"].to(
             trainer.device, dtype=torch.int64
@@ -1107,8 +1131,8 @@ def _compare_first_example_pytorch_vs_onnx(
 
     with torch.no_grad():
         trainer.model.eval()
-        # In merged mode, ONNX wrapper semantics may produce a logits length that
-        # differs from reward tensor length. Derive mask shape from actual forward output.
+        # Derive mask shape from actual forward output to stay robust to
+        # runtime/export shape differences.
         pytorch_logits = trainer.model(**model_kwargs).detach().cpu().to(torch.float32).view(-1)
     mask = torch.ones((int(pytorch_logits.numel()),), dtype=torch.bool)
     model_kwargs["mask"] = mask.to(trainer.device)
@@ -1131,7 +1155,7 @@ def _compare_first_example_pytorch_vs_onnx(
         return out.numpy().astype("bool")
 
     base_onnx_inputs = {
-        "node_features": node_features.detach().cpu().numpy().astype("float32"),
+        "node_features": node_features.detach().cpu().numpy().astype(node_feature_np_dtype),
         "edge_index": edge_index.detach().cpu().numpy().astype("int64"),
         "edge_attr": edge_attr.detach().cpu().numpy().astype("int64"),
         "membership": membership.detach().cpu().numpy().astype("int64"),
@@ -1146,7 +1170,12 @@ def _compare_first_example_pytorch_vs_onnx(
         else:
             goal_batch = goal_batch.to(torch.int64)
         base_onnx_inputs["goal_node_features"] = (
-            sample["goal_node_features"].detach().cpu().numpy().astype("float32")
+            sample["goal_node_features"]
+            .detach()
+            .cpu()
+            .to(node_feature_dtype)
+            .numpy()
+            .astype(node_feature_np_dtype)
         )
         base_onnx_inputs["goal_edge_index"] = (
             sample["goal_edge_index"].detach().cpu().numpy().astype("int64")
@@ -1542,6 +1571,7 @@ def _run_onnx_single_frontier(
     np_mod: Any,
     static_onnx_len: Optional[int],
     use_goal_inputs: bool,
+    dataset_type: str,
 ) -> Dict[str, Any]:
     n_candidates = _infer_num_candidates(sample)
     if n_candidates <= 0:
@@ -1562,9 +1592,17 @@ def _run_onnx_single_frontier(
             "error": f"sample is missing required tensors {missing_base}.",
         }
 
+    node_feature_dtype, node_feature_np_dtype = _node_feature_dtypes_for_dataset(
+        dataset_type
+    )
     base_onnx_inputs = {
         "node_features": (
-            sample["node_features"].detach().cpu().to(torch.float32).numpy().astype("float32")
+            sample["node_features"]
+            .detach()
+            .cpu()
+            .to(node_feature_dtype)
+            .numpy()
+            .astype(node_feature_np_dtype)
         ),
         "edge_index": (
             sample["edge_index"].detach().cpu().to(torch.int64).numpy().astype("int64")
@@ -1596,9 +1634,9 @@ def _run_onnx_single_frontier(
             sample["goal_node_features"]
             .detach()
             .cpu()
-            .to(torch.float32)
+            .to(node_feature_dtype)
             .numpy()
-            .astype("float32")
+            .astype(node_feature_np_dtype)
         )
         base_onnx_inputs["goal_edge_index"] = (
             sample["goal_edge_index"].detach().cpu().to(torch.int64).numpy().astype("int64")
@@ -1699,6 +1737,7 @@ def _evaluate_onnx_dataset_samples(
             np_mod=np_mod,
             static_onnx_len=static_onnx_len,
             use_goal_inputs=use_goal_inputs,
+            dataset_type=trainer.model.dataset_type,
         )
         if result.get("status") != "ok":
             failed_frontiers.append(
@@ -1745,12 +1784,33 @@ def _strip_quotes(v: Any) -> str:
     return str(v).replace('"', "").strip()
 
 
-def _parse_numeric_node_label_eval(node_obj: object) -> float:
-    if isinstance(node_obj, (int, float)):
-        return float(node_obj)
+def _parse_numeric_node_label_eval(node_obj: object) -> int:
+    if isinstance(node_obj, bool):
+        raise TypeError("Boolean node labels are not supported.")
+    if isinstance(node_obj, int):
+        return int(node_obj)
+    if isinstance(node_obj, float):
+        if not float(node_obj).is_integer():
+            raise ValueError(f"Node label '{node_obj}' is not an integer.")
+        return int(node_obj)
     if isinstance(node_obj, str):
-        return float(node_obj.strip())
+        s = node_obj.strip()
+        try:
+            return int(s)
+        except ValueError:
+            parsed = float(s)
+            if not parsed.is_integer():
+                raise ValueError(f"Node label '{node_obj}' is not an integer.")
+            return int(parsed)
     raise TypeError(f"Unsupported node label type: {type(node_obj)}")
+
+
+def _split_uint64_eval(value: int, *, context: str) -> tuple[int, int]:
+    if value < 0 or value > U64_MAX:
+        raise ValueError(f"{context} is out of uint64 range [0, {U64_MAX}].")
+    hi = value >> U64_CHUNK_BITS
+    lo = value & U64_CHUNK_MASK
+    return int(hi), int(lo)
 
 
 def _load_graph_tensors_no_pyg(path: str, dataset_type: str) -> _EvalGraphTensors:
@@ -1804,10 +1864,24 @@ def _load_graph_tensors_no_pyg(path: str, dataset_type: str) -> _EvalGraphTensor
         node_bits = torch.tensor(rows, dtype=torch.bool)
         node_features = node_bits.to(torch.float32)
         node_names = node_features.clone()
+    elif dataset_type_norm == "HASHED":
+        rows: list[list[int]] = []
+        for node in nodes:
+            parsed = _parse_numeric_node_label_eval(node)
+            hi, lo = _split_uint64_eval(parsed, context=f"Node '{node}'")
+            rows.append([hi, lo])
+        node_features = torch.tensor(rows, dtype=torch.int64)
+        node_names = node_features.clone()
     else:
         raw_ids = [_parse_numeric_node_label_eval(node) for node in nodes]
-        node_names = torch.tensor(raw_ids, dtype=torch.float32)
-        node_features = node_names.view(-1, 1).to(torch.float32)
+        for node, raw_id in zip(nodes, raw_ids):
+            if raw_id < I64_MIN or raw_id > I64_MAX:
+                raise ValueError(
+                    f"Node '{node}' is out of int64 range [{I64_MIN}, {I64_MAX}] "
+                    "for MAPPED dataset."
+                )
+        node_names = torch.tensor(raw_ids, dtype=torch.int64)
+        node_features = node_names.view(-1, 1).to(torch.int64)
 
     edge_rows: list[list[int]] = []
     edge_attrs: list[list[int]] = []
@@ -2238,6 +2312,25 @@ def main(args):
     if args.evaluate and not args.build_eval_data:
         print("[info] --build-eval-data is false: skipping eval data rebuild, using saved eval files only.")
 
+    dataset_type_norm = str(args.dataset_type).upper()
+    if dataset_type_norm != "BITMASK":
+        first_node_features = train_samples[0].get("node_features")
+        if isinstance(first_node_features, torch.Tensor) and first_node_features.dtype.is_floating_point:
+            print(
+                "[warning] Loaded cached samples use floating node_features for HASHED/MAPPED. "
+                "Regenerate data with --build-data true to avoid precision loss in node IDs."
+            )
+        if (
+            dataset_type_norm == "HASHED"
+            and isinstance(first_node_features, torch.Tensor)
+            and first_node_features.dim() == 2
+            and int(first_node_features.size(1)) != 2
+        ):
+            print(
+                "[warning] HASHED samples should use hi32/lo32 encoding with width 2. "
+                "Regenerate data with --build-data true for full uint64 support."
+            )
+
     train_loader, eval_loader, eval2_loader = get_dataloaders(
         train_samples=train_samples,
         eval_samples=eval_samples,
@@ -2256,7 +2349,7 @@ def main(args):
         shuffle=False,
     )
 
-    node_input_dim = int(train_samples[0]["node_features"].size(1))
+    node_input_dim = 1 if dataset_type_norm == "HASHED" else int(train_samples[0]["node_features"].size(1))
     use_goal_separate_input = (
         args.kind_of_data == "separated"
         if args.use_goal_separate_input is None

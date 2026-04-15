@@ -22,7 +22,10 @@ VALID_DATASET_TYPES = {
     DATASET_TYPE_MAPPED,
     DATASET_TYPE_BITMASK,
 }
-TWO_48_MINUS_1 = float(2**48 - 1)
+TWO_64_MINUS_1 = float(2**64 - 1)
+U64_CHUNK_BITS = 32
+U64_CHUNK_BASE = 1 << U64_CHUNK_BITS
+U64_CHUNK_MASK = U64_CHUNK_BASE - 1
 
 
 def _build_mlp(in_dim: int, hidden_dim: int, depth: int, out_dim: int) -> nn.Sequential:
@@ -103,14 +106,27 @@ class GNNEncoder(nn.Module):
             x = x.view(-1, 1)
 
         if self.dataset_type == DATASET_TYPE_HASHED:
-            if (not is_tracing) and x.size(-1) != 1:
+            if x.size(-1) == 2:
+                # Unsigned-safe encoding: node id = hi32 * 2^32 + lo32.
+                hi = x[:, 0].to(torch.float64)
+                lo = x[:, 1].to(torch.float64)
+                if not is_tracing:
+                    if bool((hi < 0).any().item()) or bool((lo < 0).any().item()):
+                        raise ValueError("HASHED hi32/lo32 chunks must be non-negative.")
+                    if bool((hi > float(U64_CHUNK_MASK)).any().item()) or bool(
+                        (lo > float(U64_CHUNK_MASK)).any().item()
+                    ):
+                        raise ValueError("HASHED hi32/lo32 chunk out of uint32 range.")
+                unsigned_vals = hi * float(U64_CHUNK_BASE) + lo
+                x = (unsigned_vals / TWO_64_MINUS_1).to(torch.float32).view(-1, 1)
+            elif x.size(-1) == 1:
+                # Legacy scalar path (kept for backward compatibility).
+                needs_scaling = torch.logical_or(torch.amin(x) < 0.0, torch.amax(x) > 1.0)
+                x = torch.where(needs_scaling, x / TWO_64_MINUS_1, x).clamp(0.0, 1.0)
+            else:
                 raise ValueError(
-                    f"HASHED dataset expects scalar node IDs. Got shape {tuple(x.shape)}."
+                    f"HASHED dataset expects node feature width 1 or 2, got {x.size(-1)}."
                 )
-            # Keep normalization ONNX-trace-safe by using tensor conditionals
-            # instead of Python scalar extraction.
-            needs_scaling = torch.logical_or(torch.amin(x) < 0.0, torch.amax(x) > 1.0)
-            x = torch.where(needs_scaling, x / TWO_48_MINUS_1, x).clamp(0.0, 1.0)
         elif self.dataset_type in {DATASET_TYPE_MAPPED, DATASET_TYPE_BITMASK}:
             pass
         else:
@@ -168,7 +184,28 @@ class GNNEncoder(nn.Module):
         if (not is_tracing) and x.size(0) == 0:
             return torch.zeros((0,), dtype=torch.long, device=device)
 
-        if self.dataset_type in {DATASET_TYPE_HASHED, DATASET_TYPE_MAPPED}:
+        if self.dataset_type == DATASET_TYPE_HASHED:
+            if x.size(-1) == 2:
+                hi = x[:, 0].to(device=device, dtype=torch.long)
+                lo = x[:, 1].to(device=device, dtype=torch.long)
+                if (not is_tracing) and (
+                    bool((hi < 0).any().item()) or bool((lo < 0).any().item())
+                ):
+                    raise ValueError("HASHED hi32/lo32 chunks must be non-negative.")
+                mod = int(self.num_node_labels)
+                base_mod = int(U64_CHUNK_BASE % mod)
+                hi_mod = torch.remainder(hi, mod)
+                lo_mod = torch.remainder(lo, mod)
+                label_ids = torch.remainder(hi_mod * base_mod + lo_mod, mod)
+                return label_ids.view(-1)
+            if (not is_tracing) and x.size(-1) != 1:
+                raise ValueError(
+                    f"HASHED dataset expects scalar IDs or hi32/lo32 chunks, got shape {tuple(x.shape)}."
+                )
+            raw = x[:, 0].to(device=device, dtype=torch.long)
+            return torch.remainder(raw, self.num_node_labels).view(-1)
+
+        if self.dataset_type == DATASET_TYPE_MAPPED:
             if (not is_tracing) and x.size(-1) != 1:
                 raise ValueError(
                     f"{self.dataset_type} dataset expects scalar node IDs for label embedding, got shape {tuple(x.shape)}."
@@ -201,7 +238,7 @@ class GNNEncoder(nn.Module):
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
     ) -> torch.Tensor:
-        raw_nodes = node_features.to(torch.float32)
+        raw_nodes = node_features
         if raw_nodes.dim() == 1:
             raw_nodes = raw_nodes.view(-1, 1)
         x = self._prepare_node_features(raw_nodes)
