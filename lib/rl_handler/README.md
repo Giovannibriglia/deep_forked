@@ -11,13 +11,13 @@ CSV + DOT -> Frontier Samples -> GNN Policy -> Candidate Logits -> argmax Action
 
 The training objective is to maximize expected reward over each frontier:
 
-$$
+```math
 p_i = \operatorname{softmax}(s_i)
-$$
+```
 
-$$
+```math
 \mathcal{L} = - \mathbb{E}_{\text{frontier}} \left[\sum_i p_i \, r_i\right]
-$$ 
+```
 
 ## What this module provides
 
@@ -63,13 +63,13 @@ Let a frontier have $K$ candidates. For candidate $k \in \{0, \ldots, K-1\}$, de
 
 Mask is always built from the number of valid candidates in the current frontier:
 
-$$
+```math
 \text{mask}[k] =
 \begin{cases}
 \text{True}, & k < n_{\text{candidates}} \\
 \text{False}, & k \ge n_{\text{candidates}}
 \end{cases}
-$$
+```
 
 ### `merged`
 
@@ -81,9 +81,9 @@ How tensors are built:
 2. Create global `node_features` from unique nodes encountered across all candidates.
 3. Remap each candidate edge with global indices and deduplicate edge triplets:
 
-$$
-T = \operatorname{unique}\left\{(\phi_k(u), \phi_k(v), a) : (u,v,a) \in (E_k, A_k)\right\}
-$$
+   ```math
+   T = \operatorname{unique}\left\{(\phi_k(u), \phi_k(v), a) : (u,v,a) \in (E_k, A_k)\right\}
+   ```
 
 4. Split triplets into:
    - `edge_index`: first two fields of each triplet in $T$
@@ -103,46 +103,46 @@ How tensors are built:
 
 1. Concatenate node features:
 
-$$
-\text{node\_features} =
-\begin{bmatrix}
-X_0 \\
-X_1 \\
-\vdots \\
-X_{K-1}
-\end{bmatrix}
-$$
+   ```math
+   \text{node\_features} =
+   \begin{bmatrix}
+   X_0 \\
+   X_1 \\
+   \vdots \\
+   X_{K-1}
+   \end{bmatrix}
+   ```
 
 2. Compute node offsets:
 
-$$
-o_k = \sum_{j<k} N_j
-$$
+   ```math
+   o_k = \sum_{j<k} N_j
+   ```
 
 3. Shift each edge index and concatenate:
 
-$$
-\text{edge\_index} = [E_0 + o_0,\ E_1 + o_1,\ \ldots,\ E_{K-1} + o_{K-1}]
-$$
+   ```math
+   \text{edge\_index} = [E_0 + o_0,\ E_1 + o_1,\ \ldots,\ E_{K-1} + o_{K-1}]
+   ```
 
 4. Concatenate edge attributes:
 
-$$
-\text{edge\_attr} =
-\begin{bmatrix}
-A_0 \\
-A_1 \\
-\vdots \\
-A_{K-1}
-\end{bmatrix}
-$$
+   ```math
+   \text{edge\_attr} =
+   \begin{bmatrix}
+   A_0 \\
+   A_1 \\
+   \vdots \\
+   A_{K-1}
+   \end{bmatrix}
+   ```
 
 5. Build membership by repeating each candidate id for its nodes:
 
-$$
-\text{membership} =
-[\,\underbrace{0,\ldots,0}_{N_0},\ \underbrace{1,\ldots,1}_{N_1},\ \ldots,\ \underbrace{K-1,\ldots,K-1}_{N_{K-1}}\,]
-$$
+   ```math
+   \text{membership} =
+   [\,\underbrace{0,\ldots,0}_{N_0},\ \underbrace{1,\ldots,1}_{N_1},\ \ldots,\ \underbrace{K-1,\ldots,K-1}_{N_{K-1}}\,]
+   ```
 
 6. Goal is passed as a separate graph branch:
    - `goal_node_features = X_g`
@@ -154,42 +154,42 @@ If multiple goals are batched together, `goal_batch` contains the goal graph id 
 
 ### `merged` vs `separated`
 
-| Feature | `merged` | `separated` |
-| --- | --- | --- |
-| Candidate graph topology | merged into one graph | disconnected concatenation |
-| Node sharing across candidates | yes | no |
-| Goal handling | inside successor graphs | separate goal input branch |
-| Additional ONNX goal inputs | no | yes |
+| Feature                        | `merged`                | `separated`                |
+|--------------------------------|-------------------------|----------------------------|
+| Candidate graph topology       | merged into one graph   | disconnected concatenation |
+| Node sharing across candidates | yes                     | no                         |
+| Goal handling                  | inside successor graphs | separate goal input branch |
+| Additional ONNX goal inputs    | no                      | yes                        |
 
 ## Model input contract (PyTorch / ONNX)
 
 Core tensors:
 
-| Tensor | Shape | DType | Meaning |
-| --- | --- | --- | --- |
-| `node_features` | `[N, F]` | `float32` | Node feature matrix |
-| `edge_index` | `[2, E]` | `int64` | Edge list (`src`, `dst`) |
-| `edge_attr` | `[E, 1]` | `int64` | Edge label ID per edge |
-| `membership` | `[N]` | `int64` | Candidate index for each node |
-| `mask` | `[K]` | `bool` | Valid candidate slots |
+| Tensor          | Shape    | DType     | Meaning                       |
+|-----------------|----------|-----------|-------------------------------|
+| `node_features` | `[N, F]` | `float32` | Node feature matrix           |
+| `edge_index`    | `[2, E]` | `int64`   | Edge list (`src`, `dst`)      |
+| `edge_attr`     | `[E, 1]` | `int64`   | Edge label ID per edge        |
+| `membership`    | `[N]`    | `int64`   | Candidate index for each node |
+| `mask`          | `[K]`    | `bool`    | Valid candidate slots         |
 
 Additional tensors in `separated` mode:
 
-| Tensor | Shape | DType | Meaning |
-| --- | --- | --- | --- |
-| `goal_node_features` | `[GN, F]` | `float32` | Goal graph node features |
-| `goal_edge_index` | `[2, GE]` | `int64` | Goal graph edges |
-| `goal_edge_attr` | `[GE, 1]` | `int64` | Goal graph edge labels |
-| `goal_batch` | `[GN]` | `int64` | Goal graph batch assignment |
+| Tensor               | Shape     | DType     | Meaning                     |
+|----------------------|-----------|-----------|-----------------------------|
+| `goal_node_features` | `[GN, F]` | `float32` | Goal graph node features    |
+| `goal_edge_index`    | `[2, GE]` | `int64`   | Goal graph edges            |
+| `goal_edge_attr`     | `[GE, 1]` | `int64`   | Goal graph edge labels      |
+| `goal_batch`         | `[GN]`    | `int64`   | Goal graph batch assignment |
 
 Output:
 
 - Logits shape: $[K]$
 - Action selection:
 
-$$
+```math
 a = \arg\max_{k < n_{\text{candidates}}} \, \text{logits}_k
-$$
+```
 
 Plain-text equivalent:
 
@@ -326,64 +326,64 @@ Main outputs (inside `--dir-save-data` / `--dir-save-model`, optionally under `-
 
 ### Paths and naming
 
-| Parameter | Default | Effect |
-| --- | --- | --- |
-| `--subset-train` | `[]` | Restrict training to specific dataset subfolders. |
-| `--folder-raw-data` | `out/NN/Training` | Root containing raw CSV/DOT training data. |
-| `--dir-save-data` | `data` | Output root for materialized `.pt` samples. |
-| `--dir-save-model` | `models` | Output root for checkpoints, metrics, ONNX. |
-| `--experiment-name` | `""` | Optional subdirectory under save roots (run isolation). |
-| `--model-name` | `frontier_policy` | Base filename for model/ONNX/report artifacts. |
+| Parameter           | Default           | Effect                                                  |
+|---------------------|-------------------|---------------------------------------------------------|
+| `--subset-train`    | `[]`              | Restrict training to specific dataset subfolders.       |
+| `--folder-raw-data` | `out/NN/Training` | Root containing raw CSV/DOT training data.              |
+| `--dir-save-data`   | `data`            | Output root for materialized `.pt` samples.             |
+| `--dir-save-model`  | `models`          | Output root for checkpoints, metrics, ONNX.             |
+| `--experiment-name` | `""`              | Optional subdirectory under save roots (run isolation). |
+| `--model-name`      | `frontier_policy` | Base filename for model/ONNX/report artifacts.          |
 
 ### Data semantics and dataset build
 
-| Parameter | Default | Effect |
-| --- | --- | --- |
-| `--dataset_type` | `HASHED` | Node encoding mode: `HASHED`, `MAPPED`, `BITMASK`. |
-| `--kind-of-data` | `merged` | Frontier composition mode: `merged` or `separated`. |
-| `--n-max-dataset-queries` | `1000` | Max random/stress eval queries generated per dataset. |
-| `--max-size-frontier` | `25` | Max frontier size in stress FIFO/LIFO scheduling. |
-| `--max-failure-states-per-dataset` | `0.3` | Caps train frontiers with failures (ratio to no-failure train frontiers). |
-| `--reward-formulation` | `negative_distance` | Reward mode label (pipeline uses distance-derived rewards). |
-| `--max-regular-distance-for-reward` | `50.0` | Distance threshold used for reward scaling and failure cut. |
-| `--failure-reward-value` | `-1.0` | Reward assigned to failure states (`distance > max_regular_distance`). |
-| `--build-data` | `true` | Rebuild materialized train/eval samples from raw data. |
-| `--build-eval-data` | `true` | Rebuild random + stress eval sets (used when `--evaluate true`). |
+| Parameter                           | Default             | Effect                                                                    |
+|-------------------------------------|---------------------|---------------------------------------------------------------------------|
+| `--dataset_type`                    | `HASHED`            | Node encoding mode: `HASHED`, `MAPPED`, `BITMASK`.                        |
+| `--kind-of-data`                    | `merged`            | Frontier composition mode: `merged` or `separated`.                       |
+| `--n-max-dataset-queries`           | `1000`              | Max random/stress eval queries generated per dataset.                     |
+| `--max-size-frontier`               | `25`                | Max frontier size in stress FIFO/LIFO scheduling.                         |
+| `--max-failure-states-per-dataset`  | `0.3`               | Caps train frontiers with failures (ratio to no-failure train frontiers). |
+| `--reward-formulation`              | `negative_distance` | Reward mode label (pipeline uses distance-derived rewards).               |
+| `--max-regular-distance-for-reward` | `50.0`              | Distance threshold used for reward scaling and failure cut.               |
+| `--failure-reward-value`            | `-1.0`              | Reward assigned to failure states (`distance > max_regular_distance`).    |
+| `--build-data`                      | `true`              | Rebuild materialized train/eval samples from raw data.                    |
+| `--build-eval-data`                 | `true`              | Rebuild random + stress eval sets (used when `--evaluate true`).          |
 
 ### Training and optimization
 
-| Parameter | Default | Effect |
-| --- | --- | --- |
-| `--batch-size` | `9092` | Dataloader batch size (number of frontiers per step). |
-| `--n-train-epochs` | `200` | Number of training epochs. |
-| `--eval-every` | `20` | Evaluate every N epochs during training. |
-| `--num-workers` | `0` | DataLoader worker processes. |
-| `--seed` | `42` | RNG seed for split/build/sampling reproducibility. |
-| `--lr` | `1e-3` | AdamW learning rate. |
-| `--weight-decay` | `0.0` | AdamW weight decay. |
-| `--max-grad-norm` | `0.0` | Gradient clipping threshold (`>0` enables clipping). |
-| `--early-stopping-patience-evals` | `0` | Early stop after N eval checkpoints without reward improvement (`0` disables). |
+| Parameter                         | Default | Effect                                                                         |
+|-----------------------------------|---------|--------------------------------------------------------------------------------|
+| `--batch-size`                    | `9092`  | Dataloader batch size (number of frontiers per step).                          |
+| `--n-train-epochs`                | `200`   | Number of training epochs.                                                     |
+| `--eval-every`                    | `20`    | Evaluate every N epochs during training.                                       |
+| `--num-workers`                   | `0`     | DataLoader worker processes.                                                   |
+| `--seed`                          | `42`    | RNG seed for split/build/sampling reproducibility.                             |
+| `--lr`                            | `1e-3`  | AdamW learning rate.                                                           |
+| `--weight-decay`                  | `0.0`   | AdamW weight decay.                                                            |
+| `--max-grad-norm`                 | `0.0`   | Gradient clipping threshold (`>0` enables clipping).                           |
+| `--early-stopping-patience-evals` | `0`     | Early stop after N eval checkpoints without reward improvement (`0` disables). |
 
 ### Model architecture
 
-| Parameter | Default | Effect |
-| --- | --- | --- |
-| `--gnn-layers` | `3` | Number of message-passing layers in encoder. |
-| `--hidden-dim` | `128` | Hidden size for encoder/head. |
-| `--conv-type` | `gine` | GNN layer family: `gine`, `rgcn`, `gcn`. |
-| `--pooling-type` | `mean` | Node-to-candidate pooling: `mean`, `sum`, `max`. |
-| `--edge-emb-dim` | `32` | Edge-label embedding size. |
-| `--num-node-labels` | `4096` | Size of node label embedding table. |
-| `--use-global-context` | `true` | Concatenate frontier context (mean candidate embedding) in policy head. |
-| `--mlp-depth` | `2` | Depth of policy MLP head. |
-| `--use-goal-separate-input` | `None` | Separate goal branch. If unset: auto `true` for `separated`, else `false`. |
+| Parameter                   | Default | Effect                                                                     |
+|-----------------------------|---------|----------------------------------------------------------------------------|
+| `--gnn-layers`              | `3`     | Number of message-passing layers in encoder.                               |
+| `--hidden-dim`              | `128`   | Hidden size for encoder/head.                                              |
+| `--conv-type`               | `gine`  | GNN layer family: `gine`, `rgcn`, `gcn`.                                   |
+| `--pooling-type`            | `mean`  | Node-to-candidate pooling: `mean`, `sum`, `max`.                           |
+| `--edge-emb-dim`            | `32`    | Edge-label embedding size.                                                 |
+| `--num-node-labels`         | `4096`  | Size of node label embedding table.                                        |
+| `--use-global-context`      | `true`  | Concatenate frontier context (mean candidate embedding) in policy head.    |
+| `--mlp-depth`               | `2`     | Depth of policy MLP head.                                                  |
+| `--use-goal-separate-input` | `None`  | Separate goal branch. If unset: auto `true` for `separated`, else `false`. |
 
 ### Execution, evaluation, ONNX
 
-| Parameter | Default | Effect |
-| --- | --- | --- |
-| `--train` | `true` | Run training loop. |
-| `--evaluate` | `true` | Run evaluation on available eval splits. |
-| `--export-onnx` | `true` | Export ONNX model after train/load. |
-| `--if-try-example` | `false` | Run PyTorch-vs-ONNX parity checks and frontier order/removal checks. |
-| `--onnx-frontier-check-size` | `5` | Candidate count used by ONNX order/removal diagnostic check. |
+| Parameter                    | Default | Effect                                                               |
+|------------------------------|---------|----------------------------------------------------------------------|
+| `--train`                    | `true`  | Run training loop.                                                   |
+| `--evaluate`                 | `true`  | Run evaluation on available eval splits.                             |
+| `--export-onnx`              | `true`  | Export ONNX model after train/load.                                  |
+| `--if-try-example`           | `false` | Run PyTorch-vs-ONNX parity checks and frontier order/removal checks. |
+| `--onnx-frontier-check-size` | `5`     | Candidate count used by ONNX order/removal diagnostic check.         |

@@ -49,6 +49,7 @@ set(TEMPLATIC_HEADERS
     src/heuristics/strategies/epg/StateLevel.h
     src/heuristics/strategies/epg/PlanningGraph.h
     src/heuristics/strategies/neuralnets/TrainingDataset.h
+    src/heuristics/strategies/neuralnets/FringeEvalRL.h
     src/search/SpaceSearcher.h
     src/search/search_strategies/BreadthFirst.h
     src/search/search_strategies/DepthFirst.h

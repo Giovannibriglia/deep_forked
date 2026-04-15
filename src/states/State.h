@@ -19,6 +19,7 @@
 #include <concepts>
 
 #include "actions/Action.h"
+#include "neuralnets/GraphTensor.h"
 #include "utilities/Define.h"
 
 /**
@@ -57,6 +58,11 @@ concept StateRepresentation =
        * @brief Reduces the state using bisimulation contraction.
        */
       { rep.contract_with_bisimulation() };
+
+      /**
+       * @brief Compute the tensor for the m_representation.
+       */
+      { rep.get_tensor_representation() } -> std::same_as<const GraphTensor &>;
 
       /**
        * @brief Successor computation method.
@@ -138,6 +144,11 @@ public:
    *
    * @return the m_representation of *this*.*/
   [[nodiscard]] const StateRepr &get_representation() const;
+
+  /** \brief Getter of \ref m_tensor_representation.
+   *
+   * @return the m_tensor_representation of *this*.*/
+  [[nodiscard]] const GraphTensor &get_tensor_representation();
 
   /** \brief Function that add and \ref ActionId to \ref m_executed_actions_id.
    *

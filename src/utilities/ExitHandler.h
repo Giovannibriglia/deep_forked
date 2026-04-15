@@ -153,9 +153,31 @@ public:
     GNNBitmaskGOALError =
         897, ///< Error indicating that the GOAL encoding is not working.
 
-    // --- State/Action Related (900-919) ---
+    // --- FringeEvalRL Related (900-919) ---
+    FringeEvalInstanceError = 900, ///< Error in creating GNN training files.
+    FringeEvalFileError = 901,     ///< Error in accessing a file.
+    FringeEvalScriptError = 902,   ///< Error in running the GNN script file.
+    FringeEvalMappedNotSupportedError =
+        903, ///< Error indicating that we do not support the mapped version
+             ///< with the inference in C++ (it is useless, hashing should be
+             ///< better)
+    FringeEvalTensorTranslationError =
+        904, ///< Error indicating that the translation
+    ///< from state to Tensor did not work
+    FringeEvalModelLoadError = 905, ///< Error loading the GNN model.
+    FringeEvalBitmaskLengthError =
+        906, ///< Error indicating that the bitmask length required
+    ///< exceeds the maximum allowed length defined by MAX_FLUENT_NUMBER.
+    FringeEvalBitmaskRepetitionError =
+        907, ///< Error indicating that the repetition number
+             ///< exceeds the maximum value that can be represented with
+             ///< MAX_REPETITION_BITS bits.
+    FringeEvalBitmaskGOALError =
+        907, ///< Error indicating that the GOAL encoding is not working.
+
+    // --- State/Action Related (1000-1019) ---
     StateActionNotExecutableError =
-        900, ///< Action not executable in state where it is supposed to be.
+        1000, ///< Action not executable in state where it is supposed to be.
   };
 
   // ArgumentParser Related

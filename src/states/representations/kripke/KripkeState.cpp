@@ -26,6 +26,7 @@
 
 #include "KripkeStorage.h"
 #include "SetHelper.h"
+#include "neuralnets/GraphNN.h"
 #include "utilities/ExitHandler.h"
 
 // --- Setters ---
@@ -691,6 +692,15 @@ void KripkeState::contract_with_bisimulation() {
   KripkeReachabilityHelper::clean_unreachable_worlds(*this);
   Bisimulation b;
   b.calc_min_bisimilar(*this);
+}
+
+const GraphTensor &KripkeState::get_tensor_representation() {
+  if (!m_computed_tensor_representation) {
+    m_tensor_representation =
+        GraphNN<KripkeState>::get_instance().state_to_tensor_minimal(*this);
+    m_computed_tensor_representation = true;
+  }
+  return m_tensor_representation;
 }
 
 // --- Constructors ---
