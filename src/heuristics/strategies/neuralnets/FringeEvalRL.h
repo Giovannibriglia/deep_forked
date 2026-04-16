@@ -97,6 +97,7 @@ public:
   [[nodiscard]] std::vector<float>
   get_score(const std::vector<State<StateRepr>> &states);
 
+
   /** \brief Deleted copy constructor (singleton pattern). */
   FringeEvalRL(const FringeEvalRL &) = delete;
 
@@ -176,6 +177,14 @@ private:
    * \return The output score from the GNN model as a float.
    */
   float run_inference(const GraphTensor &tensor) const;
+
+
+    /** \brief Function that return the position of each state in the fringe wrt to their score
+     *
+     * \param scores The Array of scores ordered as in input
+     * \return THe array that associates to each position the rank of the states
+     */
+    std::vector<float> rankScores(const std::vector<float> &scores) const;
 };
 
 #include "FringeEvalRL.tpp"
