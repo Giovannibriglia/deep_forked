@@ -198,7 +198,7 @@ Export examples:
 python3 lib/rl_handler/__main__.py --kind-of-data merged --export-onnx true
 
 # separated
-python3 lib/rl_handler/__main__.py --kind-of-data separated --use-goal-separate-input true --export-onnx true
+python3 lib/rl_handler/__main__.py --kind-of-data separated --export-onnx true
 ```
 
 Minimal inference input examples:
@@ -280,23 +280,22 @@ python3 lib/rl_handler/__main__.py \
   --subset-train <dataset_a> <dataset_b> \
   --dir-save-data <path/to/output_data> \
   --dir-save-model <path/to/output_models> \
-  --kind-of-data separated \
-  --use-goal-separate-input true
+  --kind-of-data separated
 ```
 
 ## Generated artifacts
 
 Main outputs (inside `--dir-save-data` / `--dir-save-model`, optionally under `--experiment-name`):
 
-- `data_pytorch/train_samples.pt`
-- `data_pytorch/eval_samples_random.pt`
-- `data_pytorch/eval_samples_stress.pt`
-- `data_pytorch/samples_params.pt`
+- `processed_data/train_samples.pt`
+- `processed_data/samples_params.pt`
+- `processed_data/query_bundle.json` (train/test x random/fifo/stress queries)
 - `best.pt`
 - `metrics/<model_name>.pt`
 - `<model_name>.onnx`
-- `metrics/eval_reports/*.json`
-- `metrics/onnx/*.json` (when ONNX checks are enabled)
+- `metrics/eval_reports/*.json` (per-eval-step summaries)
+- `metrics/eval_onnx/**/final_metrics.json` (ONNX evaluation by split)
+- `metrics/onnx/*.json` (example parity checks)
 
 ## Deployment checklist
 
@@ -331,8 +330,8 @@ Main outputs (inside `--dir-save-data` / `--dir-save-model`, optionally under `-
 | `--reward-formulation`              | `negative_distance` | Reward mode label (pipeline uses distance-derived rewards).               |
 | `--max-regular-distance-for-reward` | `50.0`              | Distance threshold used for reward scaling and failure cut.               |
 | `--failure-reward-value`            | `-1.0`              | Reward assigned to failure states (`distance > max_regular_distance`).    |
-| `--build-data`                      | `true`              | Rebuild materialized train/eval samples from raw data.                    |
-| `--build-eval-data`                 | `true`              | Rebuild random + stress eval sets (used when `--evaluate true`).          |
+| `--build-data`                      | `true`              | Rebuild materialized train samples from raw data.                         |
+| `--build-eval-data`                 | `true`              | Rebuild query bundle for ONNX eval (`train/test × random/fifo/stress`).   |
 
 ### Training and optimization
 
@@ -360,14 +359,11 @@ Main outputs (inside `--dir-save-data` / `--dir-save-model`, optionally under `-
 | `--num-node-labels`         | `4096`  | Size of node label embedding table.                                        |
 | `--use-global-context`      | `true`  | Concatenate frontier context (mean candidate embedding) in policy head.    |
 | `--mlp-depth`               | `2`     | Depth of policy MLP head.                                                  |
-| `--use-goal-separate-input` | `None`  | Separate goal branch. If unset: auto `true` for `separated`, else `false`. |
 
 ### Execution, evaluation, ONNX
 
 | Parameter                    | Default | Effect                                                               |
 |------------------------------|---------|----------------------------------------------------------------------|
 | `--train`                    | `true`  | Run training loop.                                                   |
-| `--evaluate`                 | `true`  | Run evaluation on available eval splits.                             |
+| `--evaluate`                 | `true`  | Run ONNX evaluation on query splits during training and after train. |
 | `--export-onnx`              | `true`  | Export ONNX model after train/load.                                  |
-| `--if-try-example`           | `false` | Run PyTorch-vs-ONNX parity checks and frontier order/removal checks. |
-| `--onnx-frontier-check-size` | `5`     | Candidate count used by ONNX order/removal diagnostic check.         |

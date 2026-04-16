@@ -115,10 +115,7 @@ def main():
         "--n-max-dataset-queries",
         type=int,
         default=1000,
-        help=(
-            "Max eval queries per dataset for random and stress evaluation; "
-            "accepts legacy alias --max-random-eval-frontiers-for-dataset."
-        ),
+        help="Max generated ONNX-eval queries per dataset for random/fifo/stress.",
     )
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -136,8 +133,8 @@ def main():
         choices=["true", "false"],
         default="true",
         help=(
-            "Whether to rebuild eval sample files "
-            "(eval_samples_random.pt and eval_samples_stress.pt) before evaluation."
+            "Whether to rebuild ONNX-eval query definitions "
+            "(train/test x random/fifo/stress) before evaluation."
         ),
     )
     args = parser.parse_args()

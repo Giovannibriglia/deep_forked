@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import torch
 import unittest
 import warnings
 from pathlib import Path
-
-import torch
 from torch import nn
-
 
 RL_HANDLER_ROOT = Path(__file__).resolve().parents[1]
 if str(RL_HANDLER_ROOT) not in sys.path:

@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
 import networkx as nx
 import pydot
 import torch
+from dataclasses import dataclass
+from pathlib import Path
 from torch_geometric.data import Data
 from torch_geometric.utils import from_networkx
+from typing import Dict, List, Optional
 
 DATASET_TYPE_HASHED = "HASHED"
 DATASET_TYPE_MAPPED = "MAPPED"
@@ -216,92 +215,6 @@ def _compose_disconnected(
         "edge_index": edge_index,
         "edge_attr": edge_attr,
         "membership": membership,
-    }
-
-
-def _node_keys(graph: Data) -> List[Tuple[int | float, ...]]:
-    names = getattr(graph, "node_names", None)
-    if names is None:
-        names = graph.node_features
-    names = names.detach().cpu()
-    if names.dim() == 1:
-        if names.dtype.is_floating_point:
-            return [(float(v.item()),) for v in names]
-        return [(int(v.item()),) for v in names]
-    if names.dtype.is_floating_point:
-        return [tuple(float(x.item()) for x in row) for row in names]
-    return [tuple(int(x.item()) for x in row) for row in names]
-
-
-def _edge_attr_tuple(edge_attr: torch.Tensor, idx: int) -> Tuple[int, ...]:
-    row = edge_attr[idx].detach().cpu().view(-1)
-    return tuple(int(v.item()) for v in row)
-
-
-def _compose_merged_shared_goal(graphs: List[Data]) -> Dict[str, torch.Tensor]:
-    # Nodes are merged by stable identity (node_names when available). If two
-    # graphs share central goal nodes, they map to the same merged node.
-    node_features_rows: List[torch.Tensor] = []
-    key_to_index: Dict[Tuple[int | float, ...], int] = {}
-    # Membership keeps one owner candidate per merged node to stay compatible
-    # with the existing model input contract (single membership tensor).
-    owner_membership: List[int] = []
-    pool_node_index: List[int] = []
-    pool_membership: List[int] = []
-    edge_rows: List[List[int]] = []
-    edge_attr_rows: List[torch.Tensor] = []
-    edge_seen = set()
-
-    for member_value, graph in enumerate(graphs):
-        keys = _node_keys(graph)
-        local_to_global: List[int] = []
-
-        for local_idx, key in enumerate(keys):
-            g_idx = key_to_index.get(key)
-            if g_idx is None:
-                g_idx = len(node_features_rows)
-                key_to_index[key] = g_idx
-                node_features_rows.append(graph.node_features[local_idx].detach().clone())
-                owner_membership.append(member_value)
-            local_to_global.append(g_idx)
-            pool_node_index.append(g_idx)
-            pool_membership.append(member_value)
-
-        if graph.edge_index.numel() == 0:
-            continue
-        edge_index = graph.edge_index.detach().cpu()
-        for e_idx in range(edge_index.size(1)):
-            src_local = int(edge_index[0, e_idx].item())
-            dst_local = int(edge_index[1, e_idx].item())
-            src = local_to_global[src_local]
-            dst = local_to_global[dst_local]
-            attr_key = _edge_attr_tuple(graph.edge_attr, e_idx)
-            edge_key = (src, dst, attr_key)
-            if edge_key in edge_seen:
-                continue
-            edge_seen.add(edge_key)
-            edge_rows.append([src, dst])
-            edge_attr_rows.append(graph.edge_attr[e_idx].detach().clone().to(torch.int64))
-
-    if not node_features_rows:
-        raise ValueError("Cannot compose an empty list of graphs.")
-
-    node_features = torch.stack(node_features_rows, dim=0)
-    membership = torch.tensor(owner_membership, dtype=torch.long)
-    if edge_rows:
-        edge_index = torch.tensor(edge_rows, dtype=torch.long).t().contiguous()
-        edge_attr = torch.stack(edge_attr_rows, dim=0)
-    else:
-        edge_index = torch.zeros((2, 0), dtype=torch.long)
-        edge_attr = torch.zeros((0, 1), dtype=torch.int64)
-
-    return {
-        "node_features": node_features,
-        "edge_index": edge_index,
-        "edge_attr": edge_attr,
-        "membership": membership,
-        "pool_node_index": torch.tensor(pool_node_index, dtype=torch.long),
-        "pool_membership": torch.tensor(pool_membership, dtype=torch.long),
     }
 
 

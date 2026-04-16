@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -13,6 +11,7 @@ from torch_geometric.nn import (
     global_max_pool,
     global_mean_pool,
 )
+from typing import Optional
 
 DATASET_TYPE_HASHED = "HASHED"
 DATASET_TYPE_MAPPED = "MAPPED"

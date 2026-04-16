@@ -3,16 +3,14 @@ from __future__ import annotations
 import csv
 import os
 import random
+import torch
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
-
-import torch
+from src.graph_utils import VALID_DATASET_TYPES, combine_graphs, load_pyg_graph
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-
-from src.graph_utils import VALID_DATASET_TYPES, combine_graphs, load_pyg_graph
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 CSV_FILE_PATH = "File Path"
 CSV_DEPTH = "Depth"
@@ -37,12 +35,9 @@ RANDOM_EVAL_FRONTIER_SIZES = [
     8,
     9,
     10,
-    15,
-    20,
-    25,
-    30,
-    40,
-    50,
+    16,
+    24,
+    32,
 ]
 
 FAILURE_EPS = 1e-9
@@ -89,12 +84,6 @@ def normalize_distance_to_reward(
     max_dist = max(1e-9, float(max_regular_distance))
     dist = max(0.0, float(distance))
     if dist > max_dist:
-        warnings.warn(
-            "normalize_distance_to_reward: received distance greater than "
-            "max_regular_distance; mapping to failure_reward_value.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
         return float(failure_reward_value)
     return 0.9 * dist / max_dist
 
@@ -1074,83 +1063,6 @@ def build_frontier_dataloader(
         collate_fn=lambda x: frontier_collate_fn(x, pad_frontiers=pad_frontiers),
         generator=generator,
     )
-
-
-def get_dataloaders(
-    train_samples: Sequence[Dict[str, Any]],
-    eval_samples: Sequence[Dict[str, Any]],
-    eval2_samples: Optional[Sequence[Dict[str, Any]]] = None,
-    batch_size: int = 8,
-    seed: int = 42,
-    num_workers: int = 0,
-    pad_frontiers: bool = True,
-):
-    train_loader = build_frontier_dataloader(
-        samples=train_samples,
-        batch_size=batch_size,
-        seed=int(seed),
-        num_workers=num_workers,
-        pad_frontiers=pad_frontiers,
-        shuffle=True,
-    )
-    eval_loader = build_frontier_dataloader(
-        samples=eval_samples,
-        batch_size=batch_size,
-        seed=int(seed) + 1,
-        num_workers=num_workers,
-        pad_frontiers=pad_frontiers,
-        shuffle=False,
-    )
-    eval2_loader = (
-        build_frontier_dataloader(
-            samples=eval2_samples,
-            batch_size=batch_size,
-            seed=int(seed) + 2,
-            num_workers=num_workers,
-            pad_frontiers=pad_frontiers,
-            shuffle=False,
-        )
-        if eval2_samples is not None
-        else None
-    )
-    return train_loader, eval_loader, eval2_loader
-
-
-def save_samples(
-    out_path: str | Path,
-    train_samples: Sequence[Dict[str, Any]],
-    eval_samples: Sequence[Dict[str, Any]],
-    eval2_samples: Optional[Sequence[Dict[str, Any]]] = None,
-    eval3_samples: Optional[Sequence[Dict[str, Any]]] = None,
-    params: Optional[Dict[str, Any]] = None,
-) -> Path:
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "train_samples": list(train_samples),
-            "eval_samples": list(eval_samples),
-            "eval2_samples": list(eval2_samples or []),
-            "eval3_samples": list(eval3_samples or []),
-            "eval_random_samples": list(eval_samples),
-            "eval_stress_fifo_samples": list(eval2_samples or []),
-            "eval_stress_lifo_samples": list(eval3_samples or []),
-            "params": params or {},
-        },
-        out_path,
-    )
-    return out_path
-
-
-def load_saved_samples(path: str | Path) -> Dict[str, Any]:
-    payload = torch.load(path, weights_only=False)
-    payload.setdefault("eval2_samples", [])
-    payload.setdefault("eval3_samples", [])
-    payload.setdefault("eval_random_samples", payload.get("eval_samples", []))
-    payload.setdefault("eval_stress_fifo_samples", payload.get("eval2_samples", []))
-    payload.setdefault("eval_stress_lifo_samples", payload.get("eval3_samples", []))
-    payload.setdefault("params", {})
-    return payload
 
 
 def seed_everything(seed: int = 42) -> None:

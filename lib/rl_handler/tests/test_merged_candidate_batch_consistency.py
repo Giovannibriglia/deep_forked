@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import sys
+import torch
 import unittest
 from pathlib import Path
-
-import torch
 from torch_geometric.data import Data
-
 
 RL_HANDLER_ROOT = Path(__file__).resolve().parents[1]
 if str(RL_HANDLER_ROOT) not in sys.path:

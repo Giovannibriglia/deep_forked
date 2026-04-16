@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from typing import Dict, List, Optional, Sequence
-
 import matplotlib.pyplot as plt
 import torch
+from pathlib import Path
+from src.models.frontier_policy import FrontierPolicyNetwork
 from torch import nn
 from tqdm import tqdm
-
-from src.models.frontier_policy import FrontierPolicyNetwork
+from typing import Dict, List, Optional, Sequence
 
 FAILURE_REWARD_VALUE = -1.0
 FAILURE_EPS = 1e-9
@@ -135,13 +133,6 @@ class RLFrontierTrainer:
         return float(sum(values) / len(values))
 
     @staticmethod
-    def _safe_std(values: Sequence[float]) -> float:
-        if not values:
-            return 0.0
-        t = torch.tensor(values, dtype=torch.float32)
-        return float(t.std(unbiased=False).item())
-
-    @staticmethod
     def _iqm_iqr_stats(values: Sequence[float]) -> Dict[str, float]:
         if not values:
             return {
@@ -238,17 +229,6 @@ class RLFrontierTrainer:
     @staticmethod
     def _ensure_dir(path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
-
-    @staticmethod
-    def _save_placeholder_plot(out_path: Path, message: str, title: str = "") -> None:
-        plt.figure(figsize=(8, 4), dpi=300)
-        if title:
-            plt.title(title)
-        plt.text(0.5, 0.5, message, ha="center", va="center", wrap=True)
-        plt.axis("off")
-        plt.tight_layout()
-        plt.savefig(out_path)
-        plt.close()
 
     @staticmethod
     def _plot_iqm_with_iqr_std_band(
