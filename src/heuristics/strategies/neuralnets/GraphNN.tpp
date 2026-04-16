@@ -157,12 +157,10 @@ void GraphNN<StateRepr>::initialize_onnx_model() {
   }
 }
 
-
 template <StateRepresentation StateRepr>
 GraphTensor GraphNN<StateRepr>::get_goal_tensor() const {
   return m_goal_graph_tensor;
 }
-
 
 template <StateRepresentation StateRepr>
 int GraphNN<StateRepr>::get_score(State<StateRepr> &state) {

@@ -46,7 +46,7 @@ const FluentsSet &KripkeWorld::get_fluent_set() const noexcept {
   return m_fluent_set;
 }
 
-KripkeWorldId KripkeWorld::get_id() const noexcept { return m_id;}
+KripkeWorldId KripkeWorld::get_id() const noexcept { return m_id; }
 
 bool KripkeWorld::operator<(const KripkeWorld &to_compare) const noexcept {
   return m_id < to_compare.get_id();
@@ -191,24 +191,26 @@ void KripkeWorldPointer::set_id() noexcept {
 
     m_id = FormulaHelper::hash_string_into_id(id_str);
 
-/*
-#ifdef DEBUG
-    if (ArgumentParser::get_instance().get_verbose()) {
-      constexpr uint64_t limit = (1ULL << 64)-1;  // 2^64
-      if (m_id > limit) {
-        auto &os = ArgumentParser::get_instance().get_output_stream();
-        os << "[DEBUG] KripkeWorldPointer set_id() called. Base ID: " << id
-           << ", Repetition: " << repetition << ", Combined ID String: " << id_str
-           << ", Final Hashed ID: " << m_id << std::endl;
-        ExitHandler::exit_with_message(
-             ExitHandler::ExitCode::KripkeWorldPointerIdError,
-           "Error: KripkeWorldPointerID " + std::to_string(m_id) + " is bigger than 2^48.");
-        // This line is unreachable, but added to avoid compiler warnings.
-        std::exit(static_cast<int>(ExitHandler::ExitCode::ExitForCompiler));
-      }
-    }
-#endif
-*/
+    /*
+    #ifdef DEBUG
+        if (ArgumentParser::get_instance().get_verbose()) {
+          constexpr uint64_t limit = (1ULL << 64)-1;  // 2^64
+          if (m_id > limit) {
+            auto &os = ArgumentParser::get_instance().get_output_stream();
+            os << "[DEBUG] KripkeWorldPointer set_id() called. Base ID: " << id
+               << ", Repetition: " << repetition << ", Combined ID String: " <<
+    id_str
+               << ", Final Hashed ID: " << m_id << std::endl;
+            ExitHandler::exit_with_message(
+                 ExitHandler::ExitCode::KripkeWorldPointerIdError,
+               "Error: KripkeWorldPointerID " + std::to_string(m_id) + " is
+    bigger than 2^48.");
+            // This line is unreachable, but added to avoid compiler warnings.
+            std::exit(static_cast<int>(ExitHandler::ExitCode::ExitForCompiler));
+          }
+        }
+    #endif
+    */
 
     return;
   }

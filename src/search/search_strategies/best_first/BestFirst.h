@@ -70,11 +70,11 @@ public:
    */
   virtual void push(State<StateRepr> &s) = 0;
 
-
-    /**
-* \brief Push a list of states into the search container. Not implemented for searches that are not RL-based
-*/
-  virtual void push(const std::vector<State<StateRepr> > &s) = 0;
+  /**
+   * \brief Push a list of states into the search container. Not implemented for
+   * searches that are not RL-based
+   */
+  virtual void push(const std::vector<State<StateRepr>> &s) = 0;
 
   /**
    * \brief Pop the state with the highest priority (lowest heuristic value).

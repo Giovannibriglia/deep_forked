@@ -39,12 +39,14 @@ public:
   }
 
   /**
- * \brief Push a list of states into the search container. Not implemented for searches that are not RL-based
- */
-  void push([[maybe_unused]] const std::vector<State<StateRepr> > &s) {
+   * \brief Push a list of states into the search container. Not implemented for
+   * searches that are not RL-based
+   */
+  void push([[maybe_unused]] const std::vector<State<StateRepr>> &s) {
     ExitHandler::exit_with_message(
-      ExitHandler::ExitCode::SearchMethodNotImplemented,
-      "Error: push of a vector of states is not implemented for IDFS. It is solely added for RL reasoning");
+        ExitHandler::ExitCode::SearchMethodNotImplemented,
+        "Error: push of a vector of states is not implemented for IDFS. It is "
+        "solely added for RL reasoning");
   }
 
   /**

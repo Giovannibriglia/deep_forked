@@ -30,13 +30,15 @@ public:
    */
   void push(const State<StateRepr> &s) { search_space.push(s); }
 
-    /**
-* \brief Push a list of states into the search container. Not implemented for searches that are not RL-based
-*/
-    void push([[maybe_unused]] const std::vector<State<StateRepr> > &s) {
-      ExitHandler::exit_with_message(
+  /**
+   * \brief Push a list of states into the search container. Not implemented for
+   * searches that are not RL-based
+   */
+  void push([[maybe_unused]] const std::vector<State<StateRepr>> &s) {
+    ExitHandler::exit_with_message(
         ExitHandler::ExitCode::SearchMethodNotImplemented,
-        "Error: push of a vector of states is not implemented for BFS. It is solely added for RL reasoning");
+        "Error: push of a vector of states is not implemented for BFS. It is "
+        "solely added for RL reasoning");
   }
 
   /**
