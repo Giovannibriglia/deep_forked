@@ -107,6 +107,10 @@ bool SpaceSearcher<StateRepr, Strategy>::search_sequential(
     const bool check_visited) {
   m_strategy.reset();
 
+    const bool is_RL_active = Configuration::get_instance().get_RL();
+    std::vector<State<StateRepr>> fringe_RL;
+
+
   std::set<State<StateRepr>> visited_states;
   /// \warning cannot use unordered_set because I am missing a clear way of
   /// hashing the state
@@ -155,10 +159,19 @@ bool SpaceSearcher<StateRepr, Strategy>::search_sequential(
         }
 
         if (!check_visited || visited_states.insert(successor).second) {
-          m_strategy.push(successor);
+            if (!is_RL_active) {
+                m_strategy.push(successor);
+            }
+            {
+                fringe_RL.push_back(successor);
+            }
         }
       }
     }
+      if (!is_RL_active) {
+          m_strategy.push(fringe_RL);
+          fringe_RL.clear();
+      }
   }
   return false;
 }

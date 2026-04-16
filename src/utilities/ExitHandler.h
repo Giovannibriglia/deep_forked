@@ -108,7 +108,7 @@ public:
     BisimulationWrapperOutOfBounds =
         801, ///< Accessed out of bounds in Bisimulation wrapper.
 
-    // --- BreadthFirst Search Related (850-869) ---
+    // --- BreadthFirst Related (850-869) ---
     SearchNoActions =
         850, ///< No actions available in the domain for the search.
 
@@ -125,6 +125,9 @@ public:
         862, ///< Error in reading a field in portfolio configuration file.
     SearchParallelNotImplemented =
         863, ///< Parallel search is not implemented yet.
+
+      SearchMethodNotImplemented =
+    864, ///< Parallel search is not implemented yet.
 
     // --- NN Related (880-889) ---
     NNTrainingFileError = 880,      ///< Error opening NN training files.

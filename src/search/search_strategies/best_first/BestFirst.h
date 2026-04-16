@@ -70,10 +70,16 @@ public:
    */
   virtual void push(State<StateRepr> &s) = 0;
 
+
+    /**
+* \brief Push a list of states into the search container. Not implemented for searches that are not RL-based
+*/
+  virtual void push(const std::vector<State<StateRepr> > &s) = 0;
+
   /**
    * \brief Pop the state with the highest priority (lowest heuristic value).
    */
-  void pop() { search_space.pop(); }
+  virtual void pop() { search_space.pop(); }
 
   /**
    * \brief Peek at the next state in the search container without removing it.
@@ -92,7 +98,7 @@ public:
   /**
    * \brief Clear and reset the search container.
    */
-  void reset() { search_space = StatePriorityQueue(); }
+  virtual void reset() { search_space = StatePriorityQueue(); }
 
   /**
    * \brief Check whether the search container is empty.
