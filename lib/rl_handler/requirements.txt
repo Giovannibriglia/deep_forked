@@ -1,8 +1,6 @@
 torch
 networkx
-pydot
 matplotlib
-pandas
 numpy
 black>24.3.0
 ufmt==2.0.0
@@ -13,5 +11,4 @@ torch-geometric
 pydot==3.0.4
 onnx
 onnxscript
-scikit-learn
 onnxruntime

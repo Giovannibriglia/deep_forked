@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import sys
 import tempfile
-import unittest
-from pathlib import Path
-
 import torch
+import unittest
+import warnings
+from pathlib import Path
 from torch import nn
-
 
 RL_HANDLER_ROOT = Path(__file__).resolve().parents[1]
 if str(RL_HANDLER_ROOT) not in sys.path:
@@ -20,7 +19,7 @@ from src.data import (
     group_clean_frontiers,
     normalize_distance_to_reward,
 )
-from src.graph_utils import TWO_48_MINUS_1, load_pyg_graph
+from src.graph_utils import TWO_64_MINUS_1, load_pyg_graph
 from src.models.frontier_policy import FrontierPolicyNetwork
 from src.trainer import RLFrontierTrainer
 
@@ -65,6 +64,19 @@ class TestDatasetTypeAndRewardTargets(unittest.TestCase):
             normalize_distance_to_reward(50.1, max_regular_distance=50.0),
             -1.0,
             places=6,
+        )
+
+    def test_distance_to_reward_warns_when_distance_exceeds_max(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            reward = normalize_distance_to_reward(50.1, max_regular_distance=50.0)
+        self.assertAlmostEqual(reward, -1.0, places=6)
+        self.assertTrue(
+            any(
+                issubclass(w.category, RuntimeWarning)
+                and "greater than max_regular_distance" in str(w.message)
+                for w in caught
+            )
         )
 
     def test_group_clean_frontiers_removes_singleton_and_all_failure(self) -> None:
@@ -212,7 +224,7 @@ class TestDatasetTypeAndRewardTargets(unittest.TestCase):
     def test_hashed_node_ids_are_normalized_in_model(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             dot_path = Path(td) / "hashed.dot"
-            raw_ids = [0, 2**48 - 1]
+            raw_ids = [0, 2**64 - 1]
             _write_dot(
                 dot_path,
                 nodes=[str(x) for x in raw_ids],
@@ -220,12 +232,16 @@ class TestDatasetTypeAndRewardTargets(unittest.TestCase):
             )
             graph = load_pyg_graph(dot_path.as_posix(), dataset_type="HASHED")
 
-            # Graph loader keeps raw IDs.
+            # Graph loader keeps unsigned-safe hi32/lo32 chunks.
+            expected_chunks = torch.tensor(
+                [
+                    [0, 0],
+                    [2**32 - 1, 2**32 - 1],
+                ],
+                dtype=torch.int64,
+            )
             self.assertTrue(
-                torch.allclose(
-                    graph.node_features.view(-1),
-                    torch.tensor(raw_ids, dtype=torch.float32),
-                )
+                torch.equal(graph.node_features, expected_chunks)
             )
 
             model = FrontierPolicyNetwork(
@@ -237,8 +253,17 @@ class TestDatasetTypeAndRewardTargets(unittest.TestCase):
                 dataset_type="HASHED",
             )
             normalized = model.encoder._prepare_node_features(graph.node_features)
-            expected = torch.tensor(raw_ids, dtype=torch.float32).view(-1, 1) / TWO_48_MINUS_1
+            expected = torch.tensor(raw_ids, dtype=torch.float32).view(-1, 1) / TWO_64_MINUS_1
             self.assertTrue(torch.allclose(normalized, expected, atol=1e-6))
+            label_ids = model.encoder._node_label_ids(
+                graph.node_features,
+                device=torch.device("cpu"),
+            )
+            expected_label_ids = torch.tensor(
+                [rid % model.encoder.num_node_labels for rid in raw_ids],
+                dtype=torch.long,
+            )
+            self.assertTrue(torch.equal(label_ids, expected_label_ids))
 
     def test_trainer_uses_reward_target_as_optimization_signal(self) -> None:
         model = _ConstantLogitModel([0.0, 0.0])
