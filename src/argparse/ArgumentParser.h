@@ -188,12 +188,12 @@ public:
    */
   [[nodiscard]] int64_t get_dataset_seed() const noexcept;
 
-    /**
- * \brief Gets the value of the RL seed.
- * \return the value of the seed. If no values is set return a negative number
- * that sets the seed to a random value.
- */
-    [[nodiscard]] int64_t get_RL_seed() const noexcept;
+  /**
+   * \brief Gets the value of the RL seed.
+   * \return the value of the seed. If no values is set return a negative number
+   * that sets the seed to a random value.
+   */
+  [[nodiscard]] int64_t get_RL_seed() const noexcept;
 
   /**
    * \brief Returns the output stream.
@@ -284,7 +284,7 @@ private:
                                     ///< is the couple goal,state.
 
   int64_t m_dataset_seed = -1; ///< Seed for dataset generation.
-    int64_t m_RL_seed = -1; ///< Seed for RL.
+  int64_t m_RL_seed = -1;      ///< Seed for RL.
 
   std::string m_search_strategy = "BFS"; ///< Search strategy (BFS by default).
   std::string m_heuristic_opt =

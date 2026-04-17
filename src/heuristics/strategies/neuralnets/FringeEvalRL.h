@@ -114,9 +114,8 @@ private:
 
   static FringeEvalRL *instance; ///< Singleton instance pointer
 
-  std::string m_model_path =
-      ArgumentParser::get_instance()
-          .get_RL_model_path(); ///< Path to the RL model
+  std::string m_model_path = ArgumentParser::get_instance()
+                                 .get_RL_model_path(); ///< Path to the RL model
 
   ///// --- ONNX Runtime inference components ---
   Ort::Env m_env{
@@ -138,15 +137,18 @@ private:
   bool m_model_loaded =
       false; ///< Indicates whether the ONNX model has been loaded.
 
+  // --- Persistent backing storage for the tensors above ---
+  std::vector<uint64_t>
+      m_real_node_ids_goal_data; ///< Backing storage for node IDs.
+  std::vector<int64_t>
+      m_edge_index_goal_data; ///< Backing storage for edge_index.
+  std::vector<int64_t>
+      m_edge_attrs_goal_data; ///< Backing storage for edge attrs.
+  std::vector<int64_t>
+      m_state_batch_goal_data; ///< Backing storage for batch ids.
 
-    // --- Persistent backing storage for the tensors above ---
-    std::vector<uint64_t> m_real_node_ids_goal_data;  ///< Backing storage for node IDs.
-    std::vector<int64_t>  m_edge_index_goal_data;      ///< Backing storage for edge_index.
-    std::vector<int64_t> m_edge_attrs_goal_data;       ///< Backing storage for edge attrs.
-    std::vector<int64_t>  m_state_batch_goal_data;      ///< Backing storage for batch ids.
-
-    bool m_goal_tensors_computed = false;  ///< True once goal tensors are initialized.
-
+  bool m_goal_tensors_computed =
+      false; ///< True once goal tensors are initialized.
 
   /**
    * \brief Converts a set of KripkeState (Fringe) to a minimal GraphTensor
@@ -171,7 +173,6 @@ private:
    * with the model.
    */
   void initialize_onnx_model();
-
 
   /** \brief Function that return the position of each state in the fringe wrt
    * to their score

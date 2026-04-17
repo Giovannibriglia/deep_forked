@@ -329,7 +329,7 @@ ArgumentParser::ArgumentParser() : app("deep") {
       ->check(CLI::IsMember({"MIN", "MAX", "AVG", "RNG"}))
       ->default_val("MIN");
 
-    dataset_group
+  dataset_group
       ->add_option("--RL_seed", m_RL_seed,
                    "Set the seed used for RL exploration and RNG heuristics. "
                    "If no seed is provided, the default (94) is used. "
@@ -485,9 +485,7 @@ int64_t ArgumentParser::get_dataset_seed() const noexcept {
   return m_dataset_seed;
 }
 
-int64_t ArgumentParser::get_RL_seed() const noexcept {
-    return m_RL_seed;
-}
+int64_t ArgumentParser::get_RL_seed() const noexcept { return m_RL_seed; }
 
 const std::string &ArgumentParser::get_heuristic() const noexcept {
   return m_heuristic_opt;

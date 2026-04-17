@@ -156,17 +156,17 @@ bool PortfolioSearch::run_portfolio_search() const {
       expanded = searcherAstar.get_expanded_nodes();
       break;
     }
-            case SearchType::RL: {
-        FringeEvalRL<KripkeState>::create_instance();
-        SpaceSearcher<KripkeState, RL_BestFirst<KripkeState>> searcherRL{
-            RL_BestFirst<KripkeState>(initial_state), found_goal};
-        result = searcherRL.search(initial_state);
-        actions_id = searcherRL.get_plan_actions_id();
-        search_type_name = searcherRL.get_search_type();
-        elapsed = searcherRL.get_elapsed_seconds();
-        expanded = searcherRL.get_expanded_nodes();
-        break;
-        }
+    case SearchType::RL: {
+      FringeEvalRL<KripkeState>::create_instance();
+      SpaceSearcher<KripkeState, RL_BestFirst<KripkeState>> searcherRL{
+          RL_BestFirst<KripkeState>(initial_state), found_goal};
+      result = searcherRL.search(initial_state);
+      actions_id = searcherRL.get_plan_actions_id();
+      search_type_name = searcherRL.get_search_type();
+      elapsed = searcherRL.get_elapsed_seconds();
+      expanded = searcherRL.get_expanded_nodes();
+      break;
+    }
     default:
       if (ArgumentParser::get_instance().get_verbose()) {
         static std::mutex cout_mutex;

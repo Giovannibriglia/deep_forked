@@ -39,11 +39,9 @@ public:
   }
 
   /**
- * \brief Push the initial state into the search container.
- */
-  void push_initial(const State<StateRepr> &s) {
-    push(s);
-  }
+   * \brief Push the initial state into the search container.
+   */
+  void push_initial(const State<StateRepr> &s) { push(s); }
 
   /**
    * \brief Push a list of states into the search container. Not implemented for
