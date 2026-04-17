@@ -86,7 +86,9 @@ public:
    *
    * \return The next state in the priority queue.
    */
-  [[nodiscard]] virtual State<StateRepr> peek() const { return search_space.top(); }
+  [[nodiscard]] virtual State<StateRepr> peek() const {
+    return search_space.top();
+  }
 
   /**
    * \brief Pure virtual function to return the name of the search strategy.

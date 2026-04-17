@@ -89,7 +89,6 @@ public:
     }
   }
 
-
   void reset() override {
     Base::reset();
     m_reservoir.clear();
@@ -102,18 +101,17 @@ public:
            (m_refill_mode == RefillMode::RANDOM ? "random" : "heuristic") + ")";
   }
 
-
   void pop() override {
     if (this->search_space.empty()) {
       if (!m_reservoir.empty()) {
         ExitHandler::exit_with_message(
-        ExitHandler::ExitCode::SearchMethodError,
-        "Error: Trying to pop from an empty queue while reservoir is not empty. Should call peek before pop.");
-      }
-      else {
-          ExitHandler::exit_with_message(
-          ExitHandler::ExitCode::SearchMethodError,
-          "Error: Trying to pop from an empty queue while reservoir is also empty.");
+            ExitHandler::ExitCode::SearchMethodError,
+            "Error: Trying to pop from an empty queue while reservoir is not "
+            "empty. Should call peek before pop.");
+      } else {
+        ExitHandler::exit_with_message(ExitHandler::ExitCode::SearchMethodError,
+                                       "Error: Trying to pop from an empty "
+                                       "queue while reservoir is also empty.");
       }
     }
     this->search_space.pop();
@@ -123,11 +121,10 @@ public:
 
     if (this->search_space.empty()) {
       if (m_reservoir.empty()) {
-        ExitHandler::exit_with_message(
-         ExitHandler::ExitCode::SearchMethodError,
-         "Error: Trying to peek from an empty queue while reservoir is also empty.");
-      }
-      else {
+        ExitHandler::exit_with_message(ExitHandler::ExitCode::SearchMethodError,
+                                       "Error: Trying to peek from an empty "
+                                       "queue while reservoir is also empty.");
+      } else {
         if (m_refill_mode == RefillMode::RANDOM) {
           this->search_space.push(reservoir_take_random());
         } else {
@@ -138,8 +135,9 @@ public:
     return this->search_space.top();
   }
 
-  [[nodiscard]] bool empty() const override { return (this->search_space.empty() && m_reservoir.empty()); }
-
+  [[nodiscard]] bool empty() const override {
+    return (this->search_space.empty() && m_reservoir.empty());
+  }
 
 private:
   std::size_t m_max_beam_size =
@@ -147,7 +145,8 @@ private:
   RefillMode m_refill_mode{RefillMode::HEURISTIC};
 
   std::vector<State<StateRepr>> m_reservoir;
-  std::size_t m_exploration_size = Configuration::get_instance().get_exploration_nodes();
+  std::size_t m_exploration_size =
+      Configuration::get_instance().get_exploration_nodes();
 
   std::mt19937_64 m_rng;
   int64_t m_seed{-1};
@@ -211,22 +210,22 @@ private:
 
   void reservoir_push(State<StateRepr> &&candidate, const bool new_state) {
 
-
     if (m_refill_mode == RefillMode::RANDOM) {
       m_reservoir.push_back(std::move(candidate));
       return;
     }
 
-
     if (new_state) {
       candidate.set_heuristic_value(0);
-    }
-    else {
+    } else {
       // Change Heuristic value to be a different one maybe (like number of
       // subgoals)
-      // Think about how to use RL heuristics (which is avg/min/max of the RL assigned scores -- need to keep track of the various score)
-      // he heuristic set to work will then be employed -- the previous is about search
-      const auto heuristic_value = this->m_heuristics_manager.get_heuristic_value(candidate);
+      // Think about how to use RL heuristics (which is avg/min/max of the RL
+      // assigned scores -- need to keep track of the various score) he
+      // heuristic set to work will then be employed -- the previous is about
+      // search
+      const auto heuristic_value =
+          this->m_heuristics_manager.get_heuristic_value(candidate);
       candidate.set_heuristic_value(heuristic_value);
     }
 
@@ -251,5 +250,4 @@ private:
     m_reservoir.pop_back();
     return candidate;
   }
-
 };

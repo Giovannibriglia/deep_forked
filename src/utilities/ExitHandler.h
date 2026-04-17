@@ -129,8 +129,7 @@ public:
     SearchMethodNotImplemented =
         864, ///< Method in search is not implemented yet.
 
-      SearchMethodError =
-    865, ///< Error in some searcher method.
+    SearchMethodError = 865, ///< Error in some searcher method.
 
     // --- NN Related (880-889) ---
     NNTrainingFileError = 880,      ///< Error opening NN training files.

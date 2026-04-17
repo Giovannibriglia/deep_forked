@@ -87,25 +87,26 @@ void ArgumentParser::parse(int argc, char **argv) {
     }
 
     // --- Heuristic consistency check ---
-    if (m_search_strategy != "HFS" && m_search_strategy != "Astar" && m_search_strategy != "RL" &&
-        app.count("--heuristics")) {
+    if (m_search_strategy != "HFS" && m_search_strategy != "Astar" &&
+        m_search_strategy != "RL" && app.count("--heuristics")) {
       ExitHandler::exit_with_message(
           ExitHandler::ExitCode::ArgParseError,
-          "--heuristics can only be used with --search HFS, --search Astar, or --search RL.");
+          "--heuristics can only be used with --search HFS, --search Astar, or "
+          "--search RL.");
     }
 
-      // RL heuristic can only be used with RL search
-      if (m_heuristic_opt == "RL_H" && m_search_strategy != "RL") {
-          ExitHandler::exit_with_message(
-              ExitHandler::ExitCode::ArgParseError,
-              "Heuristic RL_H can only be used with RL search (--search RL).");
-      }
+    // RL heuristic can only be used with RL search
+    if (m_heuristic_opt == "RL_H" && m_search_strategy != "RL") {
+      ExitHandler::exit_with_message(
+          ExitHandler::ExitCode::ArgParseError,
+          "Heuristic RL_H can only be used with RL search (--search RL).");
+    }
 
-      if (m_RL_exploration_percentage + m_RL_exploitation_percentage >= 100) {
-          ExitHandler::exit_with_message(
-              ExitHandler::ExitCode::ArgParseError,
-              "The sum of --RL_exploration and --RL_exploitation must be below 100.");
-      }
+    if (m_RL_exploration_percentage + m_RL_exploitation_percentage >= 100) {
+      ExitHandler::exit_with_message(ExitHandler::ExitCode::ArgParseError,
+                                     "The sum of --RL_exploration and "
+                                     "--RL_exploitation must be below 100.");
+    }
     /*if ((m_search_strategy == "HFS" || m_search_strategy == "Astar") &&
         m_heuristic_opt != "GNN" && app.count("--GNN_model")) {
       ExitHandler::exit_with_message(
@@ -262,13 +263,16 @@ ArgumentParser::ArgumentParser() : app("deep") {
           "-u,--heuristics", m_heuristic_opt,
           "Specify the heuristic for HFS, Astar or RL search: 'SUBGOALS' "
           "(default), 'L_PG', "
-          "'S_PG', 'C_PG', 'GNN', or 'RL_H'. Only used if HFS, Astar, or RL are selected as "
+          "'S_PG', 'C_PG', 'GNN', or 'RL_H'. Only used if HFS, Astar, or RL "
+          "are selected as "
           "search method. "
           "'RL_H' only works in association with RL search method."
-          "If GNN or RL_H are enabled, ensure you are using a model compiled with the "
+          "If GNN or RL_H are enabled, ensure you are using a model compiled "
+          "with the "
           "'ENABLE_NEURALNETS' option; otherwise, torch will not be installed "
           "or linked for efficiency purposes.")
-      ->check(CLI::IsMember({"SUBGOALS", "L_PG", "S_PG", "C_PG", "GNN", "RL_H"}))
+      ->check(
+          CLI::IsMember({"SUBGOALS", "L_PG", "S_PG", "C_PG", "GNN", "RL_H"}))
       ->default_val("SUBGOALS");
   search_group
       ->add_option("--GNN_model", m_GNN_model_path,
@@ -286,41 +290,44 @@ ArgumentParser::ArgumentParser() : app("deep") {
       ->default_val("lib/gnn_handler/models/"
                     "distance_estimator_C.txt");
 
-    search_group
-    ->add_option("--RL_model", m_RL_model_path,
-                 "Specify the path of the model used by the search and heuristics "
-                 "'RL'. The default model is the one located in "
-                 "'lib/rl_handler/models/rl_estimator.onnx'. "
-                 "Only used if RL (with or without 'RL-H') is selected.")
-    ->default_val("lib/rl_handler/models/rl_estimator.onnx");
+  search_group
+      ->add_option(
+          "--RL_model", m_RL_model_path,
+          "Specify the path of the model used by the search and heuristics "
+          "'RL'. The default model is the one located in "
+          "'lib/rl_handler/models/rl_estimator.onnx'. "
+          "Only used if RL (with or without 'RL-H') is selected.")
+      ->default_val("lib/rl_handler/models/rl_estimator.onnx");
 
-    search_group
-        ->add_option("--RL_fringe_size", m_RL_fringe_size,
-                     "The size of the fringe on which RL is applied.")
-        ->default_val("32");
+  search_group
+      ->add_option("--RL_fringe_size", m_RL_fringe_size,
+                   "The size of the fringe on which RL is applied.")
+      ->default_val("32");
 
-    search_group
-        ->add_option("--RL_exploration", m_RL_exploration_percentage,
-                     "The maximum percentage of the fringe to be filled with random states "
-                     "to allow exploration. The new fringe is the exploration "
-                     "(states expanded from the best of the previous fringe) plus the ones "
-                     "from the reservoir plus these.")
-        ->default_val("10");
+  search_group
+      ->add_option("--RL_exploration", m_RL_exploration_percentage,
+                   "The maximum percentage of the fringe to be filled with "
+                   "random states "
+                   "to allow exploration. The new fringe is the exploration "
+                   "(states expanded from the best of the previous fringe) "
+                   "plus the ones "
+                   "from the reservoir plus these.")
+      ->default_val("10");
 
-    search_group
-        ->add_option("--RL_exploitation", m_RL_exploitation_percentage,
-                     "The minimum percentage of the fringe to be filled by new states if possible "
-                     "(expanded from the best of the previous fringe). The new fringe is "
-                     "these plus the ones from the reservoir plus the exploration.")
-        ->default_val("70");
+  search_group
+      ->add_option(
+          "--RL_exploitation", m_RL_exploitation_percentage,
+          "The minimum percentage of the fringe to be filled by new states if "
+          "possible "
+          "(expanded from the best of the previous fringe). The new fringe is "
+          "these plus the ones from the reservoir plus the exploration.")
+      ->default_val("70");
 
-    search_group
-        ->add_option("--RL_heuristics", m_RL_heur_selection,
-                     "Specify the heuristic mode for RL.")
-        ->check(CLI::IsMember({"MIN", "MAX", "AVG"}))
-        ->default_val("MIN");
-
-
+  search_group
+      ->add_option("--RL_heuristics", m_RL_heur_selection,
+                   "Specify the heuristic mode for RL.")
+      ->check(CLI::IsMember({"MIN", "MAX", "AVG"}))
+      ->default_val("MIN");
 
   /*search_group->add_option("--search_threads", m_threads_per_search,
                             "Set the number of threads to use for each search
@@ -473,7 +480,6 @@ const std::string &ArgumentParser::get_heuristic() const noexcept {
   return m_heuristic_opt;
 }
 
-
 const std::string &ArgumentParser::get_GNN_model_path() const noexcept {
   return m_GNN_model_path;
 }
@@ -486,25 +492,24 @@ const std::string &ArgumentParser::get_search_strategy() const noexcept {
   return m_search_strategy;
 }
 
-
 const std::string &ArgumentParser::get_RL_model_path() const noexcept {
-    return m_RL_model_path;
+  return m_RL_model_path;
 }
 
 int ArgumentParser::get_RL_fringe_size() const noexcept {
-    return m_RL_fringe_size;
+  return m_RL_fringe_size;
 }
 
 int ArgumentParser::get_RL_exploration_percentage() const noexcept {
-    return m_RL_exploration_percentage;
+  return m_RL_exploration_percentage;
 }
 
 int ArgumentParser::get_RL_exploitation_percentage() const noexcept {
-    return m_RL_exploitation_percentage;
+  return m_RL_exploitation_percentage;
 }
 
 std::string ArgumentParser::get_RL_heur_selection() const noexcept {
-    return m_RL_heur_selection;
+  return m_RL_heur_selection;
 }
 bool ArgumentParser::get_execute_plan() const noexcept { return m_exec_plan; }
 

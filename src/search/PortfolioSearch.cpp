@@ -274,23 +274,18 @@ void PortfolioSearch::set_default_configurations() {
       {{"search", "Astar"}, {"heuristics", "GNN"}});
   m_search_configurations.push_back({{"search", "IDFS"}});
 
-
   // This is to test RL with the various other Heuristics
   m_search_configurations.push_back(
-    {{"search", "RL"}, {"heuristics", "SUBGOALS"}});
-  m_search_configurations.push_back(
-    {{"search", "RL"}, {"heuristics", "L_PG"}});
-  m_search_configurations.push_back(
-    {{"search", "RL"}, {"heuristics", "C_PG"}});
-  m_search_configurations.push_back(
-    {{"search", "RL"}, {"heuristics", "GNN"}});
+      {{"search", "RL"}, {"heuristics", "SUBGOALS"}});
+  m_search_configurations.push_back({{"search", "RL"}, {"heuristics", "L_PG"}});
+  m_search_configurations.push_back({{"search", "RL"}, {"heuristics", "C_PG"}});
+  m_search_configurations.push_back({{"search", "RL"}, {"heuristics", "GNN"}});
 
   // This is to test RL with the RL Heuristics
   m_search_configurations.push_back(
-    {{"search", "RL"}, {"heuristics", "RL_H"}, {"RL_heuristics", "MIN"}});
+      {{"search", "RL"}, {"heuristics", "RL_H"}, {"RL_heuristics", "MIN"}});
   m_search_configurations.push_back(
-    {{"search", "RL"}, {"heuristics", "RL_H"}, {"RL_heuristics", "MAX"}});
+      {{"search", "RL"}, {"heuristics", "RL_H"}, {"RL_heuristics", "MAX"}});
   m_search_configurations.push_back(
-    {{"search", "RL"}, {"heuristics", "RL_H"}, {"RL_heuristics", "AVG"}});
-  
+      {{"search", "RL"}, {"heuristics", "RL_H"}, {"RL_heuristics", "AVG"}});
 }

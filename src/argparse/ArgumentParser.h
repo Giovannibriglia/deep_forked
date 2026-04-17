@@ -138,36 +138,35 @@ public:
    */
   [[nodiscard]] bool get_log_enabled() const noexcept;
 
+  /**
+   * @brief Get the RL model path.
+   * @return Path to the RL model file.
+   */
+  [[nodiscard]] const std::string &get_RL_model_path() const noexcept;
 
-    /**
- * @brief Get the RL model path.
- * @return Path to the RL model file.
- */
-    [[nodiscard]] const std::string &get_RL_model_path() const noexcept;
+  /**
+   * @brief Get the RL fringe size.
+   * @return Fringe size.
+   */
+  [[nodiscard]] int get_RL_fringe_size() const noexcept;
 
-    /**
-     * @brief Get the RL fringe size.
-     * @return Fringe size.
-     */
-    [[nodiscard]] int get_RL_fringe_size() const noexcept;
+  /**
+   * @brief Get the exploration percentage.
+   * @return Exploration percentage of the fringe.
+   */
+  [[nodiscard]] int get_RL_exploration_percentage() const noexcept;
 
-    /**
-     * @brief Get the exploration percentage.
-     * @return Exploration percentage of the fringe.
-     */
-    [[nodiscard]] int get_RL_exploration_percentage() const noexcept;
+  /**
+   * @brief Get the exploitation percentage.
+   * @return Exploitation percentage of the fringe.
+   */
+  [[nodiscard]] int get_RL_exploitation_percentage() const noexcept;
 
-    /**
-     * @brief Get the exploitation percentage.
-     * @return Exploitation percentage of the fringe.
-     */
-    [[nodiscard]] int get_RL_exploitation_percentage() const noexcept;
-
-    /**
-     * @brief Get the RL heuristic selection.
-     * @return RL heuristic type.
-     */
-    [[nodiscard]] std::string get_RL_heur_selection() const noexcept;
+  /**
+   * @brief Get the RL heuristic selection.
+   * @return RL heuristic type.
+   */
+  [[nodiscard]] std::string get_RL_heur_selection() const noexcept;
 
   /**
    * \brief Return the type of encoding used for the information in states.
@@ -293,42 +292,38 @@ private:
                                   ///< normalization constant
                                   ///< for the GNN model.
 
+  /**
+   * @brief Path to the RL model file.
+   *
+   * Used by RL-based search and heuristics.
+   */
+  std::string m_RL_model_path = "lib/rl_handler/models/rl_estimator.onnx";
 
-    /**
- * @brief Path to the RL model file.
- *
- * Used by RL-based search and heuristics.
- */
-    std::string m_RL_model_path = "lib/rl_handler/models/rl_estimator.onnx";
+  /**
+   * @brief Size of the fringe used in RL-based search.
+   */
+  int m_RL_fringe_size = 32;
 
-    /**
-     * @brief Size of the fringe used in RL-based search.
-     */
-    int m_RL_fringe_size = 32;
+  /**
+   * @brief Percentage of the fringe allocated to exploration.
+   *
+   * Represents the portion filled with random states to encourage exploration.
+   */
+  int m_RL_exploration_percentage = 10;
 
-    /**
-     * @brief Percentage of the fringe allocated to exploration.
-     *
-     * Represents the portion filled with random states to encourage exploration.
-     */
-    int m_RL_exploration_percentage = 10;
+  /**
+   * @brief Percentage of the fringe allocated to exploitation.
+   *
+   * Represents the portion filled with states expanded from the best nodes.
+   */
+  int m_RL_exploitation_percentage = 70;
 
-    /**
-     * @brief Percentage of the fringe allocated to exploitation.
-     *
-     * Represents the portion filled with states expanded from the best nodes.
-     */
-    int m_RL_exploitation_percentage = 70;
-
-    /**
-     * @brief RL heuristic selection mode (stored as string).
-     *
-     * Converted to RL_Heur_type when accessed.
-     */
-    std::string m_RL_heur_selection = "MIN";
-
-
-
+  /**
+   * @brief RL heuristic selection mode (stored as string).
+   *
+   * Converted to RL_Heur_type when accessed.
+   */
+  std::string m_RL_heur_selection = "MIN";
 
   bool m_exec_plan =
       false; ///< Flag to indicate if the plan should be executed.

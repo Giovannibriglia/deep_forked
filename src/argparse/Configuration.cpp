@@ -114,22 +114,25 @@ void Configuration::set_heuristic_opt(const std::string &val) {
         ExitHandler::ExitCode::ArgParseError,
         "Heuristic RL_H can only be used with RL search.");
   }
-
 }
 
 int Configuration::get_succesors_to_analyze() const noexcept {
-  //Maybe make the various fields dependent on the Configuration rather than on Argparse for better multi-threading options
+  // Maybe make the various fields dependent on the Configuration rather than on
+  // Argparse for better multi-threading options
   if (m_search_strategy_enum != SearchType::RL) {
     return 0;
   }
   const auto &instance = ArgumentParser::get_instance();
-  return (instance.get_RL_fringe_size() / 100) * instance.get_RL_exploitation_percentage();
+  return (instance.get_RL_fringe_size() / 100) *
+         instance.get_RL_exploitation_percentage();
 }
 
 int Configuration::get_exploration_nodes() const noexcept {
-  //Maybe make the various fields dependent on the Configuration rather than on Argparse for better multi-threading options
+  // Maybe make the various fields dependent on the Configuration rather than on
+  // Argparse for better multi-threading options
   const auto &instance = ArgumentParser::get_instance();
-  return (instance.get_RL_fringe_size() / 100) * instance.get_RL_exploration_percentage();
+  return (instance.get_RL_fringe_size() / 100) *
+         instance.get_RL_exploration_percentage();
 }
 
 void Configuration::set_GNN_model_path(const std::string &val) {
@@ -189,7 +192,7 @@ void Configuration::set_search_strategy_enum() {
     m_search_strategy_enum = SearchType::HFS;
   } else if (m_search_strategy == "Astar") {
     m_search_strategy_enum = SearchType::Astar;
-  }else if (m_search_strategy == "RL") {
+  } else if (m_search_strategy == "RL") {
     m_search_strategy_enum = SearchType::RL;
   } else {
     ExitHandler::exit_with_message(ExitHandler::ExitCode::ArgParseError,
@@ -230,24 +233,23 @@ void Configuration::set_heuristic_enum() {
   }
 }
 
-
-void Configuration::set_RL_heuristics(const std::string & val) {
-    m_heuristic_opt = val;
-    set_RL_heuristics_enum();
+void Configuration::set_RL_heuristics(const std::string &val) {
+  m_heuristic_opt = val;
+  set_RL_heuristics_enum();
 }
 
 void Configuration::set_RL_heuristics_enum() {
-    if (m_RL_heuristics_opt == "MIN") {
-        m_RL_heuristics_enum = RLHeuristicType::MIN;
-    } else if (m_RL_heuristics_opt == "MAX") {
-        m_RL_heuristics_enum = RLHeuristicType::MAX;
-    } else if (m_RL_heuristics_opt == "AVG") {
-        m_RL_heuristics_enum = RLHeuristicType::AVG;
-    } else {
-        ExitHandler::exit_with_message(ExitHandler::ExitCode::ArgParseError,
-                                       "Invalid RL heuristic selection specified: " +
-                                       m_RL_heuristics_opt);
-    }
+  if (m_RL_heuristics_opt == "MIN") {
+    m_RL_heuristics_enum = RLHeuristicType::MIN;
+  } else if (m_RL_heuristics_opt == "MAX") {
+    m_RL_heuristics_enum = RLHeuristicType::MAX;
+  } else if (m_RL_heuristics_opt == "AVG") {
+    m_RL_heuristics_enum = RLHeuristicType::AVG;
+  } else {
+    ExitHandler::exit_with_message(
+        ExitHandler::ExitCode::ArgParseError,
+        "Invalid RL heuristic selection specified: " + m_RL_heuristics_opt);
+  }
 }
 
 RLHeuristicType Configuration::get_RL_heuristics() const noexcept {
@@ -268,7 +270,9 @@ void Configuration::print(std::ostream &os) const {
   }
   os << "    Already visited state check: "
      << (m_check_visited ? "active" : "inactive") << '\n';
-  if ((m_search_strategy_enum == SearchType::HFS || m_search_strategy_enum == SearchType::Astar || m_search_strategy_enum == SearchType::RL) &&
+  if ((m_search_strategy_enum == SearchType::HFS ||
+       m_search_strategy_enum == SearchType::Astar ||
+       m_search_strategy_enum == SearchType::RL) &&
       m_heuristic_enum == Heuristics::GNN) {
     os << "    Path to GNN model: " << m_GNN_model_path << '\n';
     os << "    Path to GNN constant file: " << m_GNN_constant_path << '\n';
@@ -277,9 +281,12 @@ void Configuration::print(std::ostream &os) const {
   if (m_search_strategy_enum == SearchType::RL) {
     const auto &instance = ArgumentParser::get_instance();
     os << "    Path to RL model: " << instance.get_RL_model_path() << '\n';
-    os << "    RL fringe size selection: " << instance.get_RL_fringe_size() << '\n';
-    os << "    RL exploration percentage: " << instance.get_RL_exploration_percentage() << "\n";
-    os << "    RL exploitation percentage: " << instance.get_RL_exploitation_percentage() << std::endl;
+    os << "    RL fringe size selection: " << instance.get_RL_fringe_size()
+       << '\n';
+    os << "    RL exploration percentage: "
+       << instance.get_RL_exploration_percentage() << "\n";
+    os << "    RL exploitation percentage: "
+       << instance.get_RL_exploitation_percentage() << std::endl;
   }
   if (m_heuristic_enum == Heuristics::RL_H) {
     os << "    RL heuristics used is: " << m_RL_heuristics_opt << std::endl;
