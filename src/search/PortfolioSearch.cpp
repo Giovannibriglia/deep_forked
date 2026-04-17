@@ -21,6 +21,10 @@
 #include "states/representations/kripke/KripkeState.h"
 #include "utilities/ExitHandler.h"
 
+#ifdef USE_NEURALNETS
+#include "neuralnets/GraphNN.h"
+#endif
+
 // I am adding this to be seen by the linker because it is a static templated
 // singleton
 template <>
@@ -157,15 +161,24 @@ bool PortfolioSearch::run_portfolio_search() const {
       break;
     }
     case SearchType::RL: {
-      FringeEvalRL<KripkeState>::create_instance();
-      SpaceSearcher<KripkeState, RL_BestFirst<KripkeState>> searcherRL{
-          RL_BestFirst<KripkeState>(initial_state), found_goal};
-      result = searcherRL.search(initial_state);
-      actions_id = searcherRL.get_plan_actions_id();
-      search_type_name = searcherRL.get_search_type();
-      elapsed = searcherRL.get_elapsed_seconds();
-      expanded = searcherRL.get_expanded_nodes();
-      break;
+#ifdef USE_NEURALNETS
+        FringeEvalRL<KripkeState>::create_instance();
+        SpaceSearcher<KripkeState, RL_BestFirst<KripkeState>> searcherRL{
+            RL_BestFirst<KripkeState>(initial_state), found_goal};
+        result = searcherRL.search(initial_state);
+        actions_id = searcherRL.get_plan_actions_id();
+        search_type_name = searcherRL.get_search_type();
+        elapsed = searcherRL.get_elapsed_seconds();
+        expanded = searcherRL.get_expanded_nodes();
+        break;
+#else
+        ExitHandler::exit_with_message(
+         ExitHandler::ExitCode::HeuristicsBadDeclaration,
+         "RL heuristics selected, but neural network support (onnx handler) is "
+         "not "
+         "enabled or linked. Please recompile with the nn option.");
+        break;
+#endif
     }
     default:
       if (ArgumentParser::get_instance().get_verbose()) {
