@@ -707,10 +707,11 @@ const GraphTensor &KripkeState::get_tensor_representation() {
   return m_tensor_representation;
 #else
   ExitHandler::exit_with_message(
-        ExitHandler::ExitCode::HeuristicsBadDeclaration,
-        "Trying to create a tensor of a state but neural network support (onnx handler) is "
-        "not "
-        "enabled or linked. Please recompile with the nn option.");
+      ExitHandler::ExitCode::HeuristicsBadDeclaration,
+      "Trying to create a tensor of a state but neural network support (onnx "
+      "handler) is "
+      "not "
+      "enabled or linked. Please recompile with the nn option.");
   // This line will never be reached, but added to avoid compiler warning.
   std::exit(static_cast<int>(ExitHandler::ExitCode::ExitForCompiler));
 #endif
