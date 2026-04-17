@@ -16,13 +16,12 @@
 #include "search_strategies/IterativeDepthFirst.h"
 #include "search_strategies/best_first/Astar.h"
 #include "search_strategies/best_first/HeuristicFirst.h"
-#include "search_strategies/best_first/RL_BestFirst.h"
 #include "states/State.h"
 #include "states/representations/kripke/KripkeState.h"
 #include "utilities/ExitHandler.h"
 
 #ifdef USE_NEURALNETS
-#include "neuralnets/GraphNN.h"
+#include "search_strategies/best_first/RL_BestFirst.h"
 #endif
 
 // I am adding this to be seen by the linker because it is a static templated

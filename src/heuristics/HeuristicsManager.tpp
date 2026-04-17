@@ -2,9 +2,9 @@
 #include "HeuristicsManager.h"
 #include <ranges>
 
-#include "neuralnets/FringeEvalRL.h"
 
 #ifdef USE_NEURALNETS
+#include "neuralnets/FringeEvalRL.h"
 #include "neuralnets/GraphNN.h"
 #endif
 
