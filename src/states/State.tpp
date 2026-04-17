@@ -23,6 +23,16 @@ State<StateRepr>::State(const State &prev_state,
   }
 }
 
+template<StateRepresentation StateRepr>
+float State<StateRepr>::get_old_heuristic_value() const {
+  return m_old_heuristic_value;
+}
+
+template<StateRepresentation StateRepr>
+float State<StateRepr>::get_heuristics_evaluation_times() const {
+  return m_heuristics_evaluation_times;
+}
+
 template <StateRepresentation StateRepr>
 State<StateRepr>::State(const State &other)
     : m_representation(other.m_representation),
@@ -101,6 +111,21 @@ void State<StateRepr>::add_executed_action(const Action &to_add) {
 template <StateRepresentation StateRepr>
 void State<StateRepr>::set_heuristic_value(const short heuristic_value) {
   m_heuristic_value = heuristic_value;
+}
+
+template<StateRepresentation StateRepr>
+void State<StateRepr>::set_old_heuristic_value(const short old_heuristic_value) {
+  m_old_heuristic_value = old_heuristic_value;
+}
+
+template<StateRepresentation StateRepr>
+void State<StateRepr>::set_heuristics_evaluation_times(const short heuristics_evaluation_times) {
+  m_heuristics_evaluation_times = heuristics_evaluation_times;
+}
+
+template<StateRepresentation StateRepr>
+void State<StateRepr>::increase_heuristics_evaluation_times() {
+  ++m_heuristics_evaluation_times;
 }
 
 template <StateRepresentation StateRepr>

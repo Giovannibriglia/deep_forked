@@ -259,6 +259,7 @@ void PortfolioSearch::parse_configurations_from_file(
 
 void PortfolioSearch::set_default_configurations() {
   m_search_configurations.clear();
+
   // Whatever is not set here will is kept from the user input.
   m_search_configurations.push_back({{"search", "BFS"}});
   m_search_configurations.push_back(
@@ -272,4 +273,24 @@ void PortfolioSearch::set_default_configurations() {
   m_search_configurations.push_back(
       {{"search", "Astar"}, {"heuristics", "GNN"}});
   m_search_configurations.push_back({{"search", "IDFS"}});
+
+
+  // This is to test RL with the various other Heuristics
+  m_search_configurations.push_back(
+    {{"search", "RL"}, {"heuristics", "SUBGOALS"}});
+  m_search_configurations.push_back(
+    {{"search", "RL"}, {"heuristics", "L_PG"}});
+  m_search_configurations.push_back(
+    {{"search", "RL"}, {"heuristics", "C_PG"}});
+  m_search_configurations.push_back(
+    {{"search", "RL"}, {"heuristics", "GNN"}});
+
+  // This is to test RL with the RL Heuristics
+  m_search_configurations.push_back(
+    {{"search", "RL"}, {"heuristics", "RL_H"}, {"RL_heuristics", "MIN"}});
+  m_search_configurations.push_back(
+    {{"search", "RL"}, {"heuristics", "RL_H"}, {"RL_heuristics", "MAX"}});
+  m_search_configurations.push_back(
+    {{"search", "RL"}, {"heuristics", "RL_H"}, {"RL_heuristics", "AVG"}});
+  
 }

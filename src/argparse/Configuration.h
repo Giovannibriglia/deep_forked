@@ -110,6 +110,40 @@ public:
    */
   void set_heuristic_opt(const std::string &val);
 
+
+
+    /**
+ * @brief Get the number of derived states (from expansion) to add to the RL routine during search using the exploitation percentage.
+ * @return RL the number of states to add.
+ */
+   [[nodiscard]] int get_succesors_to_analyze() const noexcept;
+
+    /**
+* @brief Get the number of states to randomly explore during RL routine using the exploration percentage.
+* @return RL the number of states to randomly explore.
+*/
+    [[nodiscard]] int get_exploration_nodes() const noexcept;
+
+    /**
+ * @brief Get the RL heuristic selection.
+ * @return RL heuristic type.
+ */
+    [[nodiscard]] RLHeuristicType get_RL_heuristics() const noexcept;
+
+    /**
+ * @brief Set the RL heuristic selection from string.
+ *
+ * Accepted values: "MIN", "MAX", "AVG".
+ *
+ * @param val String representation of the heuristic type.
+ */
+    void set_RL_heuristics(const std::string &val);
+
+    /**
+* @brief Set the RL heuristic selection from the internal value
+*/
+    void set_RL_heuristics_enum();
+
   /**
    * \brief Sets the path to the model used by the GNN heuristics.
    * \param val The path value.
@@ -188,6 +222,12 @@ private:
                                   ///< contains the
                                   ///< normalization constant
                                   ///< for the GNN model.
+
+
+    std::string m_RL_heuristics_opt = "MIN"; ///< RL Heuristic option string.
+    RLHeuristicType m_RL_heuristics_enum =
+        RLHeuristicType::MIN; ///< RL Heuristic option enum.
+
 
   /**
    * \brief Sets the bisimulation type as a boolean.

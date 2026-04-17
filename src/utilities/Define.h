@@ -128,6 +128,7 @@ enum class Heuristics {
   C_PG,     ///< Classical planning BisGraph for belief formulae.
   SUBGOALS, ///< Number of found/missing subgoals.
   GNN,      ///< GNN-based heuristic.
+    RL_H,     ///< RL-based heuristic to use only when RL SearchType is active.
   ERROR,    ///< Error state, used to detect uninitialized heuristics.
 };
 
@@ -141,7 +142,20 @@ enum class SearchType {
   IDFS,  ///< Iterative depth first search.
   HFS,   ///< Heuristic first search.
   Astar, ///< A* search (heuristic first search with A*).
+    RL, ///< RL-based search.
 };
+
+
+/**
+ * \enum RLHeuristicType
+ * \brief The possible ways of combining RL heuristics values.
+ */
+enum class RLHeuristicType {
+    MIN,   ///< Keep the minimal value for the heuristics (most optimal).
+    MAX,   ///< Keep the maximal value for the heuristics (least optimal).
+    AVG,  ///< Keep the average value for the heuristics.
+  };
+
 
 /// \name Belief Formulae Related
 ///@{

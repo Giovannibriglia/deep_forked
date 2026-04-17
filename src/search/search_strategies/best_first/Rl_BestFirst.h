@@ -81,7 +81,7 @@ public:
     }
 
     const std::vector<float> heuristic_values =
-        FringeEvalRL.get_score(batch);
+        FringeEvalRL<StateRepr>::get_instance().get_score(batch);
 
     for (std::size_t i = 0; i < batch.size(); ++i) {
       batch[i].set_heuristic_value(heuristic_values[i]);
@@ -143,11 +143,11 @@ public:
 
 private:
   std::size_t m_max_beam_size =
-      ArgumentParser::get_instance().get_max_fringe_size();
+      ArgumentParser::get_instance().get_RL_fringe_size();
   RefillMode m_refill_mode{RefillMode::HEURISTIC};
 
   std::vector<State<StateRepr>> m_reservoir;
-  std::size_t m_exploration_size = 2;
+  std::size_t m_exploration_size = Configuration::get_instance().get_exploration_nodes();
 
   std::mt19937_64 m_rng;
   int64_t m_seed{-1};
@@ -226,7 +226,7 @@ private:
       // subgoals)
       // Think about how to use RL heuristics (which is avg/min/max of the RL assigned scores -- need to keep track of the various score)
       // he heuristic set to work will then be employed -- the previous is about search
-      const auto heuristic_value = this->m_heuristics_manager.get_heuristic_value();
+      const auto heuristic_value = this->m_heuristics_manager.get_heuristic_value(candidate);
       candidate.set_heuristic_value(heuristic_value);
     }
 

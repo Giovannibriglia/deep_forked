@@ -48,7 +48,7 @@ struct FringeTensor {
   ///< array in real_nodes_ids.
 
   std::vector<uint8_t> active_states = std::vector<uint8_t>(
-      ArgumentParser::get_instance().get_max_fringe_size(), 0);
+      ArgumentParser::get_instance().get_RL_fringe_size(), 0);
   ///< [32, 1] boolean masks that it is set to 1 for each active state.
 
   std::vector<int64_t> candidate_batch;

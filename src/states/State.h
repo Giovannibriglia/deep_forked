@@ -101,7 +101,9 @@ concept StateRepresentation =
  */
 template <StateRepresentation StateRepr> class State {
 public:
-  /** \brief Constructor without parameters.
+
+
+ /** \brief Constructor without parameters.
    *
    * It creates \ref m_representation calling its **StateRepr** constructor.*/
   State() = default;
@@ -136,10 +138,37 @@ public:
    *
    * @param[in] heuristic_value: the int to copy in \ref m_heuristic_value.*/
   void set_heuristic_value(short heuristic_value);
+
+
+ /** \brief Setter for the field \ref m_old_heuristic_value.
+ *
+ * @param[in] old_heuristic_value: the int to copy in \ref m_old_heuristic_value.*/
+ void set_old_heuristic_value(const short old_heuristic_value);
+
+ /** \brief Setter for the field \ref m_heuristics_evaluation_times.
+ *
+ * @param[in] heuristics_evaluation_times: the int to copy in \ref m_heuristics_evaluation_times.*/
+ void set_heuristics_evaluation_times(const short heuristics_evaluation_times);
+
+ /** \brief Increase the field \ref m_heuristics_evaluation_times by one.*/
+ void increase_heuristics_evaluation_times();
+
   /** \brief Getter of \ref m_heuristic_value.
    *
-   * @return the heuristic value *this*.*/
+   * @return the heuristic value of *this*.*/
   [[nodiscard]] short get_heuristic_value() const;
+
+ /** \brief Getter of \ref m_old_heuristic_value.
+ *
+ * @return the old heuristic value of  *this*.*/
+ [[nodiscard]] float get_old_heuristic_value() const;
+
+ /** \brief Getter of \ref m_heuristics_evaluation_times.
+  *
+  * @return the number of times the heuristic value for *this* has been evaluated.*/
+ [[nodiscard]] float get_heuristics_evaluation_times() const;
+
+
   /** \brief Getter of \ref m_representation.
    *
    * @return the m_representation of *this*.*/
@@ -304,6 +333,8 @@ public:
    */
   void print_dataset_format(std::ofstream &ofs) const;
 
+
+
 private:
   /** \brief The type of state m_representation.
    *
@@ -321,6 +352,11 @@ private:
    *
    * This value is given by the chosen implementation of Heuristics.*/
   int m_heuristic_value = 0;
+
+   /** \brief The old heuristic value of the *this*, used to compute the RL heuristic value*/
+   float m_old_heuristic_value = 0;
+ /** \brief Number of time *this* has been evaluated, used to compute the RL heuristic value*/
+ float m_heuristics_evaluation_times = 0;
 
   /** \brief Setter for the field \ref m_executed_actions_id.
    *
