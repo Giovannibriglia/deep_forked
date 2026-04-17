@@ -24,26 +24,26 @@
  */
 
 struct FringeTensor {
-  std::vector<uint64_t> edge_src;
+  std::vector<int64_t> edge_src;
   ///< [1, num_edges] -- First dimension.
   ///< Symbolic source node ID for each edge.
-  std::vector<uint64_t>
+  std::vector<int64_t>
       edge_dst; ///< [1, num_edges] -- Second dimension. Symbolic destination
                 ///< node ID for each edge.
 
   /// edge_src and edge_dest are used to create edge_index -> list <edge_source,
   /// edge_target> -> [2, num_edges]
 
-  std::vector<uint64_t>
+  std::vector<int64_t>
       edge_attrs; ///< [1, num_edges] Edge attributes or labels,
 
   ///< aligned with edge_ids.
-  std::vector<uint64_t> real_node_ids;
+  std::vector<int64_t> real_node_ids;
   ///< [num_nodes, 1] Mapping from symbolic
   ///< node IDs to real/hashed node IDs.
   ///< aligned with edge_ids.
 
-  std::vector<uint64_t> membership;
+  std::vector<int64_t> membership;
   ///< [num_states, 1] mapping each state to the corresponding start of the
   ///< array in real_nodes_ids.
 
@@ -115,8 +115,8 @@ private:
   static FringeEvalRL *instance; ///< Singleton instance pointer
 
   std::string m_model_path =
-      Configuration::get_instance()
-          .get_GNN_model_path(); ///< Path to the RL model
+      ArgumentParser::get_instance()
+          .get_RL_model_path(); ///< Path to the RL model
 
   ///// --- ONNX Runtime inference components ---
   Ort::Env m_env{
@@ -138,12 +138,22 @@ private:
   bool m_model_loaded =
       false; ///< Indicates whether the ONNX model has been loaded.
 
+
+    // --- Persistent backing storage for the tensors above ---
+    std::vector<uint64_t> m_real_node_ids_goal_data;  ///< Backing storage for node IDs.
+    std::vector<int64_t>  m_edge_index_goal_data;      ///< Backing storage for edge_index.
+    std::vector<int64_t> m_edge_attrs_goal_data;       ///< Backing storage for edge attrs.
+    std::vector<int64_t>  m_state_batch_goal_data;      ///< Backing storage for batch ids.
+
+    bool m_goal_tensors_computed = false;  ///< True once goal tensors are initialized.
+
+
   /**
    * \brief Converts a set of KripkeState (Fringe) to a minimal GraphTensor
    * representation.
    *
    * This function transforms the given Fringe into a FringeTensor,
-   * extracting only the essential information required for GNN input.
+   * extracting only the essential information required for RL input.
    *
    * \param states The set of States to convert.
    * \return A FringeTensor containing the minimal tensor representation of the
@@ -153,34 +163,24 @@ private:
   fringe_to_tensor_minimal(const std::vector<State<StateRepr>> &states);
 
   /**
-   * \brief Initializes the ONNX Runtime model for GNN inference.
+   * \brief Initializes the ONNX Runtime model for RL inference.
    *
-   * Sets up the ONNX Runtime environment, session options, loads the GNN model,
+   * Sets up the ONNX Runtime environment, session options, loads the RL model,
    * and prepares input/output names and memory information required for
    * inference. This function should be called before performing any inference
    * with the model.
    */
   void initialize_onnx_model();
 
-  /**
-   * \brief Runs ONNX Runtime inference on the provided GraphTensor.
-   *
-   * This method takes a GraphTensor representing the input graph, prepares the
-   * necessary ONNX Runtime tensors, and performs inference using the loaded GNN
-   * model. It returns the resulting score or output from the neural network.
-   *
-   * \param tensor The GraphTensor containing the graph data for inference.
-   * \return The output score from the GNN model as a float.
-   */
-  float run_inference(const GraphTensor &tensor) const;
 
   /** \brief Function that return the position of each state in the fringe wrt
    * to their score
    *
    * \param scores The Array of scores ordered as in input
+   * \param n
    * \return THe array that associates to each position the rank of the states
    */
-  std::vector<float> rankScores(const std::vector<float> &scores) const;
+  std::vector<float> rankScores(const float *scores, size_t n) const;
 };
 
 #include "FringeEvalRL.tpp"

@@ -326,8 +326,17 @@ ArgumentParser::ArgumentParser() : app("deep") {
   search_group
       ->add_option("--RL_heuristics", m_RL_heur_selection,
                    "Specify the heuristic mode for RL.")
-      ->check(CLI::IsMember({"MIN", "MAX", "AVG"}))
+      ->check(CLI::IsMember({"MIN", "MAX", "AVG", "RNG"}))
       ->default_val("MIN");
+
+    dataset_group
+      ->add_option("--RL_seed", m_RL_seed,
+                   "Set the seed used for RL exploration and RNG heuristics. "
+                   "If no seed is provided, the default (94) is used. "
+                   "If a negative value is given, a random seed will be "
+                   "generated instead, "
+                   "as negative seeds are not accepted.")
+      ->default_val("94");
 
   /*search_group->add_option("--search_threads", m_threads_per_search,
                             "Set the number of threads to use for each search
@@ -474,6 +483,10 @@ bool ArgumentParser::get_dataset_separated() const noexcept {
 
 int64_t ArgumentParser::get_dataset_seed() const noexcept {
   return m_dataset_seed;
+}
+
+int64_t ArgumentParser::get_RL_seed() const noexcept {
+    return m_RL_seed;
 }
 
 const std::string &ArgumentParser::get_heuristic() const noexcept {

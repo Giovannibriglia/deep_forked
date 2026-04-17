@@ -31,10 +31,17 @@ public:
   void push(const State<StateRepr> &s) { search_space.push(s); }
 
   /**
+* \brief Push the initial state into the search container.
+*/
+  void push_initial(const State<StateRepr> &s) {
+    push(s);
+  }
+
+  /**
    * \brief Push a list of states into the search container. Not implemented for
    * searches that are not RL-based
    */
-  void push([[maybe_unused]] const std::vector<State<StateRepr>> &s) {
+  void push_vector([[maybe_unused]] std::vector<State<StateRepr>> &s) {
     ExitHandler::exit_with_message(
         ExitHandler::ExitCode::SearchMethodNotImplemented,
         "Error: push of a vector of states is not implemented for DFS. It is "

@@ -2,6 +2,8 @@
 #include "HeuristicsManager.h"
 #include <ranges>
 
+#include "neuralnets/FringeEvalRL.h"
+
 #ifdef USE_NEURALNETS
 #include "neuralnets/GraphNN.h"
 #endif
@@ -57,6 +59,7 @@ HeuristicsManager<StateRepr>::HeuristicsManager(
 #endif
   case Heuristics::RL_H:
 #ifdef USE_NEURALNETS
+      FringeEvalRL<StateRepr>::create_instance();
     if (Configuration::get_instance().get_search_strategy() != SearchType::RL) {
       ExitHandler::exit_with_message(
           ExitHandler::ExitCode::HeuristicsBadDeclaration,

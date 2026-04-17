@@ -38,7 +38,9 @@ template <StateRepresentation StateRepr> GraphNN<StateRepr>::GraphNN() {
       TrainingDataset<StateRepr>::get_instance().get_goal_file_path();
 
   populate_with_goal();
-  initialize_onnx_model();
+  if (Configuration::get_instance().get_heuristic_opt() == Heuristics::GNN) {
+    initialize_onnx_model();
+  }
 }
 
 template <StateRepresentation StateRepr>
@@ -397,7 +399,7 @@ float GraphNN<StateRepr>::run_inference(const GraphTensor &tensor) const {
       input_tensors.size(), output_names_cstr.data(), output_names_cstr.size());
 
   // Get the result (assuming scalar output)
-  const auto *output_data = output_tensors[0].GetTensorMutableData<float>();
+  const auto *output_data = output_tensors[0].GetTensorData<float>();
   const float score = output_data[0];
 
   return score;
@@ -746,10 +748,6 @@ void GraphNN<StateRepr>::populate_with_goal() {
 
     add_edge(epsilon_id, goal_parent_id,
              TrainingDataset<KripkeState>::get_to_goal_edge_id_int());
-  } else {
-    ExitHandler::exit_with_message(
-        ExitHandler::ExitCode::GNNTensorTranslationError,
-        "Separated dataset type not supported for GNN inference.");
   }
 
   for (auto it = begin; it != end; ++it) {
@@ -770,10 +768,6 @@ void GraphNN<StateRepr>::populate_with_goal() {
     m_real_node_ids_bitmask.clear();
     m_node_to_symbolic.clear();
     m_symbolic_id = 0;
-
-    ExitHandler::exit_with_message(
-        ExitHandler::ExitCode::GNNTensorTranslationError,
-        "Separated dataset type not supported for GNN inference.");
   }
 
   m_edges_initial_size = m_edge_labels.size();
@@ -789,25 +783,19 @@ GraphNN<StateRepr>::state_to_tensor_minimal(const KripkeState &kstate) {
   const auto m_node_to_symbolic_original = m_node_to_symbolic;
 
   const auto &training_dataset = TrainingDataset<KripkeState>::get_instance();
-  const bool is_merged =
-      !ArgumentParser::get_instance().get_dataset_separated();
 
   std::map<KripkeWorldId, KripkeWorldId> world_map;
   world_map.clear();
   const auto dataset_type = ArgumentParser::get_instance().get_dataset_type();
   int world_counter = training_dataset.get_shift_state_ids();
 
-  if (is_merged) {
+  if (!ArgumentParser::get_instance().get_dataset_separated()) {
     const auto &state_parent = kstate.get_pointed();
     const auto state_parent_id = state_parent.get_id();
 
     add_edge(TrainingDataset<KripkeState>::get_epsilon_node_id_int(),
              state_parent_id, state_parent,
              TrainingDataset<KripkeState>::get_to_state_edge_id_int());
-  } else {
-    ExitHandler::exit_with_message(
-        ExitHandler::ExitCode::GNNTensorTranslationError,
-        "Separated dataset type not supported for GNN inference.");
   }
 
   // Assign IDs ///\todo remove this for efficiency. The hash can be used

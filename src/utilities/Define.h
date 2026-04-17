@@ -153,6 +153,7 @@ enum class RLHeuristicType {
   MIN, ///< Keep the minimal value for the heuristics (most optimal).
   MAX, ///< Keep the maximal value for the heuristics (least optimal).
   AVG, ///< Keep the average value for the heuristics.
+    RNG, ///< Fill the beam at random from the reservoir.
 };
 
 /// \name Belief Formulae Related

@@ -16,6 +16,7 @@
 #include "search_strategies/IterativeDepthFirst.h"
 #include "search_strategies/best_first/Astar.h"
 #include "search_strategies/best_first/HeuristicFirst.h"
+#include "search_strategies/best_first/RL_BestFirst.h"
 #include "states/State.h"
 #include "states/representations/kripke/KripkeState.h"
 #include "utilities/ExitHandler.h"
@@ -146,15 +147,26 @@ bool PortfolioSearch::run_portfolio_search() const {
       break;
     }
     case SearchType::Astar: {
-      SpaceSearcher<KripkeState, Astar<KripkeState>> searcherHFS{
+      SpaceSearcher<KripkeState, Astar<KripkeState>> searcherAstar{
           Astar<KripkeState>(initial_state), found_goal};
-      result = searcherHFS.search(initial_state);
-      actions_id = searcherHFS.get_plan_actions_id();
-      search_type_name = searcherHFS.get_search_type();
-      elapsed = searcherHFS.get_elapsed_seconds();
-      expanded = searcherHFS.get_expanded_nodes();
+      result = searcherAstar.search(initial_state);
+      actions_id = searcherAstar.get_plan_actions_id();
+      search_type_name = searcherAstar.get_search_type();
+      elapsed = searcherAstar.get_elapsed_seconds();
+      expanded = searcherAstar.get_expanded_nodes();
       break;
     }
+            case SearchType::RL: {
+        FringeEvalRL<KripkeState>::create_instance();
+        SpaceSearcher<KripkeState, RL_BestFirst<KripkeState>> searcherRL{
+            RL_BestFirst<KripkeState>(initial_state), found_goal};
+        result = searcherRL.search(initial_state);
+        actions_id = searcherRL.get_plan_actions_id();
+        search_type_name = searcherRL.get_search_type();
+        elapsed = searcherRL.get_elapsed_seconds();
+        expanded = searcherRL.get_expanded_nodes();
+        break;
+        }
     default:
       if (ArgumentParser::get_instance().get_verbose()) {
         static std::mutex cout_mutex;

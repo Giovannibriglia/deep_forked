@@ -120,7 +120,7 @@ bool SpaceSearcher<StateRepr, Strategy>::search_sequential(
   /// hashing the state
   m_expanded_nodes = 0;
 
-  m_strategy.push(initial);
+  m_strategy.push_initial(initial);
   if (check_visited) {
     visited_states.insert(initial);
   }
@@ -172,7 +172,7 @@ bool SpaceSearcher<StateRepr, Strategy>::search_sequential(
     }
     if (is_RL_search &&
         fringe_RL.size() >= static_cast<size_t>(RL_node_to_add)) {
-      m_strategy.push(fringe_RL);
+      m_strategy.push_vector(fringe_RL);
       fringe_RL.clear();
     }
   }

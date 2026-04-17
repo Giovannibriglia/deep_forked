@@ -63,7 +63,7 @@ if(ENABLE_NEURALNETS)
     list(APPEND TEMPLATIC_HEADERS
         src/heuristics/strategies/neuralnets/GraphNN.h
         src/heuristics/strategies/neuralnets/FringeEvalRL.h
-        src/search/search_strategies/best_first/Rl_BestFirst.h
+            src/search/search_strategies/best_first/RL_BestFirst.h
     )
 endif()
 

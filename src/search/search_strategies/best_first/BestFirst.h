@@ -71,10 +71,22 @@ public:
   virtual void push(State<StateRepr> &s) = 0;
 
   /**
+* \brief Push the initial state into the search container.
+*/
+  virtual void push_initial(const State<StateRepr> &s) {
+    search_space.push(s);
+  }
+
+  /**
    * \brief Push a list of states into the search container. Not implemented for
    * searches that are not RL-based
    */
-  virtual void push(const std::vector<State<StateRepr>> &s) = 0;
+  virtual void push_vector([[maybe_unused]] std::vector<State<StateRepr>> &s) {
+    ExitHandler::exit_with_message(
+        ExitHandler::ExitCode::SearchMethodNotImplemented,
+        "Error: push of a vector of states is not implemented for non-RL searches. "
+        "It is solely added for RL reasoning");
+  }
 
   /**
    * \brief Pop the state with the highest priority (lowest heuristic value).
@@ -84,9 +96,11 @@ public:
   /**
    * \brief Peek at the next state in the search container without removing it.
    *
+   * Removed const because in RL_BestFirst we swap element among the reservoir and the search space, so we need to be able to modify the state in the peek function
+   *
    * \return The next state in the priority queue.
    */
-  [[nodiscard]] virtual State<StateRepr> peek() const {
+  [[nodiscard]] virtual State<StateRepr> peek() {
     return search_space.top();
   }
 
