@@ -127,7 +127,10 @@ public:
         863, ///< Parallel search is not implemented yet.
 
     SearchMethodNotImplemented =
-        864, ///< Parallel search is not implemented yet.
+        864, ///< Method in search is not implemented yet.
+
+      SearchMethodError =
+    865, ///< Error in some searcher method.
 
     // --- NN Related (880-889) ---
     NNTrainingFileError = 880,      ///< Error opening NN training files.

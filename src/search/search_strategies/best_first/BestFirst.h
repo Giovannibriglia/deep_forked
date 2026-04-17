@@ -86,7 +86,7 @@ public:
    *
    * \return The next state in the priority queue.
    */
-  State<StateRepr> peek() const { return search_space.top(); }
+  [[nodiscard]] virtual State<StateRepr> peek() const { return search_space.top(); }
 
   /**
    * \brief Pure virtual function to return the name of the search strategy.
@@ -105,7 +105,7 @@ public:
    *
    * \return true if the container is empty, false otherwise.
    */
-  [[nodiscard]] bool empty() const { return search_space.empty(); }
+  [[nodiscard]] virtual bool empty() const { return search_space.empty(); }
 
 protected:
   /**

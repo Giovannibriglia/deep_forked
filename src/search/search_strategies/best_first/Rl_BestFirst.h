@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "BestFirst.h"
+#include "neuralnets/FringeEvalRL.h"
 
 enum class RefillMode { RANDOM, HEURISTIC };
 
@@ -48,63 +49,46 @@ public:
   }
 
   void push(const std::vector<State<StateRepr>> &states) override {
-    if (states.empty() && m_reservoir.empty()) {
+
+    if (states.empty() && m_reservoir.empty() && this->search_space.empty()) {
       return;
+    }
+
+    // Move the previously unexpanded beam states to the reservoir.
+    while (!this->search_space.empty()) {
+      const auto not_expanded = this->search_space.top();
+      this->search_space.pop();
+      reservoir_push(std::move(not_expanded), false);
     }
 
     std::vector<State<StateRepr>> batch;
     batch.reserve(m_max_beam_size);
 
     // Add the newly generated states first.
-    // If there are more than m_max_beam_size, the extra states go directly to
-    // the reservoir.
     for (const auto &s : states) {
       if (batch.size() < m_max_beam_size) {
         batch.push_back(s);
       } else {
-        reservoir_push(State<StateRepr>(s), 0);
+        reservoir_push(s, true);
       }
     }
 
-    // Fill the remaining slots from the reservoir before heuristic evaluation.
+    // Fill remaining slots from the reservoir.
     refill_beam(batch);
 
     if (batch.empty()) {
       return;
     }
 
-    const std::vector<int> heuristic_values =
-        this->m_heuristics_manager.get_heuristic_value(batch);
+    const std::vector<float> heuristic_values =
+        FringeEvalRL.get_score(batch);
 
     for (std::size_t i = 0; i < batch.size(); ++i) {
       batch[i].set_heuristic_value(heuristic_values[i]);
-    }
-
-    // Keep the best state in the active queue; return the rest to the
-    // reservoir.
-    const auto best_it = std::min_element(
-        batch.begin(), batch.end(),
-        [](const State<StateRepr> &lhs, const State<StateRepr> &rhs) {
-          if (lhs.get_heuristic_value() != rhs.get_heuristic_value()) {
-            return lhs.get_heuristic_value() < rhs.get_heuristic_value();
-          }
-          return lhs < rhs;
-        });
-
-    if (best_it != batch.end()) {
-      this->search_space.push(*best_it);
-    } else {
-      ExitHandler::exit_with_message(
-          ExitHandler::ExitCode::SearchMethodNotImplemented,
-          "Error: No valid states to push into the search space.");
-    }
-
-    for (auto it = batch.begin(); it != batch.end(); ++it) {
-      if (it != best_it) {
-        reservoir_push(std::move(*it), it->get_heuristic_value());
-      }
+      this->search_space.push(std::move(batch[i]));
     }
   }
+
 
   void reset() override {
     Base::reset();
@@ -117,6 +101,45 @@ public:
            this->m_heuristics_manager.get_used_h_name() + ", " +
            (m_refill_mode == RefillMode::RANDOM ? "random" : "heuristic") + ")";
   }
+
+
+  void pop() override {
+    if (this->search_space.empty()) {
+      if (!m_reservoir.empty()) {
+        ExitHandler::exit_with_message(
+        ExitHandler::ExitCode::SearchMethodError,
+        "Error: Trying to pop from an empty queue while reservoir is not empty. Should call peek before pop.");
+      }
+      else {
+          ExitHandler::exit_with_message(
+          ExitHandler::ExitCode::SearchMethodError,
+          "Error: Trying to pop from an empty queue while reservoir is also empty.");
+      }
+    }
+    this->search_space.pop();
+  }
+
+  State<StateRepr> peek() const override {
+
+    if (this->search_space.empty()) {
+      if (m_reservoir.empty()) {
+        ExitHandler::exit_with_message(
+         ExitHandler::ExitCode::SearchMethodError,
+         "Error: Trying to peek from an empty queue while reservoir is also empty.");
+      }
+      else {
+        if (m_refill_mode == RefillMode::RANDOM) {
+          this->search_space.push(reservoir_take_random());
+        } else {
+          this->search_space.push(reservoir_take_best());
+        }
+      }
+    }
+    return this->search_space.top();
+  }
+
+  [[nodiscard]] bool empty() const override { return (this->search_space.empty() && m_reservoir.empty()); }
+
 
 private:
   std::size_t m_max_beam_size =
@@ -186,14 +209,25 @@ private:
     }
   }
 
-  void reservoir_push(State<StateRepr> &&candidate, int heuristic_value) {
-    // Change Heuristic value to be a different one maybe (like number of
-    // subgoals)
-    candidate.set_heuristic_value(heuristic_value);
+  void reservoir_push(State<StateRepr> &&candidate, const bool new_state) {
+
 
     if (m_refill_mode == RefillMode::RANDOM) {
       m_reservoir.push_back(std::move(candidate));
       return;
+    }
+
+
+    if (new_state) {
+      candidate.set_heuristic_value(0);
+    }
+    else {
+      // Change Heuristic value to be a different one maybe (like number of
+      // subgoals)
+      // Think about how to use RL heuristics (which is avg/min/max of the RL assigned scores -- need to keep track of the various score)
+      // he heuristic set to work will then be employed -- the previous is about search
+      const auto heuristic_value = this->m_heuristics_manager.get_heuristic_value();
+      candidate.set_heuristic_value(heuristic_value);
     }
 
     m_reservoir.push_back(std::move(candidate));
@@ -218,20 +252,4 @@ private:
     return candidate;
   }
 
-  void pop() override {
-    if (this->search_space.empty()) {
-      if (m_reservoir.empty()) {
-        return;
-      }
-
-      if (m_refill_mode == RefillMode::RANDOM) {
-        this->search_space.push(reservoir_take_random());
-      } else {
-        this->search_space.push(reservoir_take_best());
-      }
-      return;
-    }
-
-    this->search_space.pop();
-  }
 };
