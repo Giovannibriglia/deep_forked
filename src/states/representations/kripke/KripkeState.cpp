@@ -26,8 +26,11 @@
 
 #include "KripkeStorage.h"
 #include "SetHelper.h"
-#include "neuralnets/GraphNN.h"
 #include "utilities/ExitHandler.h"
+
+#ifdef USE_NEURALNETS
+#include "neuralnets/GraphNN.h"
+#endif
 
 // --- Setters ---
 
@@ -695,12 +698,22 @@ void KripkeState::contract_with_bisimulation() {
 }
 
 const GraphTensor &KripkeState::get_tensor_representation() {
+#ifdef USE_NEURALNETS
   if (!m_computed_tensor_representation) {
     m_tensor_representation =
         GraphNN<KripkeState>::get_instance().state_to_tensor_minimal(*this);
     m_computed_tensor_representation = true;
   }
   return m_tensor_representation;
+#else
+  ExitHandler::exit_with_message(
+        ExitHandler::ExitCode::HeuristicsBadDeclaration,
+        "Trying to create a tensor of a state but neural network support (onnx handler) is "
+        "not "
+        "enabled or linked. Please recompile with the nn option.");
+  // This line will never be reached, but added to avoid compiler warning.
+  std::exit(static_cast<int>(ExitHandler::ExitCode::ExitForCompiler));
+#endif
 }
 
 // --- Constructors ---
