@@ -49,21 +49,21 @@ set(TEMPLATIC_HEADERS
     src/heuristics/strategies/epg/StateLevel.h
     src/heuristics/strategies/epg/PlanningGraph.h
     src/heuristics/strategies/neuralnets/TrainingDataset.h
-    src/heuristics/strategies/neuralnets/FringeEvalRL.h
     src/search/SpaceSearcher.h
     src/search/search_strategies/BreadthFirst.h
     src/search/search_strategies/DepthFirst.h
     src/search/search_strategies/best_first/BestFirst.h
     src/search/search_strategies/best_first/HeuristicFirst.h
     src/search/search_strategies/best_first/Astar.h
-        src/search/search_strategies/best_first/Rl_BestFirst.h
-        src/states/State.h
+    src/states/State.h
     src/utilities/SetHelper.h
 )
 
 if(ENABLE_NEURALNETS)
     list(APPEND TEMPLATIC_HEADERS
         src/heuristics/strategies/neuralnets/GraphNN.h
+        src/heuristics/strategies/neuralnets/FringeEvalRL.h
+        src/search/search_strategies/best_first/Rl_BestFirst.h
     )
 endif()
 
