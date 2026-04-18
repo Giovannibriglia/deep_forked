@@ -56,9 +56,9 @@ public:
    */
   [[nodiscard]] KripkeWorldId get_id() const noexcept;
 
-  /** \brief Get the unique id of this world casted as int64_t instead of uint64_t.
- *  \return The unique id.
- */
+  /** \brief Get the unique id of this world casted as int64_t instead of
+   * uint64_t. \return The unique id.
+   */
   [[nodiscard]] int64_t get_id_casted() const noexcept;
 
   ///@}
@@ -237,8 +237,8 @@ public:
    */
   [[nodiscard]] KripkeWorldId get_id() const noexcept;
 
-  /** \brief Get the unique id of this world casted as int64_t instead of uint64_t.
-  *  \return The id.
+  /** \brief Get the unique id of this world casted as int64_t instead of
+   * uint64_t. \return The id.
    */
   [[nodiscard]] int64_t get_id_casted() const noexcept;
 

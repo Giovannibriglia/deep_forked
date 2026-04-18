@@ -272,7 +272,7 @@ private:
    * \return The symbolic ID corresponding to the node.
    */
   [[nodiscard]] int64_t get_symbolic_id(int64_t node,
-                                       const KripkeWorldPointer &kworld);
+                                        const KripkeWorldPointer &kworld);
   /**
    * \brief Returns the symbolic ID for a node, assigning a new one if it does
    * not exist.

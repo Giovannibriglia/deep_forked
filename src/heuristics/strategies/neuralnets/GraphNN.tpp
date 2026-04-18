@@ -332,7 +332,7 @@ float GraphNN<StateRepr>::run_inference(const GraphTensor &tensor) const {
 
   // Construct real_node_ids tensor: shape [num_nodes, 1]
   std::vector<int64_t> real_node_ids(tensor.real_node_ids.begin(),
-                                         tensor.real_node_ids.end());
+                                     tensor.real_node_ids.end());
   const std::array<int64_t, 1> node_ids_shape{
       static_cast<int64_t>(real_node_ids.size())};
   Ort::Value real_node_ids_tensor = Ort::Value::CreateTensor<int64_t>(
@@ -355,12 +355,12 @@ float GraphNN<StateRepr>::run_inference(const GraphTensor &tensor) const {
 
   // Construct edge_attr tensor: shape [num_edges, 1]
   std::vector<int64_t> edge_attrs(tensor.edge_attrs.begin(),
-                                      tensor.edge_attrs.end());
+                                  tensor.edge_attrs.end());
   const std::array<int64_t, 2> edge_attr_shape{static_cast<int64_t>(num_edges),
                                                1};
   Ort::Value edge_attrs_tensor = Ort::Value::CreateTensor<int64_t>(
-      memory_info, edge_attrs.data(), edge_attrs.size(),
-      edge_attr_shape.data(), edge_attr_shape.size());
+      memory_info, edge_attrs.data(), edge_attrs.size(), edge_attr_shape.data(),
+      edge_attr_shape.size());
 
   // Construct state_batch tensor: shape [-1]
   std::vector<int64_t> state_batch_data(num_nodes, 0);
@@ -545,7 +545,7 @@ GraphNN<StateRepr>::get_score_python(const State<StateRepr> &state) {
 
 template <StateRepresentation StateRepr>
 int64_t GraphNN<StateRepr>::get_symbolic_id(const int64_t node,
-                                           const KripkeWorldPointer &kworld) {
+                                            const KripkeWorldPointer &kworld) {
 
   // Since we pass the kworld, we are sure this is a state node and not a goal
   // node
