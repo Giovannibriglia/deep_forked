@@ -332,7 +332,7 @@ std::vector<float> FringeEvalRL<StateRepr>::get_score(
     std::vector<int64_t> goal_state_batch_shape{
         static_cast<int64_t>(m_state_batch_goal_data.size())};
 
-    Ort::Value goal_real_node_ids_tensor = Ort::Value::CreateTensor<uint64_t>(
+    Ort::Value goal_real_node_ids_tensor = Ort::Value::CreateTensor<int64_t>(
         *m_memory_info, m_real_node_ids_goal_data.data(),
         m_real_node_ids_goal_data.size(), goal_real_node_ids_shape.data(),
         goal_real_node_ids_shape.size());

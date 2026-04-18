@@ -552,9 +552,9 @@ std::string HelperPrint::kworld_to_bitmask(
   std::string bitmask(MAX_FLUENT_NUMBER, '0');
   size_t idx = 0;
 
-  const auto fluent_set = to_convert.get_fluent_set();
+  const auto& fluent_set = to_convert.get_fluent_set();
 
-  for (Fluent current_fluent : ordered_positive_fluents) {
+  for (const Fluent& current_fluent : ordered_positive_fluents) {
     if (fluent_set.contains(current_fluent)) {
       if (idx < bitmask.size()) {
         bitmask[idx] = '1';

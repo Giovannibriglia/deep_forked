@@ -138,7 +138,7 @@ private:
       false; ///< Indicates whether the ONNX model has been loaded.
 
   // --- Persistent backing storage for the tensors above ---
-  std::vector<uint64_t>
+  std::vector<int64_t>
       m_real_node_ids_goal_data; ///< Backing storage for node IDs.
   std::vector<int64_t>
       m_edge_index_goal_data; ///< Backing storage for edge_index.
