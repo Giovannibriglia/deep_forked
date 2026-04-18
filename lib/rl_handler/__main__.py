@@ -1051,7 +1051,15 @@ def _run_onnx_single_frontier(
         "edge_index": (
             sample["edge_index"].detach().cpu().to(torch.int64).numpy().astype("int64")
         ),
-        "edge_attr": sample["edge_attr"].detach().cpu().to(torch.int64).numpy().astype("int64"),
+        "edge_attr": (
+            sample["edge_attr"]
+            .detach()
+            .cpu()
+            .to(torch.int64)
+            .reshape(-1)
+            .numpy()
+            .astype("int64")
+        ),
         "membership": (
             sample["membership"].detach().cpu().to(torch.int64).numpy().astype("int64")
         ),
@@ -1086,7 +1094,13 @@ def _run_onnx_single_frontier(
             sample["goal_edge_index"].detach().cpu().to(torch.int64).numpy().astype("int64")
         )
         base_onnx_inputs["goal_edge_attr"] = (
-            sample["goal_edge_attr"].detach().cpu().to(torch.int64).numpy().astype("int64")
+            sample["goal_edge_attr"]
+            .detach()
+            .cpu()
+            .to(torch.int64)
+            .reshape(-1)
+            .numpy()
+            .astype("int64")
         )
         base_onnx_inputs["goal_batch"] = (
             goal_batch.detach().cpu().to(torch.int64).numpy().astype("int64")
@@ -1237,7 +1251,7 @@ def _run_single_sample_pytorch_and_onnx(
     base_onnx_inputs = {
         "node_features": node_features.detach().cpu().numpy().astype(node_feature_np_dtype),
         "edge_index": edge_index.detach().cpu().numpy().astype("int64"),
-        "edge_attr": edge_attr.detach().cpu().numpy().astype("int64"),
+        "edge_attr": edge_attr.detach().cpu().reshape(-1).numpy().astype("int64"),
         "membership": membership.detach().cpu().numpy().astype("int64"),
     }
     if onnx_ctx.use_goal_inputs:
@@ -1261,7 +1275,13 @@ def _run_single_sample_pytorch_and_onnx(
             sample["goal_edge_index"].detach().cpu().numpy().astype("int64")
         )
         base_onnx_inputs["goal_edge_attr"] = (
-            sample["goal_edge_attr"].detach().cpu().numpy().astype("int64")
+            sample["goal_edge_attr"]
+            .detach()
+            .cpu()
+            .to(torch.int64)
+            .reshape(-1)
+            .numpy()
+            .astype("int64")
         )
         base_onnx_inputs["goal_batch"] = goal_batch.detach().cpu().numpy().astype("int64")
 

@@ -974,11 +974,11 @@ class RLFrontierTrainer:
             dummy_inputs = (
                 torch.zeros((n_nodes, raw_node_input_dim), dtype=node_tensor_dtype),
                 torch.zeros((2, n_edges), dtype=torch.int64),
-                torch.zeros((n_edges, 1), dtype=torch.int64),
+                torch.zeros((n_edges,), dtype=torch.int64),
                 torch.arange(n_nodes, dtype=torch.int64) % n_candidates,
                 torch.zeros((n_goal_nodes, raw_node_input_dim), dtype=node_tensor_dtype),
                 torch.zeros((2, n_goal_edges), dtype=torch.int64),
-                torch.zeros((n_goal_edges, 1), dtype=torch.int64),
+                torch.zeros((n_goal_edges,), dtype=torch.int64),
                 torch.zeros((n_goal_nodes,), dtype=torch.int64),
                 torch.ones((n_candidates,), dtype=torch.bool),
             )
@@ -1010,7 +1010,7 @@ class RLFrontierTrainer:
             dummy_inputs = (
                 torch.zeros((n_nodes, raw_node_input_dim), dtype=node_tensor_dtype),
                 torch.zeros((2, n_edges), dtype=torch.int64),
-                torch.zeros((n_edges, 1), dtype=torch.int64),
+                torch.zeros((n_edges,), dtype=torch.int64),
                 torch.arange(n_nodes, dtype=torch.int64) % n_candidates,
                 torch.ones((n_candidates,), dtype=torch.bool),
             )
