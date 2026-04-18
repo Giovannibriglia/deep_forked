@@ -47,6 +47,8 @@ const FluentsSet &KripkeWorld::get_fluent_set() const noexcept {
 }
 
 KripkeWorldId KripkeWorld::get_id() const noexcept { return m_id; }
+int64_t KripkeWorld::get_id_casted() const noexcept { return std::bit_cast<int64_t>(m_id); }
+
 
 bool KripkeWorld::operator<(const KripkeWorld &to_compare) const noexcept {
   return m_id < to_compare.get_id();
@@ -169,6 +171,9 @@ KripkeWorldId KripkeWorldPointer::get_fluent_based_id() const noexcept {
 }
 
 KripkeWorldId KripkeWorldPointer::get_id() const noexcept { return m_id; }
+
+int64_t KripkeWorldPointer::get_id_casted() const noexcept { return std::bit_cast<int64_t>(m_id); }
+
 
 void KripkeWorldPointer::set_id() noexcept {
   if (m_ptr) {

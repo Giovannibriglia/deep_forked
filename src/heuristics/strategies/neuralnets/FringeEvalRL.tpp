@@ -186,7 +186,7 @@ FringeTensor FringeEvalRL<StateRepr>::fringe_to_tensor_minimal(
         fringe_tensor_ret.real_node_ids.end(), state_real_nodes_ids.begin(),
         state_real_nodes_ids.end());
     fringe_tensor_ret.membership.insert(fringe_tensor_ret.membership.end(),
-                                        static_cast<size_t>(number_of_nodes),
+                                        static_cast<int64_t>(number_of_nodes),
                                         static_cast<int64_t>(state_number));
 
     const auto state_edges_src = state_tensor.edge_src;

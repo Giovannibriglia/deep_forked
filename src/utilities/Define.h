@@ -185,7 +185,7 @@ using event_type_relation = std::set<std::pair<event_type, event_type>>;
 ///@{
 class KripkeState;
 class KripkeWorld;
-using KripkeWorldId = std::size_t; ///< ID of a KripkeWorld
+using KripkeWorldId = std::uint64_t; ///< ID of a KripkeWorld -- keep 64 bit for the onnx conversion
 inline std::size_t max_dimension_KripkeWorldID_size =
     std::numeric_limits<KripkeWorldId>::max();
 inline std::size_t max_KripkeWorldID_digits =

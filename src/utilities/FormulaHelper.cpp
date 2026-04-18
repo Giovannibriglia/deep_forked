@@ -8,6 +8,7 @@
 #include "HelperPrint.h"
 #include "KripkeEntailmentHelper.h"
 #include "State.h"
+#include "xxhash.h"
 #include "states/representations/kripke/KripkeState.h"
 
 /**
@@ -279,8 +280,13 @@ KripkeWorldId FormulaHelper::hash_fluents_into_id(const FluentsSet &fl) {
   return boost::hash_range(fl.begin(), fl.end());
 }
 
-KripkeWorldId FormulaHelper::hash_string_into_id(const std::string &string) {
+/*KripkeWorldId FormulaHelper::hash_string_into_id(const std::string &string) {
   return boost::hash_range(string.begin(), string.end());
+}*/
+
+//To force uint64 and not size_t for onnx
+KripkeWorldId FormulaHelper::hash_string_into_id(const std::string &string) {
+  return XXH3_64bits(string.data(), string.size());  // guaranteed uint64_t
 }
 
 bool FormulaHelper::consistent(const FluentsSet &to_check) {

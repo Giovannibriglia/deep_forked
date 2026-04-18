@@ -55,6 +55,12 @@ public:
    *  \return The unique id.
    */
   [[nodiscard]] KripkeWorldId get_id() const noexcept;
+
+  /** \brief Get the unique id of this world casted as int64_t instead of uint64_t.
+ *  \return The unique id.
+ */
+  [[nodiscard]] int64_t get_id_casted() const noexcept;
+
   ///@}
 
   /// \name Comparison Operators
@@ -230,6 +236,11 @@ public:
    *  \return The id.
    */
   [[nodiscard]] KripkeWorldId get_id() const noexcept;
+
+  /** \brief Get the unique id of this world casted as int64_t instead of uint64_t.
+  *  \return The id.
+   */
+  [[nodiscard]] int64_t get_id_casted() const noexcept;
 
   /** \brief Set the id of the pointed world based on its content.
    *  \details This method computes a unique id based on the fluent set and
