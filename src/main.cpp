@@ -18,6 +18,7 @@
 #include "utilities/ExitHandler.h"
 
 int main(int argc, char **argv) {
+
   ArgumentParser::create_instance(argc, argv);
   Configuration::create_instance();
   // Domain::create_instance();

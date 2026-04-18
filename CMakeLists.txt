@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.14)
 project(deep VERSION 1.0 LANGUAGES CXX)
+# === Checks ===
+
+# Check that uint64_t is actually 64 bits for the hashing function and onnx usage
+if(CMAKE_SIZEOF_VOID_P LESS 8)
+    message(FATAL_ERROR "This project requires a 64-bit architecture.")
+endif()
+
 
 # === Options ===
 option(ENABLE_NEURALNETS "Enable use of ONNX Runtime" OFF)
@@ -93,7 +100,12 @@ find_package(Doxygen OPTIONAL_COMPONENTS dot)
 add_executable(deep ${SOURCES})
 
 # === External libraries ===
+set(XXHASH_BUILD_XXHSUM OFF)
+set(BUILD_SHARED_LIBS OFF)
+
 add_subdirectory(lib/CLI11)
+add_subdirectory(lib/xxHash/build/cmake ${CMAKE_BINARY_DIR}/xxhash_build EXCLUDE_FROM_ALL)
+
 
 # === Precompiled Header ===
 target_precompile_headers(deep PRIVATE src/utilities/pch.h)
@@ -157,7 +169,7 @@ endif()
 
 # === Link libraries ===
 find_package(Threads REQUIRED)
-target_link_libraries(deep PRIVATE Threads::Threads CLI11::CLI11)
+target_link_libraries(deep PRIVATE Threads::Threads CLI11::CLI11 xxHash::xxhash)
 # librt exists only on Linux
 if(UNIX AND NOT APPLE)
     target_link_libraries(deep PRIVATE rt)

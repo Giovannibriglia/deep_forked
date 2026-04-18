@@ -101,12 +101,12 @@ private:
   ///< efficiency. If merged is active also the
   ///< additional structural nodes are added
 
-  size_t m_symbolic_id = 0;
+  int64_t m_symbolic_id = 0;
   ///< Current symbolic ID counter (will be
   ///< incremented if a new ID is assigned)
-  std::unordered_map<size_t, size_t>
+  std::unordered_map<int64_t, int64_t>
       m_node_to_symbolic; ///<  Map from real node IDs to symbolic IDs.
-  std::vector<size_t> m_real_node_ids;
+  std::vector<int64_t> m_real_node_ids;
   ///< Vector storing real node IDs in symbolic order.
   ///< (Assume that the position is meaningful)
   std::vector<uint8_t> m_real_node_ids_bitmask;
@@ -136,7 +136,7 @@ private:
       0; ///< Initial size for the node IDs vector with bitmask config (to
          ///< remove the new inserted
   ///< nodes while processing the heuristics)
-  size_t m_starting_symbolic_id =
+  int64_t m_starting_symbolic_id =
       0; ///< Initial symbolic ID (to remove the new inserted nodes while
          ///< processing the heuristics)
 
@@ -271,8 +271,8 @@ private:
    * \param kworld the info of the kstate to encode the bitmask.
    * \return The symbolic ID corresponding to the node.
    */
-  [[nodiscard]] size_t get_symbolic_id(size_t node,
-                                       const KripkeWorldPointer &kworld);
+  [[nodiscard]] int64_t get_symbolic_id(int64_t node,
+                                        const KripkeWorldPointer &kworld);
   /**
    * \brief Returns the symbolic ID for a node, assigning a new one if it does
    * not exist.
@@ -285,7 +285,7 @@ private:
    * \param node The real node ID to assign or retrieve a symbolic ID for.
    * \return The symbolic ID corresponding to the node.
    */
-  [[nodiscard]] size_t get_symbolic_id(size_t node);
+  [[nodiscard]] int64_t get_symbolic_id(int64_t node);
 
   /**
    * \brief Adds an edge to the graph representation while also adding the
@@ -302,7 +302,7 @@ private:
    * \param dst The destination node ID (real). \param label The label or
    * attribute associated with the edge.
    */
-  void add_edge(size_t src, size_t dst, int64_t label);
+  void add_edge(int64_t src, int64_t dst, int64_t label);
 
   /**
    * \brief Adds an edge to the graph representation while also adding the
@@ -320,7 +320,7 @@ private:
    * \param dst_kworld The KripkeWorldPointer associated with the destination
    * node. \param label The label or attribute associated with the edge.
    */
-  void add_edge(size_t src, size_t dst, const KripkeWorldPointer &dst_kworld,
+  void add_edge(int64_t src, int64_t dst, const KripkeWorldPointer &dst_kworld,
                 int64_t label);
 
   /**
@@ -340,7 +340,7 @@ private:
    * \param dst_kworld
    * \param label The label or attribute associated with the edge.
    */
-  void add_edge(size_t src, const KripkeWorldPointer &src_kworld, size_t dst,
+  void add_edge(int64_t src, const KripkeWorldPointer &src_kworld, int64_t dst,
                 const KripkeWorldPointer &dst_kworld, int64_t label);
   /**
    * \brief Parses the constant used for normalization in prediction results.

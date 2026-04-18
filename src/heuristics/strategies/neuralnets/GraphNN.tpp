@@ -331,12 +331,12 @@ float GraphNN<StateRepr>::run_inference(const GraphTensor &tensor) const {
       bitmask_shape.data(), bitmask_shape.size());
 
   // Construct real_node_ids tensor: shape [num_nodes, 1]
-  std::vector<float> real_node_ids_float(tensor.real_node_ids.begin(),
-                                         tensor.real_node_ids.end());
+  std::vector<int64_t> real_node_ids(tensor.real_node_ids.begin(),
+                                     tensor.real_node_ids.end());
   const std::array<int64_t, 1> node_ids_shape{
-      static_cast<int64_t>(real_node_ids_float.size())};
-  Ort::Value real_node_ids_tensor = Ort::Value::CreateTensor<float>(
-      memory_info, real_node_ids_float.data(), real_node_ids_float.size(),
+      static_cast<int64_t>(real_node_ids.size())};
+  Ort::Value real_node_ids_tensor = Ort::Value::CreateTensor<int64_t>(
+      memory_info, real_node_ids.data(), real_node_ids.size(),
       node_ids_shape.data(), node_ids_shape.size());
 
   // Construct edge_index tensor: shape [2, num_edges]
@@ -354,13 +354,13 @@ float GraphNN<StateRepr>::run_inference(const GraphTensor &tensor) const {
       edge_index_shape.data(), edge_index_shape.size());
 
   // Construct edge_attr tensor: shape [num_edges, 1]
-  std::vector<float> edge_attrs_float(tensor.edge_attrs.begin(),
-                                      tensor.edge_attrs.end());
+  std::vector<int64_t> edge_attrs(tensor.edge_attrs.begin(),
+                                  tensor.edge_attrs.end());
   const std::array<int64_t, 2> edge_attr_shape{static_cast<int64_t>(num_edges),
                                                1};
-  Ort::Value edge_attr_tensor = Ort::Value::CreateTensor<float>(
-      memory_info, edge_attrs_float.data(), edge_attrs_float.size(),
-      edge_attr_shape.data(), edge_attr_shape.size());
+  Ort::Value edge_attrs_tensor = Ort::Value::CreateTensor<int64_t>(
+      memory_info, edge_attrs.data(), edge_attrs.size(), edge_attr_shape.data(),
+      edge_attr_shape.size());
 
   // Construct state_batch tensor: shape [-1]
   std::vector<int64_t> state_batch_data(num_nodes, 0);
@@ -378,7 +378,7 @@ float GraphNN<StateRepr>::run_inference(const GraphTensor &tensor) const {
     input_tensors.emplace_back(std::move(real_node_ids_tensor));
   }
   input_tensors.emplace_back(std::move(edge_index_tensor));
-  input_tensors.emplace_back(std::move(edge_attr_tensor));
+  input_tensors.emplace_back(std::move(edge_attrs_tensor));
   input_tensors.emplace_back(std::move(state_batch_tensor));
 
   // Convert input/output names to const char* arrays
@@ -544,8 +544,8 @@ GraphNN<StateRepr>::get_score_python(const State<StateRepr> &state) {
 }*/
 
 template <StateRepresentation StateRepr>
-size_t GraphNN<StateRepr>::get_symbolic_id(const size_t node,
-                                           const KripkeWorldPointer &kworld) {
+int64_t GraphNN<StateRepr>::get_symbolic_id(const int64_t node,
+                                            const KripkeWorldPointer &kworld) {
 
   // Since we pass the kworld, we are sure this is a state node and not a goal
   // node
@@ -590,7 +590,7 @@ size_t GraphNN<StateRepr>::get_symbolic_id(const size_t node,
 }
 
 template <StateRepresentation StateRepr>
-size_t GraphNN<StateRepr>::get_symbolic_id(const size_t node) {
+int64_t GraphNN<StateRepr>::get_symbolic_id(const int64_t node) {
 
   // Since we do not pass information on the kworld, this is a goal node
 
@@ -626,9 +626,9 @@ size_t GraphNN<StateRepr>::get_symbolic_id(const size_t node) {
 }
 
 template <StateRepresentation StateRepr>
-void GraphNN<StateRepr>::add_edge(const size_t src,
+void GraphNN<StateRepr>::add_edge(const int64_t src,
                                   const KripkeWorldPointer &src_kworld,
-                                  const size_t dst,
+                                  const int64_t dst,
                                   const KripkeWorldPointer &dst_kworld,
                                   const int64_t label) {
 
@@ -640,7 +640,7 @@ void GraphNN<StateRepr>::add_edge(const size_t src,
 }
 
 template <StateRepresentation StateRepr>
-void GraphNN<StateRepr>::add_edge(const size_t src, const size_t dst,
+void GraphNN<StateRepr>::add_edge(const int64_t src, const int64_t dst,
                                   const KripkeWorldPointer &dst_kworld,
                                   const int64_t label) {
   // Only dst has kworld information because it is a state kworld and not a goal
@@ -651,7 +651,7 @@ void GraphNN<StateRepr>::add_edge(const size_t src, const size_t dst,
 }
 
 template <StateRepresentation StateRepr>
-void GraphNN<StateRepr>::add_edge(const size_t src, const size_t dst,
+void GraphNN<StateRepr>::add_edge(const int64_t src, const int64_t dst,
                                   const int64_t label) {
   m_edge_src.push_back(get_symbolic_id(src));
   m_edge_dst.push_back(get_symbolic_id(dst));
@@ -751,9 +751,9 @@ void GraphNN<StateRepr>::populate_with_goal() {
   }
 
   for (auto it = begin; it != end; ++it) {
-    const size_t src = std::stoul((*it)[1]);
-    const size_t dst = std::stoul((*it)[2]);
-    const size_t label = std::stoul((*it)[3]);
+    const int64_t src = std::stoll((*it)[1]);
+    const int64_t dst = std::stoll((*it)[2]);
+    const int64_t label = std::stoll((*it)[3]);
 
     add_edge(src, dst, label);
   }
@@ -791,7 +791,7 @@ GraphNN<StateRepr>::state_to_tensor_minimal(const KripkeState &kstate) {
 
   if (!ArgumentParser::get_instance().get_dataset_separated()) {
     const auto &state_parent = kstate.get_pointed();
-    const auto state_parent_id = state_parent.get_id();
+    const auto state_parent_id = state_parent.get_id_casted();
 
     add_edge(TrainingDataset<KripkeState>::get_epsilon_node_id_int(),
              state_parent_id, state_parent,
@@ -801,7 +801,7 @@ GraphNN<StateRepr>::state_to_tensor_minimal(const KripkeState &kstate) {
   // Assign IDs ///\todo remove this for efficiency. The hash can be used
   // directly
   for (const auto &pw : kstate.get_worlds()) {
-    if (const auto hash = pw.get_id(); !world_map.contains(hash)) {
+    if (const auto hash = pw.get_id_casted(); !world_map.contains(hash)) {
       switch (dataset_type) {
       case DatasetType::HASHED:
       case DatasetType::BITMASK:
@@ -820,14 +820,14 @@ GraphNN<StateRepr>::state_to_tensor_minimal(const KripkeState &kstate) {
   }
 
   for (const auto &[from_pw, from_map] : kstate.get_beliefs()) {
-    const size_t src = world_map[from_pw.get_id()];
+    const int64_t src = world_map[from_pw.get_id_casted()];
 
     for (const auto &[agent, to_set] : from_map) {
       const auto label = static_cast<int64_t>(
           training_dataset.get_unique_a_id_from_map(agent));
 
       for (const auto &to_pw : to_set) {
-        const size_t dst = world_map[to_pw.get_id()];
+        const int64_t dst = world_map[to_pw.get_id_casted()];
 
         add_edge(src, from_pw, dst, to_pw, label);
       }
@@ -946,8 +946,8 @@ bool GraphNN<StateRepr>::write_and_compare_tensor_to_dot(
         ++iteration;
       }
     } else {
-      uint64_t src = real_node_ids[src_symbolic];
-      uint64_t dst = real_node_ids[dst_symbolic];
+      auto src = real_node_ids[src_symbolic];
+      auto dst = real_node_ids[dst_symbolic];
       src_str = std::to_string(src);
       dst_str = std::to_string(dst);
     }

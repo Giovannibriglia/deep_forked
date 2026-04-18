@@ -552,9 +552,9 @@ std::string HelperPrint::kworld_to_bitmask(
   std::string bitmask(MAX_FLUENT_NUMBER, '0');
   size_t idx = 0;
 
-  const auto fluent_set = to_convert.get_fluent_set();
+  const auto &fluent_set = to_convert.get_fluent_set();
 
-  for (Fluent current_fluent : ordered_positive_fluents) {
+  for (const Fluent &current_fluent : ordered_positive_fluents) {
     if (fluent_set.contains(current_fluent)) {
       if (idx < bitmask.size()) {
         bitmask[idx] = '1';
@@ -611,7 +611,7 @@ void HelperPrint::print_dataset_format(const KripkeState &kstate,
 
   // Assign IDs
   for (const auto &pw : kstate.get_worlds()) {
-    if (const auto hash = pw.get_id(); !world_map.contains(hash)) {
+    if (const auto hash = pw.get_id_casted(); !world_map.contains(hash)) {
       switch (dataset_type) {
       case DatasetType::HASHED: {
         world_map[hash] = std::to_string(hash);
@@ -637,7 +637,7 @@ void HelperPrint::print_dataset_format(const KripkeState &kstate,
   ofs << "digraph G {" << std::endl;
 
   // Pointed world
-  const auto pointed_hash = kstate.get_pointed().get_id();
+  const auto pointed_hash = kstate.get_pointed().get_id_casted();
 
   /// For now, we do not adjust if we use hash. The overlap should be minimal
   /// and not relevant If it becomes relevant, simply add the shift to the hash
@@ -670,10 +670,10 @@ void HelperPrint::print_dataset_format(const KripkeState &kstate,
   // std::map<std::pair<KripkeWorldId, KripkeWorldId>, std::set<Agent>>
   // edge_map;
   for (const auto &[from_pw, from_map] : kstate.get_beliefs()) {
-    auto from_hash = from_pw.get_id();
+    auto from_hash = from_pw.get_id_casted();
     for (const auto &[ag, to_set] : from_map) {
       for (const auto &to_pw : to_set) {
-        auto to_hash = to_pw.get_id();
+        auto to_hash = to_pw.get_id_casted();
         // edge_map[{from_hash, to_hash}].insert(ag);
 
         auto from_label = world_map[from_hash];
