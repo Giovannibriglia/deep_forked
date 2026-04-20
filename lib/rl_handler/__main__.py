@@ -4,6 +4,7 @@ import argparse
 import json
 import networkx as nx
 import pydot
+import re
 import torch
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,12 +31,9 @@ from src.trainer import (
     RLFrontierTrainer,
 )
 
-U64_MAX = (1 << 64) - 1
 I64_MIN = -(1 << 63)
 I64_MAX = (1 << 63) - 1
-U64_CHUNK_BITS = 32
-U64_CHUNK_BASE = 1 << U64_CHUNK_BITS
-U64_CHUNK_MASK = U64_CHUNK_BASE - 1
+_BARE_NEGATIVE_INT_RE = re.compile(r'(?<!["\w])-([0-9]+)(?!["\w])')
 
 
 @dataclass
@@ -178,14 +176,14 @@ def parse_args():
     parser.add_argument(
         "--build-eval-data",
         type=str2bool,
-        default=True,
+        default=False,
         help=(
             "If true, rebuild query definitions for ONNX evaluation from train/test roots; "
             "otherwise load the saved query bundle."
         ),
     )
     parser.add_argument("--train", type=str2bool, default=True)
-    parser.add_argument("--evaluate", type=str2bool, default=True)
+    parser.add_argument("--evaluate", type=str2bool, default=False)
     parser.add_argument("--export-onnx", type=str2bool, default=True)
 
     return parser.parse_args()
@@ -711,12 +709,10 @@ def _parse_numeric_node_label_eval(node_obj: object) -> int:
     raise TypeError(f"Unsupported node label type: {type(node_obj)}")
 
 
-def _split_uint64_eval(value: int, *, context: str) -> tuple[int, int]:
-    if value < 0 or value > U64_MAX:
-        raise ValueError(f"{context} is out of uint64 range [0, {U64_MAX}].")
-    hi = value >> U64_CHUNK_BITS
-    lo = value & U64_CHUNK_MASK
-    return int(hi), int(lo)
+def _validate_int64_range_eval(value: int, *, context: str) -> int:
+    if value < I64_MIN or value > I64_MAX:
+        raise ValueError(f"{context} is out of int64 range [{I64_MIN}, {I64_MAX}].")
+    return int(value)
 
 
 def _load_graph_tensors_no_pyg(path: str, dataset_type: str) -> _EvalGraphTensors:
@@ -728,7 +724,13 @@ def _load_graph_tensors_no_pyg(path: str, dataset_type: str) -> _EvalGraphTensor
         )
 
     dot_src = Path(path).read_text()
-    dot = pydot.graph_from_dot_data(dot_src)[0]
+    # Signed-id datasets may contain bare negative node IDs (e.g. -123).
+    # pydot expects quoted negatives, so sanitize first.
+    dot_src = _BARE_NEGATIVE_INT_RE.sub(r'"-\1"', dot_src)
+    parsed = pydot.graph_from_dot_data(dot_src)
+    if not parsed:
+        raise ValueError(f"Failed to parse DOT graph: {path}")
+    dot = parsed[0]
     graph_nx = nx.nx_pydot.from_pydot(dot)
 
     nodes = list(graph_nx.nodes())
@@ -771,13 +773,15 @@ def _load_graph_tensors_no_pyg(path: str, dataset_type: str) -> _EvalGraphTensor
         node_features = node_bits.to(torch.float32)
         node_names = node_features.clone()
     elif dataset_type_norm == "HASHED":
-        rows: list[list[int]] = []
-        for node in nodes:
-            parsed = _parse_numeric_node_label_eval(node)
-            hi, lo = _split_uint64_eval(parsed, context=f"Node '{node}'")
-            rows.append([hi, lo])
-        node_features = torch.tensor(rows, dtype=torch.int64)
-        node_names = node_features.clone()
+        raw_ids = [
+            _validate_int64_range_eval(
+                _parse_numeric_node_label_eval(node),
+                context=f"Node '{node}'",
+            )
+            for node in nodes
+        ]
+        node_names = torch.tensor(raw_ids, dtype=torch.int64)
+        node_features = node_names.view(-1, 1).to(torch.int64)
     else:
         raw_ids = [_parse_numeric_node_label_eval(node) for node in nodes]
         for node, raw_id in zip(nodes, raw_ids):
@@ -1039,19 +1043,32 @@ def _run_onnx_single_frontier(
     node_feature_dtype, node_feature_np_dtype = _node_feature_dtypes_for_dataset(
         dataset_type
     )
+    dataset_type_norm = str(dataset_type).upper()
+    node_features_np = (
+        sample["node_features"]
+        .detach()
+        .cpu()
+        .to(node_feature_dtype)
+        .numpy()
+        .astype(node_feature_np_dtype)
+    )
+    if dataset_type_norm == "HASHED":
+        node_features_np = node_features_np.reshape(-1)
+
     base_onnx_inputs = {
-        "node_features": (
-            sample["node_features"]
-            .detach()
-            .cpu()
-            .to(node_feature_dtype)
-            .numpy()
-            .astype(node_feature_np_dtype)
-        ),
+        "node_features": node_features_np,
         "edge_index": (
             sample["edge_index"].detach().cpu().to(torch.int64).numpy().astype("int64")
         ),
-        "edge_attr": sample["edge_attr"].detach().cpu().to(torch.int64).numpy().astype("int64"),
+        "edge_attr": (
+            sample["edge_attr"]
+            .detach()
+            .cpu()
+            .to(torch.int64)
+            .reshape(-1)
+            .numpy()
+            .astype("int64")
+        ),
         "membership": (
             sample["membership"].detach().cpu().to(torch.int64).numpy().astype("int64")
         ),
@@ -1074,7 +1091,7 @@ def _run_onnx_single_frontier(
         else:
             goal_batch = goal_batch.to(torch.int64)
 
-        base_onnx_inputs["goal_node_features"] = (
+        goal_node_features_np = (
             sample["goal_node_features"]
             .detach()
             .cpu()
@@ -1082,11 +1099,20 @@ def _run_onnx_single_frontier(
             .numpy()
             .astype(node_feature_np_dtype)
         )
+        if dataset_type_norm == "HASHED":
+            goal_node_features_np = goal_node_features_np.reshape(-1)
+        base_onnx_inputs["goal_node_features"] = goal_node_features_np
         base_onnx_inputs["goal_edge_index"] = (
             sample["goal_edge_index"].detach().cpu().to(torch.int64).numpy().astype("int64")
         )
         base_onnx_inputs["goal_edge_attr"] = (
-            sample["goal_edge_attr"].detach().cpu().to(torch.int64).numpy().astype("int64")
+            sample["goal_edge_attr"]
+            .detach()
+            .cpu()
+            .to(torch.int64)
+            .reshape(-1)
+            .numpy()
+            .astype("int64")
         )
         base_onnx_inputs["goal_batch"] = (
             goal_batch.detach().cpu().to(torch.int64).numpy().astype("int64")
@@ -1094,10 +1120,10 @@ def _run_onnx_single_frontier(
 
     def _mask_numpy(mask_len: int, valid_len: int):
         valid = max(0, min(int(mask_len), int(valid_len)))
-        out = torch.zeros((int(mask_len),), dtype=torch.bool)
+        out = torch.zeros((int(mask_len),), dtype=torch.uint8)
         if valid > 0:
-            out[:valid] = True
-        return out.numpy().astype("bool")
+            out[:valid] = 1
+        return out.numpy().astype("uint8")
 
     mask_attempts = []
     if onnx_ctx.static_onnx_len is not None and int(onnx_ctx.static_onnx_len) > 0:
@@ -1176,6 +1202,7 @@ def _run_single_sample_pytorch_and_onnx(
     node_feature_dtype, node_feature_np_dtype = _node_feature_dtypes_for_dataset(
         trainer.model.dataset_type
     )
+    dataset_type_norm = str(trainer.model.dataset_type).upper()
     node_features = sample["node_features"].to(node_feature_dtype)
     edge_index = sample["edge_index"].to(torch.int64)
     edge_attr = sample["edge_attr"].to(torch.int64)
@@ -1229,15 +1256,18 @@ def _run_single_sample_pytorch_and_onnx(
 
     def _mask_numpy(mask_len: int, valid_len: int):
         valid = max(0, min(int(mask_len), int(valid_len)))
-        out = torch.zeros((int(mask_len),), dtype=torch.bool)
+        out = torch.zeros((int(mask_len),), dtype=torch.uint8)
         if valid > 0:
-            out[:valid] = True
-        return out.numpy().astype("bool")
+            out[:valid] = 1
+        return out.numpy().astype("uint8")
 
+    node_features_np = node_features.detach().cpu().numpy().astype(node_feature_np_dtype)
+    if dataset_type_norm == "HASHED":
+        node_features_np = node_features_np.reshape(-1)
     base_onnx_inputs = {
-        "node_features": node_features.detach().cpu().numpy().astype(node_feature_np_dtype),
+        "node_features": node_features_np,
         "edge_index": edge_index.detach().cpu().numpy().astype("int64"),
-        "edge_attr": edge_attr.detach().cpu().numpy().astype("int64"),
+        "edge_attr": edge_attr.detach().cpu().reshape(-1).numpy().astype("int64"),
         "membership": membership.detach().cpu().numpy().astype("int64"),
     }
     if onnx_ctx.use_goal_inputs:
@@ -1249,7 +1279,7 @@ def _run_single_sample_pytorch_and_onnx(
             )
         else:
             goal_batch = goal_batch.to(torch.int64)
-        base_onnx_inputs["goal_node_features"] = (
+        goal_node_features_np = (
             sample["goal_node_features"]
             .detach()
             .cpu()
@@ -1257,11 +1287,20 @@ def _run_single_sample_pytorch_and_onnx(
             .numpy()
             .astype(node_feature_np_dtype)
         )
+        if dataset_type_norm == "HASHED":
+            goal_node_features_np = goal_node_features_np.reshape(-1)
+        base_onnx_inputs["goal_node_features"] = goal_node_features_np
         base_onnx_inputs["goal_edge_index"] = (
             sample["goal_edge_index"].detach().cpu().numpy().astype("int64")
         )
         base_onnx_inputs["goal_edge_attr"] = (
-            sample["goal_edge_attr"].detach().cpu().numpy().astype("int64")
+            sample["goal_edge_attr"]
+            .detach()
+            .cpu()
+            .to(torch.int64)
+            .reshape(-1)
+            .numpy()
+            .astype("int64")
         )
         base_onnx_inputs["goal_batch"] = goal_batch.detach().cpu().numpy().astype("int64")
 
@@ -2021,8 +2060,6 @@ def main(args):
                 fh,
                 indent=2,
             )
-        with (model_root / "history_losses.json").open("w", encoding="utf-8") as fh:
-            json.dump(history, fh, indent=2)
 
         if best_eval_epoch is None:
             trainer.save_model(

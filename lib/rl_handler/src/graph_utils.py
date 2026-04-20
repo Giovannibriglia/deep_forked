@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import networkx as nx
 import pydot
+import re
 import torch
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,13 +18,10 @@ VALID_DATASET_TYPES = {
     DATASET_TYPE_MAPPED,
     DATASET_TYPE_BITMASK,
 }
-TWO_64_MINUS_1 = float(2**64 - 1)
-U64_MAX = (1 << 64) - 1
 I64_MIN = -(1 << 63)
 I64_MAX = (1 << 63) - 1
-U64_CHUNK_BITS = 32
-U64_CHUNK_BASE = 1 << U64_CHUNK_BITS
-U64_CHUNK_MASK = U64_CHUNK_BASE - 1
+
+_BARE_NEGATIVE_INT_RE = re.compile(r'(?<!["\w])-([0-9]+)(?!["\w])')
 
 
 @dataclass
@@ -39,7 +37,13 @@ class CombinedFrontierGraph:
 
 def _load_dot(path: Path) -> nx.DiGraph:
     src = path.read_text()
-    dot = pydot.graph_from_dot_data(src)[0]
+    # New signed-id datasets may contain bare negative node IDs (e.g. -123).
+    # pydot requires quoted negatives, so sanitize before parsing.
+    src = _BARE_NEGATIVE_INT_RE.sub(r'"-\1"', src)
+    parsed = pydot.graph_from_dot_data(src)
+    if not parsed:
+        raise ValueError(f"Failed to parse DOT graph: {path}")
+    dot = parsed[0]
     return nx.nx_pydot.from_pydot(dot)
 
 
@@ -81,12 +85,10 @@ def _parse_numeric_node_label(node_obj: object) -> int:
     raise TypeError(f"Unsupported node label type: {type(node_obj)}")
 
 
-def _split_uint64(value: int, *, context: str) -> tuple[int, int]:
-    if value < 0 or value > U64_MAX:
-        raise ValueError(f"{context} is out of uint64 range [0, {U64_MAX}].")
-    hi = value >> U64_CHUNK_BITS
-    lo = value & U64_CHUNK_MASK
-    return int(hi), int(lo)
+def _validate_int64_range(value: int, *, context: str) -> int:
+    if value < I64_MIN or value > I64_MAX:
+        raise ValueError(f"{context} is out of int64 range [{I64_MIN}, {I64_MAX}].")
+    return int(value)
 
 
 def _nx_to_pyg(G: nx.DiGraph, dataset_type: str) -> Data:
@@ -138,14 +140,15 @@ def _nx_to_pyg(G: nx.DiGraph, dataset_type: str) -> Data:
         data.node_features = data.node_bits.to(torch.float32)
     else:
         if dataset_type == DATASET_TYPE_HASHED:
-            rows: list[list[int]] = []
-            for node in G.nodes():
-                parsed = _parse_numeric_node_label(node)
-                hi, lo = _split_uint64(parsed, context=f"Node '{node}'")
-                rows.append([hi, lo])
-            node_chunks = torch.tensor(rows, dtype=torch.int64)
-            data.node_names = node_chunks.clone()
-            data.node_features = node_chunks
+            raw_ids = [
+                _validate_int64_range(
+                    _parse_numeric_node_label(node),
+                    context=f"Node '{node}'",
+                )
+                for node in G.nodes()
+            ]
+            data.node_names = torch.tensor(raw_ids, dtype=torch.int64)
+            data.node_features = data.node_names.view(-1, 1).to(torch.int64)
         elif dataset_type == DATASET_TYPE_MAPPED:
             raw_ids = [_parse_numeric_node_label(n) for n in G.nodes()]
             for node, raw_id in zip(G.nodes(), raw_ids):
