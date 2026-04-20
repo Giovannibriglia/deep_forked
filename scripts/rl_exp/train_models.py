@@ -28,6 +28,7 @@ def run_training(
     failure_reward_value,
     build_data,
     build_eval_data,
+    evaluate,
 ):
     if not os.path.isdir(training_data_folder):
         print(f"[ERROR] Missing training folder: {training_data_folder}")
@@ -66,6 +67,8 @@ def run_training(
         str(n_max_dataset_queries),
         "--build-eval-data",
         str(bool(build_eval_data)).lower(),
+        "--evaluate",
+        str(bool(evaluate)).lower(),
         "--lr",
         str(lr),
         "--weight-decay",
@@ -131,10 +134,18 @@ def main():
     parser.add_argument(
         "--build-eval-data",
         choices=["true", "false"],
-        default="true",
+        default="false",
         help=(
             "Whether to rebuild ONNX-eval query definitions "
             "(train/test x random/fifo/stress) before evaluation."
+        ),
+    )
+    parser.add_argument(
+        "--evaluate",
+        choices=["true", "false"],
+        default="false",
+        help=(
+            "If evaluation data are present, perform (train/test) x (random/fifo/stress) evaluation."
         ),
     )
     args = parser.parse_args()
@@ -161,6 +172,7 @@ def main():
                 args.failure_reward_value,
                 args.build_data.lower() == "true",
                 args.build_eval_data.lower() == "true",
+                args.evaluate.lower() == "true",
             )
             for folder in folders
         ]

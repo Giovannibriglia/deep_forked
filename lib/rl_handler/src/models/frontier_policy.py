@@ -21,10 +21,10 @@ VALID_DATASET_TYPES = {
     DATASET_TYPE_MAPPED,
     DATASET_TYPE_BITMASK,
 }
-TWO_64_MINUS_1 = float(2**64 - 1)
-U64_CHUNK_BITS = 32
-U64_CHUNK_BASE = 1 << U64_CHUNK_BITS
-U64_CHUNK_MASK = U64_CHUNK_BASE - 1
+I64_MIN = -(1 << 63)
+I64_MAX = (1 << 63) - 1
+I64_ABS_MIN_FLOAT = float(1 << 63)
+I64_MAX_FLOAT = float(I64_MAX)
 
 
 def _build_mlp(in_dim: int, hidden_dim: int, depth: int, out_dim: int) -> nn.Sequential:
@@ -100,34 +100,35 @@ class GNNEncoder(nn.Module):
 
     def _prepare_node_features(self, node_features: torch.Tensor) -> torch.Tensor:
         is_tracing = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing()
-        x = node_features.to(torch.float32)
+        x = node_features
         if x.dim() == 1:
             x = x.view(-1, 1)
 
         if self.dataset_type == DATASET_TYPE_HASHED:
-            if x.size(-1) == 2:
-                # Unsigned-safe encoding: node id = hi32 * 2^32 + lo32.
-                hi = x[:, 0].to(torch.float64)
-                lo = x[:, 1].to(torch.float64)
-                if not is_tracing:
-                    if bool((hi < 0).any().item()) or bool((lo < 0).any().item()):
-                        raise ValueError("HASHED hi32/lo32 chunks must be non-negative.")
-                    if bool((hi > float(U64_CHUNK_MASK)).any().item()) or bool(
-                        (lo > float(U64_CHUNK_MASK)).any().item()
-                    ):
-                        raise ValueError("HASHED hi32/lo32 chunk out of uint32 range.")
-                unsigned_vals = hi * float(U64_CHUNK_BASE) + lo
-                x = (unsigned_vals / TWO_64_MINUS_1).to(torch.float32).view(-1, 1)
-            elif x.size(-1) == 1:
-                # Legacy scalar path (kept for backward compatibility).
-                needs_scaling = torch.logical_or(torch.amin(x) < 0.0, torch.amax(x) > 1.0)
-                x = torch.where(needs_scaling, x / TWO_64_MINUS_1, x).clamp(0.0, 1.0)
-            else:
+            if (not is_tracing) and x.size(-1) != 1:
                 raise ValueError(
-                    f"HASHED dataset expects node feature width 1 or 2, got {x.size(-1)}."
+                    "HASHED dataset expects scalar signed int64 IDs with shape "
+                    f"[N] or [N, 1], got {tuple(x.shape)}."
                 )
+            raw = x[:, 0].to(torch.float64)
+            if not is_tracing:
+                if bool((raw < float(I64_MIN)).any().item()) or bool(
+                    (raw > float(I64_MAX)).any().item()
+                ):
+                    raise ValueError(
+                        f"HASHED scalar IDs must be in int64 range [{I64_MIN}, {I64_MAX}]."
+                    )
+
+            # Signed-aware normalization in-model (kept inside ONNX at export time):
+            # [-2^63, -1] -> [-1, 0), [0, 2^63-1] -> [0, 1].
+            x = torch.where(
+                raw >= 0.0,
+                raw / I64_MAX_FLOAT,
+                raw / I64_ABS_MIN_FLOAT,
+            ).to(torch.float32).view(-1, 1)
+            x = x.clamp(-1.0, 1.0)
         elif self.dataset_type in {DATASET_TYPE_MAPPED, DATASET_TYPE_BITMASK}:
-            pass
+            x = x.to(torch.float32)
         else:
             raise ValueError(f"Unsupported dataset_type: {self.dataset_type}")
 
@@ -184,22 +185,9 @@ class GNNEncoder(nn.Module):
             return torch.zeros((0,), dtype=torch.long, device=device)
 
         if self.dataset_type == DATASET_TYPE_HASHED:
-            if x.size(-1) == 2:
-                hi = x[:, 0].to(device=device, dtype=torch.long)
-                lo = x[:, 1].to(device=device, dtype=torch.long)
-                if (not is_tracing) and (
-                    bool((hi < 0).any().item()) or bool((lo < 0).any().item())
-                ):
-                    raise ValueError("HASHED hi32/lo32 chunks must be non-negative.")
-                mod = int(self.num_node_labels)
-                base_mod = int(U64_CHUNK_BASE % mod)
-                hi_mod = torch.remainder(hi, mod)
-                lo_mod = torch.remainder(lo, mod)
-                label_ids = torch.remainder(hi_mod * base_mod + lo_mod, mod)
-                return label_ids.view(-1)
             if (not is_tracing) and x.size(-1) != 1:
                 raise ValueError(
-                    f"HASHED dataset expects scalar IDs or hi32/lo32 chunks, got shape {tuple(x.shape)}."
+                    f"HASHED dataset expects scalar signed int64 IDs, got shape {tuple(x.shape)}."
                 )
             raw = x[:, 0].to(device=device, dtype=torch.long)
             return torch.remainder(raw, self.num_node_labels).view(-1)

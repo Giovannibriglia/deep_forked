@@ -19,7 +19,7 @@ from src.data import (
     group_clean_frontiers,
     normalize_distance_to_reward,
 )
-from src.graph_utils import TWO_64_MINUS_1, load_pyg_graph
+from src.graph_utils import load_pyg_graph
 from src.models.frontier_policy import FrontierPolicyNetwork
 from src.trainer import RLFrontierTrainer
 
@@ -224,7 +224,7 @@ class TestDatasetTypeAndRewardTargets(unittest.TestCase):
     def test_hashed_node_ids_are_normalized_in_model(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             dot_path = Path(td) / "hashed.dot"
-            raw_ids = [0, 2**64 - 1]
+            raw_ids = [-(2**63), -1, 0, (2**63) - 1]
             _write_dot(
                 dot_path,
                 nodes=[str(x) for x in raw_ids],
@@ -232,14 +232,8 @@ class TestDatasetTypeAndRewardTargets(unittest.TestCase):
             )
             graph = load_pyg_graph(dot_path.as_posix(), dataset_type="HASHED")
 
-            # Graph loader keeps unsigned-safe hi32/lo32 chunks.
-            expected_chunks = torch.tensor(
-                [
-                    [0, 0],
-                    [2**32 - 1, 2**32 - 1],
-                ],
-                dtype=torch.int64,
-            )
+            # Graph loader keeps scalar signed int64 node IDs.
+            expected_chunks = torch.tensor(raw_ids, dtype=torch.int64).view(-1, 1)
             self.assertTrue(
                 torch.equal(graph.node_features, expected_chunks)
             )
@@ -253,16 +247,21 @@ class TestDatasetTypeAndRewardTargets(unittest.TestCase):
                 dataset_type="HASHED",
             )
             normalized = model.encoder._prepare_node_features(graph.node_features)
-            expected = torch.tensor(raw_ids, dtype=torch.float32).view(-1, 1) / TWO_64_MINUS_1
+            raw_ids_f64 = torch.tensor(raw_ids, dtype=torch.float64)
+            expected = torch.where(
+                raw_ids_f64 >= 0.0,
+                raw_ids_f64 / float((1 << 63) - 1),
+                raw_ids_f64 / float(1 << 63),
+            ).to(torch.float32).view(-1, 1)
             self.assertTrue(torch.allclose(normalized, expected, atol=1e-6))
             label_ids = model.encoder._node_label_ids(
                 graph.node_features,
                 device=torch.device("cpu"),
             )
-            expected_label_ids = torch.tensor(
-                [rid % model.encoder.num_node_labels for rid in raw_ids],
-                dtype=torch.long,
-            )
+            expected_label_ids = torch.remainder(
+                torch.tensor(raw_ids, dtype=torch.long),
+                int(model.encoder.num_node_labels),
+            ).to(torch.long)
             self.assertTrue(torch.equal(label_ids, expected_label_ids))
 
     def test_trainer_uses_reward_target_as_optimization_signal(self) -> None:

@@ -962,25 +962,36 @@ class RLFrontierTrainer:
         n_candidates = 32
         n_nodes, n_edges = max(8, n_candidates), 12
         dataset_type = str(self.model.dataset_type).upper()
-        raw_node_input_dim = 2 if dataset_type == "HASHED" else int(node_input_dim)
+        raw_node_input_dim = int(node_input_dim)
         node_tensor_dtype = (
             torch.float32
             if dataset_type == "BITMASK"
             else torch.int64
         )
+        if dataset_type == "HASHED":
+            node_features_dummy = torch.zeros((n_nodes,), dtype=torch.int64)
+        else:
+            node_features_dummy = torch.zeros((n_nodes, raw_node_input_dim), dtype=node_tensor_dtype)
         if self.kind_of_data == "separated" and self.model.use_goal_separate_input:
             wrapper = OnnxFrontierPolicySeparatedWrapper(self.model).eval().cpu()
             n_goal_nodes, n_goal_edges = 6, 8
+            if dataset_type == "HASHED":
+                goal_node_features_dummy = torch.zeros((n_goal_nodes,), dtype=torch.int64)
+            else:
+                goal_node_features_dummy = torch.zeros(
+                    (n_goal_nodes, raw_node_input_dim),
+                    dtype=node_tensor_dtype,
+                )
             dummy_inputs = (
-                torch.zeros((n_nodes, raw_node_input_dim), dtype=node_tensor_dtype),
+                node_features_dummy,
                 torch.zeros((2, n_edges), dtype=torch.int64),
                 torch.zeros((n_edges,), dtype=torch.int64),
                 torch.arange(n_nodes, dtype=torch.int64) % n_candidates,
-                torch.zeros((n_goal_nodes, raw_node_input_dim), dtype=node_tensor_dtype),
+                goal_node_features_dummy,
                 torch.zeros((2, n_goal_edges), dtype=torch.int64),
                 torch.zeros((n_goal_edges,), dtype=torch.int64),
                 torch.zeros((n_goal_nodes,), dtype=torch.int64),
-                torch.ones((n_candidates,), dtype=torch.bool),
+                torch.ones((n_candidates,), dtype=torch.uint8),
             )
             input_names = [
                 "node_features",
@@ -1008,11 +1019,11 @@ class RLFrontierTrainer:
         else:
             wrapper = OnnxFrontierPolicyWrapper(self.model).eval().cpu()
             dummy_inputs = (
-                torch.zeros((n_nodes, raw_node_input_dim), dtype=node_tensor_dtype),
+                node_features_dummy,
                 torch.zeros((2, n_edges), dtype=torch.int64),
                 torch.zeros((n_edges,), dtype=torch.int64),
                 torch.arange(n_nodes, dtype=torch.int64) % n_candidates,
-                torch.ones((n_candidates,), dtype=torch.bool),
+                torch.ones((n_candidates,), dtype=torch.uint8),
             )
             input_names = [
                 "node_features",
