@@ -954,12 +954,19 @@ class RLFrontierTrainer:
         model.eval()
         return model
 
-    def to_onnx(self, out_path: str | Path, node_input_dim: int) -> None:
+    def to_onnx(
+        self,
+        out_path: str | Path,
+        node_input_dim: int,
+        onnx_frontier_size: int = 32,
+    ) -> None:
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         # ONNX tracing may specialize pooling/scatter dimensions to the traced
         # candidate range; keep this comfortably above common frontier sizes.
-        n_candidates = 32
+        n_candidates = int(onnx_frontier_size)
+        if n_candidates <= 0:
+            raise ValueError("onnx_frontier_size must be > 0.")
         n_nodes, n_edges = max(8, n_candidates), 12
         dataset_type = str(self.model.dataset_type).upper()
         raw_node_input_dim = int(node_input_dim)

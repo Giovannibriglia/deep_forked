@@ -196,6 +196,12 @@ def parse_args():
     parser.add_argument("--train", type=str2bool, default=True)
     parser.add_argument("--evaluate", type=str2bool, default=False)
     parser.add_argument("--export-onnx", type=str2bool, default=True)
+    parser.add_argument(
+        "--onnx-frontier-size",
+        type=int,
+        default=32,
+        help="Frontier size used for ONNX export tracing.",
+    )
 
     return parser.parse_args()
 
@@ -1993,7 +1999,11 @@ def main(args):
             )
             if should_eval:
                 eval_step += 1
-                trainer.to_onnx(onnx_path, node_input_dim=node_input_dim)
+                trainer.to_onnx(
+                    onnx_path,
+                    node_input_dim=node_input_dim,
+                    onnx_frontier_size=int(args.onnx_frontier_size),
+                )
                 step_summary_path = (
                     eval_step_reports_dir / f"step_{eval_step:04d}_epoch_{epoch + 1:04d}.json"
                 )
@@ -2129,7 +2139,11 @@ def main(args):
 
     must_export_onnx = bool(args.export_onnx) or bool(args.evaluate)
     if must_export_onnx:
-        trainer.to_onnx(onnx_path, node_input_dim=node_input_dim)
+        trainer.to_onnx(
+            onnx_path,
+            node_input_dim=node_input_dim,
+            onnx_frontier_size=int(args.onnx_frontier_size),
+        )
 
     final_eval_metrics: Dict[str, Dict[str, Any]] = {}
     if bool(args.evaluate):

@@ -22,6 +22,7 @@ def run_training(
     edge_label_buckets,
     max_regular_distance_for_reward,
     n_max_dataset_queries,
+    onnx_frontier_size,
     lr,
     weight_decay,
     max_grad_norm,
@@ -68,6 +69,8 @@ def run_training(
         str(max_regular_distance_for_reward),
         "--n-max-dataset-queries",
         str(n_max_dataset_queries),
+        "--onnx-frontier-size",
+        str(onnx_frontier_size),
         "--build-eval-data",
         str(bool(build_eval_data)).lower(),
         "--evaluate",
@@ -134,6 +137,12 @@ def main():
         default=1000,
         help="Max generated ONNX-eval queries per dataset for random/fifo/stress.",
     )
+    parser.add_argument(
+        "--onnx-frontier-size",
+        type=int,
+        default=32,
+        help="Frontier size used for ONNX export tracing.",
+    )
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--failure-reward-value", type=float, default=-1.0)
@@ -180,6 +189,7 @@ def main():
                 args.edge_label_buckets,
                 args.max_regular_distance_for_reward,
                 args.n_max_dataset_queries,
+                args.onnx_frontier_size,
                 args.lr,
                 args.weight_decay,
                 args.max_grad_norm,
