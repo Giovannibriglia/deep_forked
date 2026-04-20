@@ -19,6 +19,7 @@ def run_training(
     training_data_folder,
     no_goal,
     dataset_type,
+    edge_label_buckets,
     max_regular_distance_for_reward,
     n_max_dataset_queries,
     lr,
@@ -57,6 +58,8 @@ def run_training(
         model_dir,
         "--dataset_type",
         dataset_type,
+        "--K",
+        str(edge_label_buckets),
         "--build-data",
         str(bool(build_data)).lower(),
         "--failure-reward-value",
@@ -113,6 +116,17 @@ def main():
     parser.add_argument("batch_root")
     parser.add_argument("--no_goal", action="store_true")
     parser.add_argument("--dataset_type", choices=["MAPPED", "HASHED", "BITMASK"], default="HASHED")
+    parser.add_argument(
+        "--K",
+        "--edge-label-buckets",
+        dest="edge_label_buckets",
+        type=int,
+        default=256,
+        help=(
+            "Fixed number of edge-label buckets (K) passed to RL model "
+            "edge embeddings."
+        ),
+    )
     parser.add_argument("--max-regular-distance-for-reward", type=float, default=50.0)
     parser.add_argument(
         "--n-max-dataset-queries",
@@ -163,6 +177,7 @@ def main():
                 folder,
                 args.no_goal,
                 args.dataset_type,
+                args.edge_label_buckets,
                 args.max_regular_distance_for_reward,
                 args.n_max_dataset_queries,
                 args.lr,

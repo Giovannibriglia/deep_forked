@@ -157,19 +157,15 @@ class GNNEncoder(nn.Module):
         raw_ids = edge_attr.reshape(-1)
         edge_ids = raw_ids.to(device=device, dtype=torch.long)
 
-        # Avoid tracer warnings during ONNX export caused by Python scalar extraction.
-        if torch.onnx.is_in_onnx_export() or torch.jit.is_tracing():
-            return edge_ids
-
-        min_id = int(edge_ids.min().item())
-        max_id = int(edge_ids.max().item())
-        if min_id < 0:
-            raise ValueError(f"edge label IDs must be >= 0, got min {min_id}.")
-        if max_id >= self.num_edge_labels:
-            raise ValueError(
-                f"edge label ID {max_id} out of range for num_edge_labels={self.num_edge_labels}."
-            )
-        return edge_ids
+        # Deterministic OOV-safe bucketing applied in-model (and therefore exported to ONNX):
+        # bucket = abs(edge_id) % K.
+        min_i64 = torch.iinfo(torch.long).min
+        safe_edge_ids = torch.where(
+            edge_ids == min_i64,
+            torch.zeros_like(edge_ids),
+            edge_ids,
+        )
+        return torch.remainder(torch.abs(safe_edge_ids), self.num_edge_labels)
 
     def _node_label_ids(
         self,

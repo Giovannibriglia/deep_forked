@@ -165,6 +165,17 @@ def parse_args():
     parser.add_argument("--conv-type", choices=["gine", "rgcn", "gcn"], default="gine")
     parser.add_argument("--pooling-type", choices=["mean", "sum", "max"], default="mean")
     parser.add_argument("--edge-emb-dim", type=int, default=32)
+    parser.add_argument(
+        "--K",
+        "--edge-label-buckets",
+        dest="edge_label_buckets",
+        type=int,
+        default=256,
+        help=(
+            "Fixed number of edge-label buckets (K) used by the model "
+            "edge embedding table."
+        ),
+    )
     parser.add_argument("--num-node-labels", type=int, default=4096)
     parser.add_argument("--use-global-context", type=str2bool, default=True)
     parser.add_argument("--mlp-depth", type=int, default=2)
@@ -1843,7 +1854,25 @@ def main(args):
     dataset_type_norm = str(args.dataset_type).upper()
     node_input_dim = 1 if dataset_type_norm == "HASHED" else int(train_samples[0]["node_features"].size(1))
     use_goal_separate_input = args.kind_of_data == "separated"
-    num_edge_labels = _infer_num_edge_labels(train_samples)
+    inferred_num_edge_labels = _infer_num_edge_labels(train_samples)
+    num_edge_labels = int(args.edge_label_buckets)
+    if num_edge_labels <= 0:
+        raise ValueError("--K/--edge-label-buckets must be > 0.")
+
+    print(
+        "[model] edge labels | inferred_train="
+        f"{inferred_num_edge_labels} | K={num_edge_labels}"
+    )
+    print(
+        "[model] edge-id bucketing: bucket = abs(edge_id) % K "
+        "(applied in-model and exported to ONNX)."
+    )
+    if (not bool(args.train)):
+        print(
+            "[warning] --train is false: --K/--edge-label-buckets only affects "
+            "newly trained checkpoints/exports. Existing checkpoints keep "
+            "their saved architecture."
+        )
 
     model = FrontierPolicyNetwork(
         node_input_dim=node_input_dim,
@@ -2195,6 +2224,9 @@ def main(args):
     with (model_root / f"{args.model_name}_info.txt").open("w", encoding="utf-8") as fh:
         for key, value in vars(args).items():
             fh.write(f"{key} = {value}\n")
+        fh.write(f"inferred_num_edge_labels = {inferred_num_edge_labels}\n")
+        fh.write(f"effective_num_edge_labels = {num_edge_labels}\n")
+        fh.write("edge_id_bucket_mapping = abs(edge_id) % effective_num_edge_labels\n")
         fh.write(f"samples_train_path = {sample_paths['train']}\n")
         fh.write(f"samples_params_path = {sample_paths['params']}\n")
         fh.write(f"query_bundle_path = {query_bundle_path.as_posix() if query_bundle_path else ''}\n")

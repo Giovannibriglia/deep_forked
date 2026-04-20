@@ -264,6 +264,31 @@ class TestDatasetTypeAndRewardTargets(unittest.TestCase):
             ).to(torch.long)
             self.assertTrue(torch.equal(label_ids, expected_label_ids))
 
+    def test_edge_label_ids_are_bucketed_with_abs_mod_k(self) -> None:
+        model = FrontierPolicyNetwork(
+            node_input_dim=1,
+            hidden_dim=8,
+            gnn_layers=1,
+            conv_type="gcn",
+            pooling_type="mean",
+            dataset_type="MAPPED",
+            num_edge_labels=8,
+        )
+        i64_min = torch.iinfo(torch.long).min
+        raw_edge_ids = torch.tensor(
+            [[-9], [0], [1], [8], [14], [-14], [i64_min]],
+            dtype=torch.int64,
+        )
+        bucketed = model.encoder._edge_label_ids(
+            raw_edge_ids,
+            device=torch.device("cpu"),
+        )
+        expected = torch.tensor([1, 0, 1, 0, 6, 6, 0], dtype=torch.long)
+        self.assertTrue(torch.equal(bucketed, expected))
+        self.assertTrue(
+            bool(((bucketed >= 0) & (bucketed < model.encoder.num_edge_labels)).all().item())
+        )
+
     def test_trainer_uses_reward_target_as_optimization_signal(self) -> None:
         model = _ConstantLogitModel([0.0, 0.0])
         trainer = RLFrontierTrainer(model=model, device="cpu")
