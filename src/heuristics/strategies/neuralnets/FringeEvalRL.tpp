@@ -91,30 +91,51 @@ void FringeEvalRL<StateRepr>::initialize_onnx_model() {
 
     // The exported RL ONNX currently emits fixed-size logits [F] where F is
     // the export-time frontier size (normally 32). Keep runtime config aligned.
-    if (!m_output_names.empty()) {
-      auto output_info =
-          m_session->GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo();
-      const auto output_shape = output_info.GetShape();
-      if (!output_shape.empty() && output_shape[0] > 0) {
-        const auto model_frontier_size = static_cast<size_t>(output_shape[0]);
-        const auto configured_frontier_size = static_cast<size_t>(
-            ArgumentParser::get_instance().get_RL_fringe_size());
-        if (model_frontier_size != configured_frontier_size) {
-          ExitHandler::exit_with_message(
-              ExitHandler::ExitCode::FringeEvalModelLoadError,
-              "RL fringe size mismatch: ONNX logits length is " +
-                  std::to_string(model_frontier_size) +
-                  " but --RL_fringe_size is " +
-                  std::to_string(configured_frontier_size) + ".");
-        }
+      if (!m_output_names.empty()) {
+          auto output_type_info = m_session->GetOutputTypeInfo(0);
+
+          if (output_type_info.GetONNXType() != ONNXType::ONNX_TYPE_TENSOR) {
+              ExitHandler::exit_with_message(
+                  ExitHandler::ExitCode::FringeEvalModelLoadError,
+                  "ONNX output 0 is not a tensor.");
+          }
+
+          auto output_info = output_type_info.GetTensorTypeAndShapeInfo();
+          auto output_shape = output_info.GetShape();
+
+          if (output_shape.empty()) {
+              ExitHandler::exit_with_message(
+                  ExitHandler::ExitCode::FringeEvalModelLoadError,
+                  "ONNX output 0 has empty shape.");
+          }
+
+          // Use the last dim if your model exports [1, F], or the only dim if it exports [F].
+          int64_t frontier_dim = output_shape.back();
+          if (frontier_dim <= 0) {
+              ExitHandler::exit_with_message(
+                  ExitHandler::ExitCode::FringeEvalModelLoadError,
+                  "ONNX output 0 has invalid/dynamic frontier dimension.");
+          }
+
+          const auto model_frontier_size = static_cast<size_t>(frontier_dim);
+          const auto configured_frontier_size = static_cast<size_t>(
+              ArgumentParser::get_instance().get_RL_fringe_size());
+
+          if (model_frontier_size != configured_frontier_size) {
+              ExitHandler::exit_with_message(
+                  ExitHandler::ExitCode::FringeEvalModelLoadError,
+                  "RL fringe size mismatch: ONNX logits length is " +
+                      std::to_string(model_frontier_size) +
+                      " but --RL_fringe_size is " +
+                      std::to_string(configured_frontier_size) + ".");
+          }
       }
-    }
 
     m_model_loaded = true;
   } catch (const std::exception &e) {
     ExitHandler::exit_with_message(
         ExitHandler::ExitCode::FringeEvalModelLoadError,
-        std::string("Failed to load ONNX model: ") + e.what());
+        std::string("Failed to create ONNX model: ") + e.what());
   }
 
   if (ArgumentParser::get_instance().get_verbose()) {
@@ -413,9 +434,8 @@ std::vector<float> FringeEvalRL<StateRepr>::get_score(
   // Get the result
   const float *output_data = output_tensors[0].GetTensorData<float>();
   const auto output_info = output_tensors[0].GetTensorTypeAndShapeInfo();
-  const size_t num_elements = output_info.GetElementCount();
 
-  return rankScores(output_data, num_elements);
+  return rankScores(output_data, states.size());
 }
 
 template <StateRepresentation StateRepr>
@@ -441,5 +461,13 @@ std::vector<float> FringeEvalRL<StateRepr>::rankScores(const float *scores,
     ranks[paired[i].second] = static_cast<float>(i);
   }
 
+#ifdef DEBUG
+    std::cout << "[";
+    for (size_t i = 0; i < n; ++i) {
+        std::cout << scores[i] << ", " << ranks[i];
+        if (i + 1 < n) std::cout << " -- ";
+    }
+    std::cout << "]\n";
+#endif
   return ranks;
 }

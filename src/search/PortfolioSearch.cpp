@@ -244,7 +244,7 @@ bool PortfolioSearch::run_portfolio_search() const {
                                 times[idx]);
 
     if (ArgumentParser::get_instance().get_results_info()) {
-      os << "\n" << config_snapshots[idx];
+      os << "\n\n" << config_snapshots[idx];
     }
     os << std::endl << std::endl;
     return true;
@@ -285,7 +285,7 @@ void PortfolioSearch::parse_configurations_from_file(
 void PortfolioSearch::set_default_configurations() {
   m_search_configurations.clear();
 
-  // Whatever is not set here will is kept from the user input.
+  /*// Whatever is not set here will is kept from the user input.
   m_search_configurations.push_back({{"search", "BFS"}});
   m_search_configurations.push_back(
       {{"search", "HFS"}, {"heuristics", "SUBGOALS"}});
@@ -297,7 +297,7 @@ void PortfolioSearch::set_default_configurations() {
       {{"search", "HFS"}, {"heuristics", "C_PG"}});
   m_search_configurations.push_back(
       {{"search", "Astar"}, {"heuristics", "GNN"}});
-  m_search_configurations.push_back({{"search", "IDFS"}});
+  m_search_configurations.push_back({{"search", "IDFS"}});*/
 
   // This is to test RL with the various other Heuristics
   m_search_configurations.push_back(

@@ -78,7 +78,7 @@ HeuristicsManager<StateRepr>::HeuristicsManager(
     ExitHandler::exit_with_message(
         ExitHandler::ExitCode::HeuristicsBadDeclaration,
         "Wrong Heuristic Selection in HeuristicsManager. Please check the "
-        "heuristic type.");
+        "heuristic type. (1)");
     break;
   }
 }
@@ -188,7 +188,7 @@ int HeuristicsManager<StateRepr>::get_heuristic_value(
     ExitHandler::exit_with_message(
         ExitHandler::ExitCode::HeuristicsBadDeclaration,
         "Wrong Heuristic Selection in HeuristicsManager. Please check the "
-        "heuristic type.");
+        "heuristic type. (2)");
     break;
   }
   }
@@ -262,11 +262,13 @@ std::string HeuristicsManager<StateRepr>::get_used_h_name() const noexcept {
     return "SubGoals";
   case Heuristics::GNN:
     return "GNN";
+      case Heuristics::RL_H:
+      return "RL_H";
   default: {
     ExitHandler::exit_with_message(
         ExitHandler::ExitCode::HeuristicsBadDeclaration,
         "Wrong Heuristic Selection in HeuristicsManager. Please check the "
-        "heuristic type.");
+        "heuristic type. (3)");
     // This line will never be reached, but added to avoid compiler warning.
     std::exit(static_cast<int>(ExitHandler::ExitCode::ExitForCompiler));
   }
