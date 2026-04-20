@@ -89,6 +89,26 @@ void FringeEvalRL<StateRepr>::initialize_onnx_model() {
     m_input_names = m_session->GetInputNames();
     m_output_names = m_session->GetOutputNames();
 
+    // The exported RL ONNX currently emits fixed-size logits [F] where F is
+    // the export-time frontier size (normally 32). Keep runtime config aligned.
+    if (!m_output_names.empty()) {
+      auto output_info = m_session->GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo();
+      const auto output_shape = output_info.GetShape();
+      if (!output_shape.empty() && output_shape[0] > 0) {
+        const auto model_frontier_size = static_cast<size_t>(output_shape[0]);
+        const auto configured_frontier_size =
+            static_cast<size_t>(ArgumentParser::get_instance().get_RL_fringe_size());
+        if (model_frontier_size != configured_frontier_size) {
+          ExitHandler::exit_with_message(
+              ExitHandler::ExitCode::FringeEvalModelLoadError,
+              "RL fringe size mismatch: ONNX logits length is " +
+                  std::to_string(model_frontier_size) +
+                  " but --RL_fringe_size is " +
+                  std::to_string(configured_frontier_size) + ".");
+        }
+      }
+    }
+
     m_model_loaded = true;
   } catch (const std::exception &e) {
     ExitHandler::exit_with_message(
@@ -294,7 +314,6 @@ std::vector<float> FringeEvalRL<StateRepr>::get_score(
   input_tensors.emplace_back(std::move(edge_attr_tensor));
   input_tensors.emplace_back(std::move(membership_tensor));
   // input_tensors.emplace_back(std::move(state_batch_tensor));
-  input_tensors.emplace_back(std::move(active_states_tensor));
 
   if (ArgumentParser::get_instance().get_dataset_separated()) {
     if (!m_goal_tensors_computed) {
@@ -356,6 +375,19 @@ std::vector<float> FringeEvalRL<StateRepr>::get_score(
     input_tensors.emplace_back(std::move(goal_edge_index_tensor));
     input_tensors.emplace_back(std::move(goal_edge_attr_tensor));
     input_tensors.emplace_back(std::move(goal_state_batch_tensor));
+  }
+
+  // Keep mask as the last input to match ONNX export order:
+  // node/edge/membership, optional goal_*, then mask.
+  input_tensors.emplace_back(std::move(active_states_tensor));
+
+  if (input_tensors.size() != m_input_names.size()) {
+    ExitHandler::exit_with_message(
+        ExitHandler::ExitCode::FringeEvalModelLoadError,
+        "ONNX input count mismatch: model expects " +
+            std::to_string(m_input_names.size()) + " input tensors but C++ "
+            "prepared " +
+            std::to_string(input_tensors.size()) + ".");
   }
 
   // Convert input/output names to const char* arrays
