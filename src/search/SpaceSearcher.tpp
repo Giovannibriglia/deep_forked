@@ -182,8 +182,7 @@ bool SpaceSearcher<StateRepr, Strategy>::search_sequential(
         (fringe_RL.size() >= static_cast<size_t>(RL_node_to_add) ||
          m_strategy.empty())) {
 #if DEBUG
-      ArgumentParser::get_instance().get_output_stream() << std::endl
-                                                         << std::endl;
+      ArgumentParser::get_instance().get_output_stream() << std::endl;
       HelperPrint::get_instance().print_list(act_list_fringe);
       ArgumentParser::get_instance().get_output_stream() << std::endl
                                                          << std::endl;
