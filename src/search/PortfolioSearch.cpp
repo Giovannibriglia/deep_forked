@@ -304,7 +304,8 @@ void PortfolioSearch::set_default_configurations() {
       {{"search", "RL"}, {"heuristics", "SUBGOALS"}});
   m_search_configurations.push_back({{"search", "RL"}, {"heuristics", "L_PG"}});
   m_search_configurations.push_back({{"search", "RL"}, {"heuristics", "C_PG"}});
-  //m_search_configurations.push_back({{"search", "RL"}, {"heuristics", "GNN"}});
+  // m_search_configurations.push_back({{"search", "RL"}, {"heuristics",
+  // "GNN"}});
 
   // This is to test RL with the RL Heuristics
   m_search_configurations.push_back(
@@ -313,6 +314,6 @@ void PortfolioSearch::set_default_configurations() {
       {{"search", "RL"}, {"heuristics", "RL_H"}, {"RL_heuristics", "MAX"}});
   m_search_configurations.push_back(
       {{"search", "RL"}, {"heuristics", "RL_H"}, {"RL_heuristics", "AVG"}});
-    m_search_configurations.push_back(
-    {{"search", "RL"}, {"heuristics", "RL_H"}, {"RL_heuristics", "RNG"}});
+  m_search_configurations.push_back(
+      {{"search", "RL"}, {"heuristics", "RL_H"}, {"RL_heuristics", "RNG"}});
 }
