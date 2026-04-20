@@ -287,7 +287,7 @@ KripkeWorldId FormulaHelper::hash_fluents_into_id(const FluentsSet &fl) {
 // To force uint64 and not size_t for onnx
 KripkeWorldId FormulaHelper::hash_string_into_id(const std::string &string) {
   return XXH3_64bits(string.data(), string.size()); // guaranteed uint64_t
-  //return boost::hash_range(string.begin(), string.end());
+  // return boost::hash_range(string.begin(), string.end());
 }
 
 bool FormulaHelper::consistent(const FluentsSet &to_check) {
