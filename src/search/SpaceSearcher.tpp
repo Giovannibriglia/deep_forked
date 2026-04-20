@@ -169,12 +169,12 @@ bool SpaceSearcher<StateRepr, Strategy>::search_sequential(
           if (!is_RL_search) {
             m_strategy.push(successor);
           }
-          {
+
 #if DEBUG
             act_list_fringe.push_back(action.get_id());
 #endif
             fringe_RL.push_back(successor);
-          }
+
         }
       }
     }
