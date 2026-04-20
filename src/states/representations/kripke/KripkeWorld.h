@@ -281,6 +281,22 @@ public:
    */
   [[nodiscard]] bool
   operator==(const KripkeWorldPointer &to_compare) const noexcept;
+
+  /** \brief Smaller-than operator based on internal id.
+ *  \param[in] to_compare The pointer to compare.
+ *  \return True if equal.*/
+ [[nodiscard]]  bool internal_smaller(const KripkeWorldPointer &to_compare) const noexcept;
+
+  /** \brief Greater-than operator based on internal id.
+*  \param[in] to_compare The pointer to compare.
+*  \return True if equal.*/
+  [[nodiscard]] bool internal_greater(const KripkeWorldPointer &to_compare) const noexcept;
+
+  /** \brief Equality operator based on internal id.
+*  \param[in] to_compare The pointer to compare.
+*  \return True if equal.*/
+  [[nodiscard]] bool internal_equal(const KripkeWorldPointer &to_compare) const noexcept;
+
   ///@}
 
 private:

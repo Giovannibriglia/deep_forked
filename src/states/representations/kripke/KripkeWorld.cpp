@@ -258,3 +258,18 @@ bool KripkeWorldPointer::operator==(
     const KripkeWorldPointer &to_compare) const noexcept {
   return m_id == to_compare.get_id();
 }
+
+bool KripkeWorldPointer::internal_smaller(
+    const KripkeWorldPointer &to_compare) const noexcept {
+  return get_internal_world_id() < to_compare.get_internal_world_id();
+}
+
+bool KripkeWorldPointer::internal_greater(
+    const KripkeWorldPointer &to_compare) const noexcept {
+  return get_internal_world_id() > to_compare.get_internal_world_id();
+}
+
+bool KripkeWorldPointer::internal_equal(
+    const KripkeWorldPointer &to_compare) const noexcept {
+  return get_internal_world_id() == to_compare.get_internal_world_id();
+}
