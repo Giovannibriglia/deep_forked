@@ -262,8 +262,8 @@ std::string HeuristicsManager<StateRepr>::get_used_h_name() const noexcept {
     return "SubGoals";
   case Heuristics::GNN:
     return "GNN";
-      case Heuristics::RL_H:
-      return "RL_H";
+  case Heuristics::RL_H:
+    return "RL_H";
   default: {
     ExitHandler::exit_with_message(
         ExitHandler::ExitCode::HeuristicsBadDeclaration,

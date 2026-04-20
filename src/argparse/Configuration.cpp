@@ -123,14 +123,16 @@ int Configuration::get_succesors_to_analyze() const noexcept {
     return 0;
   }
   const auto &instance = ArgumentParser::get_instance();
-  return static_cast<int>(instance.get_RL_fringe_size() * instance.get_RL_exploitation_percentage() / 100.0);
+  return static_cast<int>(instance.get_RL_fringe_size() *
+                          instance.get_RL_exploitation_percentage() / 100.0);
 }
 
 int Configuration::get_exploration_nodes() const noexcept {
   // Maybe make the various fields dependent on the Configuration rather than on
   // Argparse for better multi-threading options
   const auto &instance = ArgumentParser::get_instance();
-  return static_cast<int>(instance.get_RL_fringe_size() * instance.get_RL_exploration_percentage() / 100.0);
+  return static_cast<int>(instance.get_RL_fringe_size() *
+                          instance.get_RL_exploration_percentage() / 100.0);
 }
 
 void Configuration::set_GNN_model_path(const std::string &val) {
@@ -282,10 +284,13 @@ void Configuration::print(std::ostream &os) const {
     os << "    RL fringe size selection: " << instance.get_RL_fringe_size()
        << '\n';
     os << "    RL exploration percentage: "
-       << instance.get_RL_exploration_percentage() << "% (" << get_exploration_nodes() << " nodes)\n";
-         //static_cast<int>(instance.get_RL_fringe_size() * instance.get_RL_exploration_percentage() / 100.0) << " nodes)\n";
+       << instance.get_RL_exploration_percentage() << "% ("
+       << get_exploration_nodes() << " nodes)\n";
+    // static_cast<int>(instance.get_RL_fringe_size() *
+    // instance.get_RL_exploration_percentage() / 100.0) << " nodes)\n";
     os << "    RL exploitation percentage: "
-       << instance.get_RL_exploitation_percentage() << "% (" << get_succesors_to_analyze() << " nodes)" << std::endl;
+       << instance.get_RL_exploitation_percentage() << "% ("
+       << get_succesors_to_analyze() << " nodes)" << std::endl;
   }
   if (m_heuristic_enum == Heuristics::RL_H) {
     os << "    RL heuristics used is: " << m_RL_heuristics_opt << std::endl;

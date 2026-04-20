@@ -98,8 +98,10 @@ public:
     return std::string("RLBeam x BestFirst search (") +
            (m_refill_mode == RefillMode::RANDOM
                 ? std::string("random")
-                : std::string("heuristic: ") + this->m_heuristics_manager.get_used_h_name()) +
-           ")";  }
+                : std::string("heuristic: ") +
+                      this->m_heuristics_manager.get_used_h_name()) +
+           ")";
+  }
 
   void pop() override {
     if (this->search_space.empty()) {

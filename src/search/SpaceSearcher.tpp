@@ -115,9 +115,8 @@ bool SpaceSearcher<StateRepr, Strategy>::search_sequential(
 
   std::vector<State<StateRepr>> fringe_RL;
 #if DEBUG
-    ActionIdsList act_list_fringe;
+  ActionIdsList act_list_fringe;
 #endif
-
 
   std::set<State<StateRepr>> visited_states;
   /// \warning cannot use unordered_set because I am missing a clear way of
@@ -172,24 +171,26 @@ bool SpaceSearcher<StateRepr, Strategy>::search_sequential(
           }
           {
 #if DEBUG
-              act_list_fringe.push_back(action.get_id());
+            act_list_fringe.push_back(action.get_id());
 #endif
-              fringe_RL.push_back(successor);
+            fringe_RL.push_back(successor);
           }
         }
       }
     }
     if (is_RL_search &&
-        (fringe_RL.size() >= static_cast<size_t>(RL_node_to_add) || m_strategy.empty())) {
+        (fringe_RL.size() >= static_cast<size_t>(RL_node_to_add) ||
+         m_strategy.empty())) {
 #if DEBUG
-        ArgumentParser::get_instance().get_output_stream() << std::endl << std::endl;
-        HelperPrint::get_instance().print_list(act_list_fringe);
-        ArgumentParser::get_instance().get_output_stream() << std::endl << std::endl;
-        act_list_fringe.clear();
+      ArgumentParser::get_instance().get_output_stream() << std::endl
+                                                         << std::endl;
+      HelperPrint::get_instance().print_list(act_list_fringe);
+      ArgumentParser::get_instance().get_output_stream() << std::endl
+                                                         << std::endl;
+      act_list_fringe.clear();
 #endif
-        m_strategy.push_vector(fringe_RL);
+      m_strategy.push_vector(fringe_RL);
       fringe_RL.clear();
-
     }
   }
   return false;
