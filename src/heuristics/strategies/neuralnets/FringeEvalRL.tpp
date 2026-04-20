@@ -92,12 +92,13 @@ void FringeEvalRL<StateRepr>::initialize_onnx_model() {
     // The exported RL ONNX currently emits fixed-size logits [F] where F is
     // the export-time frontier size (normally 32). Keep runtime config aligned.
     if (!m_output_names.empty()) {
-      auto output_info = m_session->GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo();
+      auto output_info =
+          m_session->GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo();
       const auto output_shape = output_info.GetShape();
       if (!output_shape.empty() && output_shape[0] > 0) {
         const auto model_frontier_size = static_cast<size_t>(output_shape[0]);
-        const auto configured_frontier_size =
-            static_cast<size_t>(ArgumentParser::get_instance().get_RL_fringe_size());
+        const auto configured_frontier_size = static_cast<size_t>(
+            ArgumentParser::get_instance().get_RL_fringe_size());
         if (model_frontier_size != configured_frontier_size) {
           ExitHandler::exit_with_message(
               ExitHandler::ExitCode::FringeEvalModelLoadError,
@@ -385,7 +386,8 @@ std::vector<float> FringeEvalRL<StateRepr>::get_score(
     ExitHandler::exit_with_message(
         ExitHandler::ExitCode::FringeEvalModelLoadError,
         "ONNX input count mismatch: model expects " +
-            std::to_string(m_input_names.size()) + " input tensors but C++ "
+            std::to_string(m_input_names.size()) +
+            " input tensors but C++ "
             "prepared " +
             std::to_string(input_tensors.size()) + ".");
   }
