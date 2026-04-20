@@ -171,10 +171,9 @@ bool SpaceSearcher<StateRepr, Strategy>::search_sequential(
           }
 
 #if DEBUG
-            act_list_fringe.push_back(action.get_id());
+          act_list_fringe.push_back(action.get_id());
 #endif
-            fringe_RL.push_back(successor);
-
+          fringe_RL.push_back(successor);
         }
       }
     }
