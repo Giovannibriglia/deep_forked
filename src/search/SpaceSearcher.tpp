@@ -138,15 +138,14 @@ bool SpaceSearcher<StateRepr, Strategy>::search_sequential(
     m_strategy.pop();
     ++m_expanded_nodes;
 
-    #ifdef DEBUG
+#ifdef DEBUG
 
-          if (m_expanded_nodes % 250 == 0)
-          {
-              auto& os = ArgumentParser::get_instance().get_output_stream();
-              os << "[DEBUG] Expanded nodes: " << m_expanded_nodes << std::endl;
-          }
+    if (m_expanded_nodes % 250 == 0) {
+      auto &os = ArgumentParser::get_instance().get_output_stream();
+      os << "[DEBUG] Expanded nodes: " << m_expanded_nodes << std::endl;
+    }
 
-    #endif
+#endif
 
     for (const auto &action : actions) {
       if (current.is_executable(action)) {
@@ -363,8 +362,9 @@ bool SpaceSearcher<StateRepr, Strategy>::validate_plan(
       if (action.get_name() == action_name) {
         found_action = true;
         if (current.is_executable(action)) {
-            auto &os = ArgumentParser::get_instance().get_output_stream();
-            os << "\n[DEBUG-REMOVE] Executing action: "<< action.get_name() <<std::endl;
+          auto &os = ArgumentParser::get_instance().get_output_stream();
+          os << "\n[DEBUG-REMOVE] Executing action: " << action.get_name()
+             << std::endl;
           ++m_expanded_nodes;
           current = current.compute_successor(action);
           if (Configuration::get_instance().get_bisimulation()) {

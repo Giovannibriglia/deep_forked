@@ -228,11 +228,11 @@ public:
    */
   [[nodiscard]] const std::string &get_config_file() const noexcept;
 
-    /**
-* \brief Checks if equality should be strictly checked during planning.
-* \return true if stricter equality is enabled, false otherwise.
-*/
-    [[nodiscard]] bool get_strong_equality() const noexcept;
+  /**
+   * \brief Checks if equality should be strictly checked during planning.
+   * \return true if stricter equality is enabled, false otherwise.
+   */
+  [[nodiscard]] bool get_strong_equality() const noexcept;
 
   /**
    * \brief Destructor. Closes the log file stream if open.
@@ -268,9 +268,10 @@ private:
   std::string m_bisimulation_type =
       "FB";                     ///< Bisimulation type (PT by default).
   bool m_check_visited = false; ///< Flag to check for visited states.
-  bool m_strong_equality = false; ///< Flag to check for stronger equality of Kripke structures.
-    bool m_dataset_mode = false;  ///< Flag to indicate dataset mode.
-  int m_dataset_depth = 10;     ///< Maximum depth for dataset generation.
+  bool m_strong_equality =
+      false; ///< Flag to check for stronger equality of Kripke structures.
+  bool m_dataset_mode = false; ///< Flag to indicate dataset mode.
+  int m_dataset_depth = 10;    ///< Maximum depth for dataset generation.
 
   int m_dataset_generation_threshold = 100000; ///< Node generation threshold
   int m_dataset_max_creation_threshold =
