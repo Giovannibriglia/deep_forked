@@ -78,15 +78,13 @@ void ArgumentParser::parse(int argc, char **argv) {
       set_dataset_type();
     }
 
-
-      // --- Visited consistency check ---
-      if (!m_check_visited && app.count("--strong_equality")) {
-          ExitHandler::exit_with_message(
-              ExitHandler::ExitCode::ArgParseError,
-              "Cannot activate strong equality if check for already visited states "
-              "is not enabled. Please use -c to activate visited states check.");
-      }
-
+    // --- Visited consistency check ---
+    if (!m_check_visited && app.count("--strong_equality")) {
+      ExitHandler::exit_with_message(
+          ExitHandler::ExitCode::ArgParseError,
+          "Cannot activate strong equality if check for already visited states "
+          "is not enabled. Please use -c to activate visited states check.");
+    }
 
     // --- Bisimulation consistency check ---
     if (!m_bisimulation && app.count("--bisimulation_type")) {
@@ -268,15 +266,14 @@ ArgumentParser::ArgumentParser() : app("deep") {
   search_group->add_flag("-c,--check_visited", m_check_visited,
                          "Enable checking for previously visited states during "
                          "planning to avoid redundant exploration.");
-    search_group->add_flag(
-        "--strong_equality",
-        m_strong_equality,
-        "Enable strong equality check (for visited states) for Kripke structures. "
-        "States are compared based on the IDs of kworlds without repetition. "
-        "This is more expensive due to how the Kripke state is stored "
-        "(which maintains repetition in its IDs), but is more correct."
-    );
-    search_group
+  search_group->add_flag(
+      "--strong_equality", m_strong_equality,
+      "Enable strong equality check (for visited states) for Kripke "
+      "structures. "
+      "States are compared based on the IDs of kworlds without repetition. "
+      "This is more expensive due to how the Kripke state is stored "
+      "(which maintains repetition in its IDs), but is more correct.");
+  search_group
       ->add_option(
           "-u,--heuristics", m_heuristic_opt,
           "Specify the heuristic for HFS, Astar or RL search: 'SUBGOALS' "
@@ -442,7 +439,7 @@ bool ArgumentParser::get_check_visited() const noexcept {
 }
 
 bool ArgumentParser::get_strong_equality() const noexcept {
-    return m_strong_equality;
+  return m_strong_equality;
 }
 
 bool ArgumentParser::get_bisimulation() const noexcept {

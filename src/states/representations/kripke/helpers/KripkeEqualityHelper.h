@@ -47,54 +47,70 @@ public:
   KripkeEqualityHelper &operator=(KripkeEqualityHelper &&) = default;
 
 private:
+  static bool world_ptr_equal(const KripkeWorldPointer &a,
+                              const KripkeWorldPointer &b);
 
-    static bool world_ptr_equal(const KripkeWorldPointer &a, const KripkeWorldPointer &b);
+  static bool world_ptr_smaller(const KripkeWorldPointer &a,
+                                const KripkeWorldPointer &b);
 
-    static bool world_ptr_smaller(const KripkeWorldPointer &a, const KripkeWorldPointer &b);
+  static KripkeWorldPointersVec
+  canonicalize_worlds(const KripkeWorldPointersSet &worlds);
 
-  static KripkeWorldPointersVec canonicalize_worlds(const KripkeWorldPointersSet &worlds);
+  static KripkeWorldPointersMapVec
+  canonicalize_agent_map(const KripkeWorldPointersMap &beliefs);
 
-  static KripkeWorldPointersMapVec canonicalize_agent_map(const KripkeWorldPointersMap &beliefs);
+  static KripkeWorldPointersTransitiveMapVec
+  canonicalize_transitive_map(const KripkeWorldPointersTransitiveMap &beliefs);
 
-  static KripkeWorldPointersTransitiveMapVec canonicalize_transitive_map(const KripkeWorldPointersTransitiveMap &beliefs);
+  static bool internal_equal(const KripkeWorldPointersVec &lhs,
+                             const KripkeWorldPointersVec &rhs);
 
-  static bool internal_equal(const KripkeWorldPointersVec &lhs, const KripkeWorldPointersVec &rhs);
+  static bool internal_smaller(const KripkeWorldPointersVec &lhs,
+                               const KripkeWorldPointersVec &rhs);
 
-  static bool internal_smaller(const KripkeWorldPointersVec &lhs, const KripkeWorldPointersVec &rhs);
+  static bool internal_equal(const KripkeWorldPointersMapVec &lhs,
+                             const KripkeWorldPointersMapVec &rhs);
 
-  static bool internal_equal(const KripkeWorldPointersMapVec &lhs, const KripkeWorldPointersMapVec &rhs);
+  static bool internal_smaller(const KripkeWorldPointersMapVec &lhs,
+                               const KripkeWorldPointersMapVec &rhs);
 
-  static bool internal_smaller(const KripkeWorldPointersMapVec &lhs, const KripkeWorldPointersMapVec &rhs);
+  static bool internal_equal(const KripkeWorldPointersMap &lhs,
+                             const KripkeWorldPointersMap &rhs);
 
-  static bool internal_equal(const KripkeWorldPointersMap &lhs, const KripkeWorldPointersMap &rhs);
+  static bool internal_smaller(const KripkeWorldPointersMap &lhs,
+                               const KripkeWorldPointersMap &rhs);
 
-  static bool internal_smaller(const KripkeWorldPointersMap &lhs, const KripkeWorldPointersMap &rhs);
+  static bool internal_equal(const KripkeWorldPointersTransitiveMapVec &lhs,
+                             const KripkeWorldPointersTransitiveMapVec &rhs);
 
-  static bool internal_equal(const KripkeWorldPointersTransitiveMapVec &lhs, const KripkeWorldPointersTransitiveMapVec &rhs);
+  static bool internal_smaller(const KripkeWorldPointersTransitiveMapVec &lhs,
+                               const KripkeWorldPointersTransitiveMapVec &rhs);
 
-  static bool internal_smaller(const KripkeWorldPointersTransitiveMapVec &lhs, const KripkeWorldPointersTransitiveMapVec &rhs);
+  static bool internal_equal(const KripkeWorldPointersTransitiveMap &lhs,
+                             const KripkeWorldPointersTransitiveMap &rhs);
 
-  static bool internal_equal(const KripkeWorldPointersTransitiveMap &lhs, const KripkeWorldPointersTransitiveMap &rhs);
-
-  static bool internal_smaller(const KripkeWorldPointersTransitiveMap &lhs, const KripkeWorldPointersTransitiveMap &rhs);
+  static bool internal_smaller(const KripkeWorldPointersTransitiveMap &lhs,
+                               const KripkeWorldPointersTransitiveMap &rhs);
 
   /// \name Equality for KripkeState
   ///@{
   /**
-   * \brief Check if a State is equal to another using Worlds ids (no repetition).
-   * \param[in] reference The reference state.
-   * \param[in] to_compare The state to check against reference.
-   * \return True if equal, false otherwise.
+   * \brief Check if a State is equal to another using Worlds ids (no
+   * repetition). \param[in] reference The reference state. \param[in]
+   * to_compare The state to check against reference. \return True if equal,
+   * false otherwise.
    */
-    static bool strong_less_operator(const KripkeState &reference, const KripkeState &to_compare);
+  static bool strong_less_operator(const KripkeState &reference,
+                                   const KripkeState &to_compare);
 
-    /**
-   * \brief Check if a State is equal to another using PointerID (repetition included).
-   * \param[in] reference The reference state.
-   * \param[in] to_compare The state to check against reference.
-   * \return True if equal, false otherwise.
+  /**
+   * \brief Check if a State is equal to another using PointerID (repetition
+   * included). \param[in] reference The reference state. \param[in] to_compare
+   * The state to check against reference. \return True if equal, false
+   * otherwise.
    */
-    static bool shallow_less_operator(const KripkeState &reference, const KripkeState &to_compare);
+  static bool shallow_less_operator(const KripkeState &reference,
+                                    const KripkeState &to_compare);
 
   ///@}
   ///
