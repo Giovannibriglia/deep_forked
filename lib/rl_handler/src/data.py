@@ -1043,6 +1043,13 @@ def _frontier_successor_path_set(frontier: Dict[str, Any]) -> set[str]:
     return out
 
 
+def _required_overlap_for_jaccard(size_a: int, size_b: int, threshold: float) -> int:
+    if threshold <= 0.0:
+        return 1
+    rhs = float(threshold) * float(int(size_a) + int(size_b)) / float(1.0 + float(threshold))
+    return max(1, int(math.ceil(rhs - 1e-12)))
+
+
 def _prune_frontiers_by_jaccard_similarity(
     frontiers: Sequence[Dict[str, Any]],
     jaccard_similarity_threshold: float,
@@ -1060,16 +1067,26 @@ def _prune_frontiers_by_jaccard_similarity(
         }
 
     groups: Dict[Tuple[str, str, int, int], Dict[str, Any]] = {}
+    token_to_id: Dict[str, int] = {}
+    next_token_id = 0
     kept_frontiers: List[Dict[str, Any]] = []
     dropped = 0
     missing_successor_paths = 0
 
-    for frontier in frontiers:
+    for frontier in tqdm(frontiers, desc="Pruning..."):
         successor_set = _frontier_successor_path_set(frontier)
         if not successor_set:
             kept_frontiers.append(frontier)
             missing_successor_paths += 1
             continue
+        successor_token_ids: set[int] = set()
+        for token in successor_set:
+            token_id = token_to_id.get(token)
+            if token_id is None:
+                token_id = int(next_token_id)
+                token_to_id[token] = token_id
+                next_token_id += 1
+            successor_token_ids.add(int(token_id))
 
         rewards = [float(x) for x in frontier.get("rewards", [])]
         has_failure = int(
@@ -1078,7 +1095,7 @@ def _prune_frontiers_by_jaccard_similarity(
         group_key = (
             str(frontier.get("dataset_id", "")),
             str(frontier.get("frontier_label", FRONTIER_LABEL_COMMON)),
-            int(len(successor_set)),
+            int(len(successor_token_ids)),
             int(has_failure),
         )
         group = groups.setdefault(
@@ -1092,21 +1109,52 @@ def _prune_frontiers_by_jaccard_similarity(
         inverted_index = group["inverted_index"]
 
         overlap_by_candidate: Dict[int, int] = {}
-        for token in successor_set:
-            for candidate_idx in inverted_index.get(token, []):
-                overlap_by_candidate[int(candidate_idx)] = int(
-                    overlap_by_candidate.get(int(candidate_idx), 0) + 1
-                )
+        size_a = int(len(successor_token_ids))
+        required_overlap = _required_overlap_for_jaccard(
+            size_a=int(size_a),
+            size_b=int(size_a),
+            threshold=float(threshold),
+        )
+        seed_token = min(
+            successor_token_ids,
+            key=lambda token_id: len(inverted_index.get(int(token_id), [])),
+        )
+        ordered_tokens: List[int] = [int(seed_token)]
+        for token_id in successor_token_ids:
+            if int(token_id) == int(seed_token):
+                continue
+            ordered_tokens.append(int(token_id))
 
+        remaining_tokens = int(size_a)
         drop_current = False
-        size_a = int(len(successor_set))
-        for candidate_idx, overlap in overlap_by_candidate.items():
-            size_b = int(sizes[int(candidate_idx)])
-            denom = int(size_a + size_b - int(overlap))
-            similarity = (float(overlap) / float(denom)) if denom > 0 else 1.0
-            if similarity >= threshold:
-                drop_current = True
+        for token_id in ordered_tokens:
+            remaining_tokens = int(max(0, remaining_tokens - 1))
+            postings = inverted_index.get(int(token_id), [])
+            if not postings:
+                continue
+            for candidate_idx in postings:
+                candidate_i = int(candidate_idx)
+                new_overlap = int(overlap_by_candidate.get(candidate_i, 0) + 1)
+                overlap_by_candidate[candidate_i] = int(new_overlap)
+                if int(new_overlap) < int(required_overlap):
+                    continue
+                size_b = int(sizes[candidate_i])
+                denom = int(size_a + size_b - int(new_overlap))
+                similarity = (float(new_overlap) / float(denom)) if denom > 0 else 1.0
+                if similarity >= threshold:
+                    drop_current = True
+                    break
+            if drop_current:
                 break
+
+            if overlap_by_candidate and remaining_tokens > 0 and required_overlap > 1:
+                impossible = [
+                    candidate_i
+                    for candidate_i, overlap in overlap_by_candidate.items()
+                    if int(overlap) + int(remaining_tokens) < int(required_overlap)
+                ]
+                for candidate_i in impossible:
+                    del overlap_by_candidate[int(candidate_i)]
 
         if drop_current:
             dropped += 1
@@ -1114,8 +1162,8 @@ def _prune_frontiers_by_jaccard_similarity(
 
         local_idx = int(len(sizes))
         sizes.append(size_a)
-        for token in successor_set:
-            bucket = inverted_index.setdefault(token, [])
+        for token_id in successor_token_ids:
+            bucket = inverted_index.setdefault(int(token_id), [])
             bucket.append(local_idx)
         kept_frontiers.append(frontier)
 
@@ -1705,7 +1753,6 @@ def build_frontier_samples(
         tqdm(
             dataset_entries,
             desc="Building strategy frontiers",
-            leave=False,
         )
     ):
         rows = read_frontier_csv(csv_path, kind_of_data=kind_of_data)
