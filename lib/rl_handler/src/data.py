@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import csv
+import math
 import os
 import random
 import torch
 import warnings
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from src.graph_utils import VALID_DATASET_TYPES, combine_graphs, load_pyg_graph
@@ -43,6 +45,16 @@ RANDOM_EVAL_FRONTIER_SIZES = [
 FAILURE_EPS = 1e-9
 STRESS_SCHEDULE_FIFO = "fifo"
 STRESS_SCHEDULE_LIFO = "lifo"
+FRONTIER_LABEL_GREEDY = "greedy"
+FRONTIER_LABEL_CONSERVATIVE = "conservative"
+FRONTIER_LABEL_RANDOM = "random"
+FRONTIER_LABEL_COMMON = "common"
+FRONTIER_LABEL_ORDER = [
+    FRONTIER_LABEL_GREEDY,
+    FRONTIER_LABEL_CONSERVATIVE,
+    FRONTIER_LABEL_RANDOM,
+    FRONTIER_LABEL_COMMON,
+]
 
 
 @dataclass
@@ -52,6 +64,13 @@ class FrontierRow:
     distance: float
     predecessor_path: str
     goal_path: str
+
+
+@dataclass
+class _TreeState:
+    depth: int
+    distance: float
+    parent_path: str
 
 
 def _safe_int(v: str, default: int = 0) -> int:
@@ -85,7 +104,7 @@ def normalize_distance_to_reward(
     dist = max(0.0, float(distance))
     if dist > max_dist:
         return float(failure_reward_value)
-    return 0.9 * dist / max_dist
+    return -0.9 * dist / max_dist
 
 
 def refresh_frontier_sample_targets(
@@ -96,7 +115,34 @@ def refresh_frontier_sample_targets(
 ) -> None:
     # m_failed_state is kept only for API compatibility.
     _ = m_failed_state
+    max_dist = max(1e-9, float(max_regular_distance_for_reward))
+    failure_value = float(failure_reward_value)
+
+    def _meta_matches(sample: Dict[str, Any]) -> bool:
+        prev_max = sample.get("_reward_max_regular_distance")
+        prev_failure = sample.get("_reward_failure_value")
+        if prev_max is None or prev_failure is None:
+            return False
+        try:
+            return (
+                abs(float(prev_max) - max_dist) <= 1e-12
+                and abs(float(prev_failure) - failure_value) <= 1e-12
+            )
+        except (TypeError, ValueError):
+            return False
+
     for sample in samples:
+        if (
+            _meta_matches(sample)
+            and isinstance(sample.get("reward_target"), torch.Tensor)
+            and isinstance(sample.get("is_failure"), torch.Tensor)
+            and isinstance(sample.get("oracle_index"), torch.Tensor)
+            and isinstance(sample.get("oracle_reward"), torch.Tensor)
+        ):
+            if "frontier_has_failure" not in sample:
+                sample["frontier_has_failure"] = bool(sample["is_failure"].to(torch.bool).any().item())
+            continue
+
         distances = sample.get("distance_raw", sample.get("distances"))
         if distances is None:
             continue
@@ -108,34 +154,26 @@ def refresh_frontier_sample_targets(
         if distances_t.numel() == 0:
             continue
 
-        reward_targets = torch.tensor(
-            [
-                normalize_distance_to_reward(
-                    distance=float(d),
-                    max_regular_distance=float(max_regular_distance_for_reward),
-                    failure_reward_value=float(failure_reward_value),
-                )
-                for d in distances_t.tolist()
-            ],
-            dtype=torch.float32,
+        clamped_distances = torch.clamp_min(distances_t, 0.0)
+        reward_targets = -0.9 * clamped_distances / float(max_dist)
+        reward_targets = torch.where(
+            clamped_distances > float(max_dist),
+            torch.full_like(reward_targets, float(failure_value)),
+            reward_targets,
         )
-        is_failure = torch.tensor(
-            [
-                _is_failure_reward(float(r), float(failure_reward_value))
-                for r in reward_targets.tolist()
-            ],
-            dtype=torch.bool,
-        )
+        is_failure = reward_targets <= float(failure_value + FAILURE_EPS)
         best_idx = int(torch.argmax(reward_targets).item())
 
-        sample["distance_raw"] = distances_t.clone()
-        sample["distances"] = distances_t.clone()
+        sample["distance_raw"] = distances_t
+        sample["distances"] = distances_t
         sample["reward_target"] = reward_targets
-        sample["rewards"] = reward_targets.clone()
+        sample["rewards"] = reward_targets
         sample["is_failure"] = is_failure
         sample["oracle_index"] = torch.tensor(best_idx, dtype=torch.long)
-        sample["oracle_reward"] = reward_targets[best_idx].clone()
+        sample["oracle_reward"] = reward_targets[best_idx]
         sample["frontier_has_failure"] = bool(is_failure.any().item())
+        sample["_reward_max_regular_distance"] = float(max_dist)
+        sample["_reward_failure_value"] = float(failure_value)
 
 
 def read_frontier_csv(csv_path: Path, kind_of_data: str) -> List[FrontierRow]:
@@ -220,10 +258,1108 @@ def group_clean_frontiers(
     return cleaned
 
 
+def _ordered_unique_paths(paths: Sequence[str]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for raw in paths:
+        path = str(raw).strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+    return out
+
+
+def _resolve_dataset_goal_path(
+    rows: Sequence[FrontierRow],
+    kind_of_data: str,
+) -> Optional[str]:
+    if kind_of_data != "separated":
+        return ""
+    goal_values = {
+        str(row.goal_path).strip()
+        for row in rows
+        if str(row.goal_path).strip()
+    }
+    if not goal_values:
+        return None
+    if len(goal_values) > 1:
+        return None
+    return next(iter(goal_values))
+
+
+def _build_tree_structures(
+    rows: Sequence[FrontierRow],
+) -> Tuple[Dict[str, _TreeState], Dict[str, List[str]], Dict[str, str], List[str]]:
+    state_by_path: Dict[str, _TreeState] = {}
+    children_by_parent: Dict[str, List[str]] = {}
+    parent_by_child: Dict[str, str] = {}
+    all_nodes: List[str] = []
+
+    for row in rows:
+        child = str(row.successor_path).strip()
+        parent = str(row.predecessor_path).strip()
+        if not child:
+            continue
+
+        all_nodes.append(child)
+        if parent:
+            all_nodes.append(parent)
+            children = children_by_parent.setdefault(parent, [])
+            if child not in children:
+                children.append(child)
+
+        prev_state = state_by_path.get(child)
+        depth_i = int(row.depth)
+        distance_f = float(row.distance)
+        if (prev_state is None) or (depth_i < int(prev_state.depth)):
+            state_by_path[child] = _TreeState(
+                depth=depth_i,
+                distance=distance_f,
+                parent_path=parent,
+            )
+            parent_by_child[child] = parent
+        elif prev_state is not None and parent_by_child.get(child, "") == "":
+            parent_by_child[child] = parent
+
+    return state_by_path, children_by_parent, parent_by_child, _ordered_unique_paths(all_nodes)
+
+
+def _find_initial_states(
+    state_by_path: Dict[str, _TreeState],
+    children_by_parent: Dict[str, List[str]],
+    parent_by_child: Dict[str, str],
+) -> List[str]:
+    roots = sorted(
+        _ordered_unique_paths(
+            [
+                parent
+                for parent in children_by_parent.keys()
+                if parent and parent not in parent_by_child
+            ]
+        )
+    )
+    if roots:
+        return roots
+
+    if state_by_path:
+        min_depth = min(int(state.depth) for state in state_by_path.values())
+        depth_roots = sorted(
+            _ordered_unique_paths(
+                [
+                    path
+                    for path, state in state_by_path.items()
+                    if int(state.depth) == int(min_depth)
+                ]
+            )
+        )
+        if depth_roots:
+            return depth_roots
+
+    return sorted(_ordered_unique_paths(children_by_parent.keys()))
+
+
+def _push_selected_path(
+    selected: List[str],
+    selected_set: set[str],
+    available_state_set: set[str],
+    path: str,
+) -> bool:
+    path_s = str(path).strip()
+    if not path_s or path_s in selected_set or path_s not in available_state_set:
+        return False
+    selected.append(path_s)
+    selected_set.add(path_s)
+    return True
+
+
+def _select_greedy_paths(
+    expanded_node: str,
+    target_size: int,
+    expanded_state_order: Sequence[str],
+    expanded_state_set: set[str],
+    open_state_order: Sequence[str],
+    open_state_set: set[str],
+    available_state_set: set[str],
+    parent_by_child: Dict[str, str],
+    children_by_parent: Dict[str, List[str]],
+) -> List[str]:
+    k = int(target_size)
+    if k <= 0:
+        return []
+
+    selected: List[str] = []
+    selected_set: set[str] = set()
+    expanded = str(expanded_node).strip()
+
+    parent = str(parent_by_child.get(expanded, "")).strip()
+    if parent:
+        for sibling in children_by_parent.get(parent, []):
+            sibling_s = str(sibling).strip()
+            if sibling_s == expanded:
+                continue
+            _push_selected_path(selected, selected_set, available_state_set, sibling_s)
+            if len(selected) >= k:
+                return selected
+
+    visited_ancestors: set[str] = set()
+    current_ancestor = parent
+    while current_ancestor and current_ancestor not in visited_ancestors and len(selected) < k:
+        visited_ancestors.add(current_ancestor)
+        if current_ancestor in expanded_state_set:
+            _push_selected_path(selected, selected_set, available_state_set, current_ancestor)
+        if len(selected) >= k:
+            return selected
+        ancestor_parent = str(parent_by_child.get(current_ancestor, "")).strip()
+        if ancestor_parent:
+            for sibling in children_by_parent.get(ancestor_parent, []):
+                sibling_s = str(sibling).strip()
+                if sibling_s == current_ancestor or sibling_s not in expanded_state_set:
+                    continue
+                _push_selected_path(selected, selected_set, available_state_set, sibling_s)
+                if len(selected) >= k:
+                    return selected
+        current_ancestor = ancestor_parent
+
+    for child in children_by_parent.get(expanded, []):
+        _push_selected_path(selected, selected_set, available_state_set, str(child))
+        if len(selected) >= k:
+            return selected
+
+    for path in reversed(open_state_order):
+        if path not in open_state_set:
+            continue
+        _push_selected_path(selected, selected_set, available_state_set, path)
+        if len(selected) >= k:
+            return selected
+
+    for path in reversed(expanded_state_order):
+        if path == expanded:
+            continue
+        _push_selected_path(selected, selected_set, available_state_set, path)
+        if len(selected) >= k:
+            return selected
+    return selected
+
+
+def _select_conservative_paths(
+    expanded_node: str,
+    target_size: int,
+    expanded_state_order: Sequence[str],
+    open_state_order: Sequence[str],
+    open_state_set: set[str],
+    available_state_set: set[str],
+    parent_by_child: Dict[str, str],
+    children_by_parent: Dict[str, List[str]],
+) -> List[str]:
+    k = int(target_size)
+    if k <= 0:
+        return []
+
+    selected: List[str] = []
+    selected_set: set[str] = set()
+    expanded = str(expanded_node).strip()
+
+    ancestor = str(parent_by_child.get(expanded, "")).strip()
+    visited_ancestors: set[str] = set()
+    while ancestor and ancestor not in visited_ancestors and len(selected) < k:
+        visited_ancestors.add(ancestor)
+        _push_selected_path(selected, selected_set, available_state_set, ancestor)
+        ancestor = str(parent_by_child.get(ancestor, "")).strip()
+        if len(selected) >= k:
+            return selected
+
+    for child in children_by_parent.get(expanded, []):
+        _push_selected_path(selected, selected_set, available_state_set, str(child))
+        if len(selected) >= k:
+            return selected
+
+    for path in reversed(open_state_order):
+        if path not in open_state_set:
+            continue
+        _push_selected_path(selected, selected_set, available_state_set, path)
+        if len(selected) >= k:
+            return selected
+
+    for path in reversed(expanded_state_order):
+        if path == expanded:
+            continue
+        _push_selected_path(selected, selected_set, available_state_set, path)
+        if len(selected) >= k:
+            return selected
+    return selected
+
+
+def _sample_random_paths_from_state_pool(
+    all_paths: Sequence[str],
+    non_failure_paths: Sequence[str],
+    failure_paths: Sequence[str],
+    size: int,
+    require_failure: bool,
+    rng: random.Random,
+) -> List[str]:
+    frontier_size = int(size)
+    if frontier_size <= 0:
+        return []
+    if frontier_size > len(all_paths):
+        return []
+    if not non_failure_paths:
+        return []
+    if require_failure and (not failure_paths):
+        return []
+
+    selected: List[str] = []
+    selected_non_failure = rng.choice(non_failure_paths)
+    selected.append(selected_non_failure)
+    selected_set: set[str] = {selected_non_failure}
+
+    if require_failure:
+        if not failure_paths:
+            return []
+        selected_failure = rng.choice(failure_paths)
+        if selected_failure in selected_set:
+            return []
+        selected.append(selected_failure)
+        selected_set.add(selected_failure)
+
+    remaining = int(frontier_size - len(selected))
+    if remaining < 0:
+        return []
+    if remaining > 0:
+        if int(len(all_paths) - len(selected_set)) < remaining:
+            return []
+        extra: List[str] = []
+        extra_set: set[str] = set()
+        max_pick_attempts = max(32, int(8 * len(all_paths)))
+        pick_attempts = 0
+        while len(extra) < remaining and pick_attempts < max_pick_attempts:
+            pick_attempts += 1
+            candidate = rng.choice(all_paths)
+            if candidate in selected_set or candidate in extra_set:
+                continue
+            extra.append(candidate)
+            extra_set.add(candidate)
+        if len(extra) < remaining:
+            remaining_pool = [p for p in all_paths if p not in selected_set]
+            if len(remaining_pool) < remaining:
+                return []
+            extra = list(rng.sample(remaining_pool, remaining))
+        selected.extend(extra)
+
+    rng.shuffle(selected)
+    return selected
+
+
+def _uniform_size_targets(total: int, sizes: Sequence[int]) -> Dict[int, int]:
+    sizes_i = [int(s) for s in sizes]
+    if total <= 0 or not sizes_i:
+        return {int(s): 0 for s in sizes_i}
+    base = int(total // len(sizes_i))
+    rem = int(total % len(sizes_i))
+    targets: Dict[int, int] = {int(s): int(base) for s in sizes_i}
+    for i in range(rem):
+        targets[int(sizes_i[i])] = int(targets[int(sizes_i[i])] + 1)
+    return targets
+
+
+def _comb_count(n: int, k: int) -> int:
+    n_i = int(n)
+    k_i = int(k)
+    if k_i < 0 or k_i > n_i:
+        return 0
+    return int(math.comb(n_i, k_i))
+
+
+def _clip_targets_and_redistribute(
+    target_by_size: Dict[int, int],
+    cap_by_size: Dict[int, int],
+) -> Dict[int, int]:
+    sizes = sorted(int(s) for s in target_by_size.keys())
+    out = {
+        int(size): int(min(int(target_by_size.get(int(size), 0)), int(cap_by_size.get(int(size), 0))))
+        for size in sizes
+    }
+    target_total = int(sum(int(target_by_size.get(int(size), 0)) for size in sizes))
+    current_total = int(sum(out.values()))
+    remaining = int(max(0, target_total - current_total))
+    while remaining > 0:
+        expandable = [
+            int(size)
+            for size in sizes
+            if int(out.get(int(size), 0)) < int(cap_by_size.get(int(size), 0))
+        ]
+        if not expandable:
+            break
+        for size in expandable:
+            if remaining <= 0:
+                break
+            out[int(size)] = int(out.get(int(size), 0) + 1)
+            remaining -= 1
+    return out
+
+
+def _random_with_failure_targets(
+    target_by_size: Dict[int, int],
+    total_with_failure: int,
+    feasible_with_failure_sizes: Sequence[int],
+    cap_by_size: Optional[Dict[int, int]] = None,
+) -> Dict[int, int]:
+    out = {int(size): 0 for size in target_by_size.keys()}
+    feasible_sizes = [int(s) for s in feasible_with_failure_sizes]
+    if total_with_failure <= 0 or not feasible_sizes:
+        return out
+
+    size_quota = _uniform_size_targets(total=int(total_with_failure), sizes=feasible_sizes)
+    for size, quota in size_quota.items():
+        out[int(size)] = int(min(int(quota), int(target_by_size.get(int(size), 0))))
+        if cap_by_size is not None:
+            out[int(size)] = int(min(int(out[int(size)]), int(cap_by_size.get(int(size), 0))))
+
+    assigned = int(sum(out.values()))
+    remaining = int(max(0, int(total_with_failure) - assigned))
+    if remaining > 0:
+        expandable = [
+            int(size)
+            for size in feasible_sizes
+            if int(out.get(int(size), 0))
+            < int(
+                min(
+                    int(target_by_size.get(int(size), 0)),
+                    int(cap_by_size.get(int(size), 0))
+                    if cap_by_size is not None
+                    else int(target_by_size.get(int(size), 0)),
+                )
+            )
+        ]
+        idx = 0
+        while remaining > 0 and expandable:
+            size = int(expandable[idx % len(expandable)])
+            max_cap = int(target_by_size.get(size, 0))
+            if cap_by_size is not None:
+                max_cap = int(min(max_cap, int(cap_by_size.get(size, 0))))
+            if int(out.get(size, 0)) < max_cap:
+                out[size] = int(out.get(size, 0) + 1)
+                remaining -= 1
+            expandable = [
+                int(s)
+                for s in feasible_sizes
+                if int(out.get(int(s), 0))
+                < int(
+                    min(
+                        int(target_by_size.get(int(s), 0)),
+                        int(cap_by_size.get(int(s), 0))
+                        if cap_by_size is not None
+                        else int(target_by_size.get(int(s), 0)),
+                    )
+                )
+            ]
+            idx += 1
+    return out
+
+
+def _build_frontier_from_paths(
+    selected_paths: Sequence[str],
+    state_by_path: Dict[str, _TreeState],
+    reward_by_path: Dict[str, float],
+    label: str,
+    predecessor_path: str,
+    goal_path: str,
+    dataset_id: str,
+    failure_reward_value: float,
+) -> Optional[Dict[str, Any]]:
+    successors = [str(p) for p in selected_paths if str(p) in state_by_path]
+    if not successors:
+        return None
+
+    distances = [float(state_by_path[path].distance) for path in successors]
+    depths = [int(state_by_path[path].depth) for path in successors]
+    rewards = [float(reward_by_path[path]) for path in successors]
+    has_non_failure = any(
+        not _is_failure_reward(float(reward), float(failure_reward_value))
+        for reward in rewards
+    )
+    if not has_non_failure:
+        return None
+
+    return {
+        "predecessor_path": str(predecessor_path),
+        "goal_path": str(goal_path),
+        "successor_paths": successors,
+        "distances": distances,
+        "depths": depths,
+        "rewards": rewards,
+        "dataset_id": str(dataset_id),
+        "frontier_label": str(label),
+    }
+
+
+def _generate_random_frontiers_from_state_pool(
+    state_by_path: Dict[str, _TreeState],
+    reward_by_path: Dict[str, float],
+    dataset_id: str,
+    goal_path: str,
+    onnx_frontier_size: int,
+    random_frontier_ratio: float,
+    random_frontier_with_failure_ratio: float,
+    reference_frontier_count: int,
+    seed: int,
+    failure_reward_value: float,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    all_paths = sorted(_ordered_unique_paths(state_by_path.keys()))
+    non_failure_paths = [
+        path
+        for path in all_paths
+        if not _is_failure_reward(float(reward_by_path[path]), float(failure_reward_value))
+    ]
+    failure_paths = [
+        path
+        for path in all_paths
+        if _is_failure_reward(float(reward_by_path[path]), float(failure_reward_value))
+    ]
+
+    max_size = min(max(1, int(onnx_frontier_size)), len(all_paths))
+    size_range = [int(s) for s in range(1, max_size + 1)]
+    target_total_requested = max(
+        0, int(round(float(reference_frontier_count) * float(random_frontier_ratio)))
+    )
+    n_total = int(len(all_paths))
+    n_non_failure = int(len(non_failure_paths))
+    n_failure = int(len(failure_paths))
+    feasible_any_by_size: Dict[int, int] = {}
+    feasible_with_failure_by_size: Dict[int, int] = {}
+    feasible_without_failure_by_size: Dict[int, int] = {}
+    for size in size_range:
+        total_combos = _comb_count(n_total, int(size))
+        all_failure_combos = _comb_count(n_failure, int(size))
+        all_non_failure_combos = _comb_count(n_non_failure, int(size))
+        any_cap = int(max(0, total_combos - all_failure_combos))
+        with_failure_cap = int(
+            max(0, total_combos - all_failure_combos - all_non_failure_combos)
+        )
+        without_failure_cap = int(all_non_failure_combos)
+        feasible_any_by_size[int(size)] = int(any_cap)
+        feasible_with_failure_by_size[int(size)] = int(
+            min(int(with_failure_cap), int(any_cap))
+        )
+        feasible_without_failure_by_size[int(size)] = int(
+            min(int(without_failure_cap), int(any_cap))
+        )
+
+    max_feasible_total = int(sum(feasible_any_by_size.values()))
+    target_total = int(min(int(target_total_requested), int(max_feasible_total)))
+    requested_with_failure_total = max(
+        0,
+        min(
+            int(target_total),
+            int(round(float(target_total) * float(random_frontier_with_failure_ratio))),
+        ),
+    )
+    feasible_with_failure_sizes = [
+        int(s) for s in size_range if int(feasible_with_failure_by_size.get(int(s), 0)) > 0
+    ]
+
+    stats: Dict[str, Any] = {
+        "reference_frontier_count": int(reference_frontier_count),
+        "random_frontier_ratio": float(random_frontier_ratio),
+        "random_frontier_with_failure_ratio": float(random_frontier_with_failure_ratio),
+        "target_random_frontiers_requested": int(target_total_requested),
+        "target_random_frontiers_capped_by_feasibility": int(target_total),
+        "target_random_frontiers": int(target_total),
+        "target_random_with_failure_frontiers": int(requested_with_failure_total),
+        "target_random_with_failure_frontiers_effective": 0,
+        "max_feasible_random_frontiers": int(max_feasible_total),
+        "generated_random_frontiers": 0,
+        "generated_random_with_failure_frontiers": 0,
+        "generated_random_without_failure_frontiers": 0,
+        "generated_by_size": {},
+        "size_range": [int(s) for s in size_range],
+    }
+    if target_total <= 0 or not size_range or not non_failure_paths:
+        return [], stats
+
+    target_by_size = _uniform_size_targets(total=int(target_total), sizes=size_range)
+    target_by_size = _clip_targets_and_redistribute(
+        target_by_size=target_by_size,
+        cap_by_size=feasible_any_by_size,
+    )
+    requested_with_failure_total = int(
+        min(
+            int(requested_with_failure_total),
+            int(
+                sum(
+                    min(
+                        int(target_by_size.get(int(size), 0)),
+                        int(feasible_with_failure_by_size.get(int(size), 0)),
+                    )
+                    for size in size_range
+                )
+            ),
+        )
+    )
+    target_with_failure_by_size = _random_with_failure_targets(
+        target_by_size=target_by_size,
+        total_with_failure=requested_with_failure_total,
+        feasible_with_failure_sizes=feasible_with_failure_sizes,
+        cap_by_size=feasible_with_failure_by_size,
+    )
+    for size in size_range:
+        total_s = int(target_by_size.get(int(size), 0))
+        with_s = int(
+            min(
+                int(target_with_failure_by_size.get(int(size), 0)),
+                int(feasible_with_failure_by_size.get(int(size), 0)),
+                int(total_s),
+            )
+        )
+        without_s = int(total_s - with_s)
+        without_cap = int(feasible_without_failure_by_size.get(int(size), 0))
+        if without_s > without_cap:
+            move = int(without_s - without_cap)
+            with_s = int(with_s + move)
+            without_s = int(without_s - move)
+        target_with_failure_by_size[int(size)] = int(with_s)
+    effective_with_failure_target = int(sum(target_with_failure_by_size.values()))
+    stats["target_random_with_failure_frontiers_effective"] = int(effective_with_failure_target)
+
+    rng = random.Random(int(seed))
+    generated: List[Dict[str, Any]] = []
+    seen_signatures: set[frozenset[str]] = set()
+    generated_by_size: Dict[int, int] = {int(size): 0 for size in size_range}
+    generated_with_failure_by_size: Dict[int, int] = {int(size): 0 for size in size_range}
+    generated_without_failure_by_size: Dict[int, int] = {int(size): 0 for size in size_range}
+    generated_with_failure = 0
+
+    def _try_generate(size: int, require_failure: bool, max_attempts: int) -> bool:
+        nonlocal generated_with_failure
+        size_i = int(size)
+        if int(generated_by_size.get(size_i, 0)) >= int(feasible_any_by_size.get(size_i, 0)):
+            return False
+        if bool(require_failure):
+            if int(generated_with_failure_by_size.get(size_i, 0)) >= int(
+                feasible_with_failure_by_size.get(size_i, 0)
+            ):
+                return False
+        else:
+            if int(generated_without_failure_by_size.get(size_i, 0)) >= int(
+                feasible_without_failure_by_size.get(size_i, 0)
+            ):
+                return False
+
+        attempts = int(
+            max(
+                16,
+                min(
+                    int(max_attempts),
+                    int(
+                        6
+                        * max(
+                            1,
+                            int(feasible_any_by_size.get(size_i, 0))
+                            - int(generated_by_size.get(size_i, 0)),
+                        )
+                    ),
+                ),
+            )
+        )
+        for _ in range(attempts):
+            selected_paths = _sample_random_paths_from_state_pool(
+                all_paths=all_paths,
+                non_failure_paths=non_failure_paths,
+                failure_paths=failure_paths,
+                size=size_i,
+                require_failure=bool(require_failure),
+                rng=rng,
+            )
+            if not selected_paths:
+                continue
+            signature = frozenset(selected_paths)
+            if signature in seen_signatures:
+                continue
+
+            frontier = _build_frontier_from_paths(
+                selected_paths=selected_paths,
+                state_by_path=state_by_path,
+                reward_by_path=reward_by_path,
+                label=FRONTIER_LABEL_RANDOM,
+                predecessor_path=f"random_{dataset_id}_{len(generated):06d}",
+                goal_path=str(goal_path),
+                dataset_id=str(dataset_id),
+                failure_reward_value=float(failure_reward_value),
+            )
+            if frontier is None:
+                continue
+            has_failure = any(
+                _is_failure_reward(float(r), float(failure_reward_value))
+                for r in frontier["rewards"]
+            )
+            if require_failure and not has_failure:
+                continue
+
+            seen_signatures.add(signature)
+            generated.append(frontier)
+            generated_by_size[size_i] = int(generated_by_size.get(size_i, 0) + 1)
+            if has_failure:
+                generated_with_failure += 1
+                generated_with_failure_by_size[size_i] = int(
+                    generated_with_failure_by_size.get(size_i, 0) + 1
+                )
+            else:
+                generated_without_failure_by_size[size_i] = int(
+                    generated_without_failure_by_size.get(size_i, 0) + 1
+                )
+            return True
+        return False
+
+    for size in size_range:
+        size_target = int(target_by_size.get(int(size), 0))
+        if size_target <= 0:
+            continue
+
+        target_with_failure = int(target_with_failure_by_size.get(int(size), 0))
+        target_without_failure = int(max(0, size_target - target_with_failure))
+
+        while int(generated_with_failure_by_size.get(int(size), 0)) < int(target_with_failure):
+            ok = _try_generate(
+                size=int(size),
+                require_failure=True,
+                max_attempts=120,
+            )
+            if not ok:
+                break
+        while int(generated_without_failure_by_size.get(int(size), 0)) < int(target_without_failure):
+            ok = _try_generate(
+                size=int(size),
+                require_failure=False,
+                max_attempts=100,
+            )
+            if not ok:
+                break
+
+    remaining = int(target_total - len(generated))
+    if remaining > 0:
+        cycle_sizes = [
+            int(size)
+            for size in size_range
+            if int(generated_by_size.get(int(size), 0)) < int(feasible_any_by_size.get(int(size), 0))
+        ]
+        idx = 0
+        blocked_modes: set[Tuple[int, bool]] = set()
+        while remaining > 0 and cycle_sizes:
+            size = int(cycle_sizes[idx % len(cycle_sizes)])
+            need_failure = generated_with_failure < int(effective_with_failure_target)
+            preferred_mode = bool(
+                need_failure
+                and int(generated_with_failure_by_size.get(size, 0))
+                < int(feasible_with_failure_by_size.get(size, 0))
+            )
+
+            generated_now = False
+            mode_order = [preferred_mode, (not preferred_mode)]
+            for mode in mode_order:
+                if (size, bool(mode)) in blocked_modes:
+                    continue
+                generated_now = _try_generate(
+                    size=size,
+                    require_failure=bool(mode),
+                    max_attempts=40,
+                )
+                if generated_now:
+                    break
+                blocked_modes.add((size, bool(mode)))
+
+            if generated_now:
+                remaining -= 1
+                blocked_modes.discard((size, True))
+                blocked_modes.discard((size, False))
+
+            if int(generated_by_size.get(size, 0)) >= int(feasible_any_by_size.get(size, 0)):
+                cycle_sizes = [s for s in cycle_sizes if int(s) != int(size)]
+                idx = 0
+            elif (size, True) in blocked_modes and (size, False) in blocked_modes:
+                cycle_sizes = [s for s in cycle_sizes if int(s) != int(size)]
+                idx = 0
+            else:
+                idx += 1
+
+    generated_without_failure = int(len(generated) - generated_with_failure)
+    stats["generated_random_frontiers"] = int(len(generated))
+    stats["generated_random_with_failure_frontiers"] = int(generated_with_failure)
+    stats["generated_random_without_failure_frontiers"] = int(generated_without_failure)
+    stats["generated_by_size"] = {
+        str(size): int(generated_by_size.get(int(size), 0))
+        for size in size_range
+    }
+    return generated, stats
+
+
+def _deduplicate_strategy_frontiers(
+    frontiers: Sequence[Dict[str, Any]],
+    kind_of_data: str,
+    failure_reward_value: float,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    deduped: Dict[Tuple[str, str, frozenset[str]], Dict[str, Any]] = {}
+    dropped_no_non_failure = 0
+    deduplicated_to_common = 0
+
+    for frontier in frontiers:
+        rewards = [float(x) for x in frontier.get("rewards", [])]
+        if not rewards or all(
+            _is_failure_reward(float(r), float(failure_reward_value))
+            for r in rewards
+        ):
+            dropped_no_non_failure += 1
+            continue
+
+        dataset_id = str(frontier.get("dataset_id", ""))
+        goal = str(frontier.get("goal_path", "")) if kind_of_data == "separated" else ""
+        key = (
+            dataset_id,
+            goal,
+            frozenset(frontier.get("successor_paths", [])),
+        )
+        current = deduped.get(key)
+        if current is None:
+            deduped[key] = dict(frontier)
+            continue
+
+        deduplicated_to_common += 1
+        current["frontier_label"] = FRONTIER_LABEL_COMMON
+
+    return list(deduped.values()), {
+        "dropped_no_non_failure": int(dropped_no_non_failure),
+        "deduplicated_to_common": int(deduplicated_to_common),
+    }
+
+
+def _frontier_successor_path_set(frontier: Dict[str, Any]) -> set[str]:
+    successor_paths = frontier.get("successor_paths", [])
+    if not isinstance(successor_paths, (list, tuple)):
+        return set()
+    out: set[str] = set()
+    for raw in successor_paths:
+        value = str(raw).strip()
+        if value:
+            out.add(value)
+    return out
+
+
+def _prune_frontiers_by_jaccard_similarity(
+    frontiers: Sequence[Dict[str, Any]],
+    jaccard_similarity_threshold: float,
+    failure_reward_value: float,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    threshold = float(jaccard_similarity_threshold)
+    if not frontiers:
+        return [], {
+            "threshold": float(threshold),
+            "n_total": 0,
+            "n_kept": 0,
+            "n_dropped": 0,
+            "n_missing_successor_paths": 0,
+            "n_groups": 0,
+        }
+
+    groups: Dict[Tuple[str, str, int, int], Dict[str, Any]] = {}
+    kept_frontiers: List[Dict[str, Any]] = []
+    dropped = 0
+    missing_successor_paths = 0
+
+    for frontier in frontiers:
+        successor_set = _frontier_successor_path_set(frontier)
+        if not successor_set:
+            kept_frontiers.append(frontier)
+            missing_successor_paths += 1
+            continue
+
+        rewards = [float(x) for x in frontier.get("rewards", [])]
+        has_failure = int(
+            any(_is_failure_reward(float(r), float(failure_reward_value)) for r in rewards)
+        )
+        group_key = (
+            str(frontier.get("dataset_id", "")),
+            str(frontier.get("frontier_label", FRONTIER_LABEL_COMMON)),
+            int(len(successor_set)),
+            int(has_failure),
+        )
+        group = groups.setdefault(
+            group_key,
+            {
+                "sizes": [],
+                "inverted_index": {},
+            },
+        )
+        sizes = group["sizes"]
+        inverted_index = group["inverted_index"]
+
+        overlap_by_candidate: Dict[int, int] = {}
+        for token in successor_set:
+            for candidate_idx in inverted_index.get(token, []):
+                overlap_by_candidate[int(candidate_idx)] = int(
+                    overlap_by_candidate.get(int(candidate_idx), 0) + 1
+                )
+
+        drop_current = False
+        size_a = int(len(successor_set))
+        for candidate_idx, overlap in overlap_by_candidate.items():
+            size_b = int(sizes[int(candidate_idx)])
+            denom = int(size_a + size_b - int(overlap))
+            similarity = (float(overlap) / float(denom)) if denom > 0 else 1.0
+            if similarity >= threshold:
+                drop_current = True
+                break
+
+        if drop_current:
+            dropped += 1
+            continue
+
+        local_idx = int(len(sizes))
+        sizes.append(size_a)
+        for token in successor_set:
+            bucket = inverted_index.setdefault(token, [])
+            bucket.append(local_idx)
+        kept_frontiers.append(frontier)
+
+    return kept_frontiers, {
+        "threshold": float(threshold),
+        "n_total": int(len(frontiers)),
+        "n_kept": int(len(kept_frontiers)),
+        "n_dropped": int(dropped),
+        "n_missing_successor_paths": int(missing_successor_paths),
+        "n_groups": int(len(groups)),
+    }
+
+
+def build_tree_strategy_frontiers_for_dataset(
+    rows: Sequence[FrontierRow],
+    kind_of_data: str,
+    dataset_id: str,
+    onnx_frontier_size: int,
+    random_frontier_ratio: float,
+    random_frontier_with_failure_ratio: float,
+    max_regular_distance_for_reward: float,
+    failure_reward_value: float = -1.0,
+    seed: int = 0,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    goal_path = _resolve_dataset_goal_path(rows=rows, kind_of_data=kind_of_data)
+    if kind_of_data == "separated" and not goal_path:
+        return [], {
+            "dataset_id": str(dataset_id),
+            "reason": "missing_or_ambiguous_goal_path",
+            "generated_before_dedup": 0,
+            "generated_after_dedup": 0,
+            "deduplicated_to_common": 0,
+            "dropped_no_non_failure": 0,
+        }
+
+    state_by_path, children_by_parent, parent_by_child, all_nodes = _build_tree_structures(rows)
+    if not state_by_path:
+        return [], {
+            "dataset_id": str(dataset_id),
+            "reason": "no_states",
+            "generated_before_dedup": 0,
+            "generated_after_dedup": 0,
+            "deduplicated_to_common": 0,
+            "dropped_no_non_failure": 0,
+        }
+
+    reward_by_path: Dict[str, float] = {
+        path: normalize_distance_to_reward(
+            distance=float(state.distance),
+            max_regular_distance=float(max_regular_distance_for_reward),
+            failure_reward_value=float(failure_reward_value),
+        )
+        for path, state in state_by_path.items()
+    }
+
+    roots = _find_initial_states(
+        state_by_path=state_by_path,
+        children_by_parent=children_by_parent,
+        parent_by_child=parent_by_child,
+    )
+    if not roots:
+        roots = sorted(_ordered_unique_paths(state_by_path.keys()))
+    if not roots:
+        return [], {
+            "dataset_id": str(dataset_id),
+            "reason": "no_roots",
+            "generated_before_dedup": 0,
+            "generated_after_dedup": 0,
+            "deduplicated_to_common": 0,
+            "dropped_no_non_failure": 0,
+        }
+
+    frontier_target_size = max(1, int(onnx_frontier_size))
+    queue: deque[str] = deque()
+    available_state_set = set(str(path) for path in state_by_path.keys())
+    discovered_set: set[str] = set()
+    open_state_order: List[str] = []
+    open_state_set: set[str] = set()
+    expanded_state_order: List[str] = []
+    expanded_state_set: set[str] = set()
+
+    def _enqueue(path: str) -> None:
+        path_s = str(path).strip()
+        if not path_s or path_s in discovered_set:
+            return
+        discovered_set.add(path_s)
+        if path_s in available_state_set:
+            open_state_order.append(path_s)
+            open_state_set.add(path_s)
+        queue.append(path_s)
+
+    for root in roots:
+        _enqueue(str(root))
+
+    generated_frontiers_gc: List[Dict[str, Any]] = []
+    expanded_nodes = 0
+
+    while True:
+        while queue:
+            current = str(queue.popleft())
+            expanded_nodes += 1
+            if current in open_state_set:
+                open_state_set.discard(current)
+            if current in available_state_set and current not in expanded_state_set:
+                expanded_state_set.add(current)
+                expanded_state_order.append(current)
+            if expanded_state_order:
+                target_size = int(frontier_target_size)
+
+                greedy_paths = _select_greedy_paths(
+                    expanded_node=current,
+                    target_size=target_size,
+                    expanded_state_order=expanded_state_order,
+                    expanded_state_set=expanded_state_set,
+                    open_state_order=open_state_order,
+                    open_state_set=open_state_set,
+                    available_state_set=available_state_set,
+                    parent_by_child=parent_by_child,
+                    children_by_parent=children_by_parent,
+                )
+                conservative_paths = _select_conservative_paths(
+                    expanded_node=current,
+                    target_size=target_size,
+                    expanded_state_order=expanded_state_order,
+                    open_state_order=open_state_order,
+                    open_state_set=open_state_set,
+                    available_state_set=available_state_set,
+                    parent_by_child=parent_by_child,
+                    children_by_parent=children_by_parent,
+                )
+                if frozenset(greedy_paths) == frozenset(conservative_paths):
+                    common_frontier = _build_frontier_from_paths(
+                        selected_paths=greedy_paths,
+                        state_by_path=state_by_path,
+                        reward_by_path=reward_by_path,
+                        label=FRONTIER_LABEL_COMMON,
+                        predecessor_path=current,
+                        goal_path=str(goal_path or ""),
+                        dataset_id=str(dataset_id),
+                        failure_reward_value=float(failure_reward_value),
+                    )
+                    if common_frontier is not None:
+                        generated_frontiers_gc.append(common_frontier)
+                else:
+                    greedy_frontier = _build_frontier_from_paths(
+                        selected_paths=greedy_paths,
+                        state_by_path=state_by_path,
+                        reward_by_path=reward_by_path,
+                        label=FRONTIER_LABEL_GREEDY,
+                        predecessor_path=current,
+                        goal_path=str(goal_path or ""),
+                        dataset_id=str(dataset_id),
+                        failure_reward_value=float(failure_reward_value),
+                    )
+                    if greedy_frontier is not None:
+                        generated_frontiers_gc.append(greedy_frontier)
+
+                    conservative_frontier = _build_frontier_from_paths(
+                        selected_paths=conservative_paths,
+                        state_by_path=state_by_path,
+                        reward_by_path=reward_by_path,
+                        label=FRONTIER_LABEL_CONSERVATIVE,
+                        predecessor_path=current,
+                        goal_path=str(goal_path or ""),
+                        dataset_id=str(dataset_id),
+                        failure_reward_value=float(failure_reward_value),
+                    )
+                    if conservative_frontier is not None:
+                        generated_frontiers_gc.append(conservative_frontier)
+
+            for child in children_by_parent.get(current, []):
+                _enqueue(str(child))
+
+        remaining_nodes = [
+            path for path in all_nodes if str(path).strip() and str(path).strip() not in discovered_set
+        ]
+        if not remaining_nodes:
+            break
+        _enqueue(str(remaining_nodes[0]))
+
+    gc_frontiers, gc_dedup_stats = _deduplicate_strategy_frontiers(
+        frontiers=generated_frontiers_gc,
+        kind_of_data=kind_of_data,
+        failure_reward_value=float(failure_reward_value),
+    )
+    reference_count = int(len(gc_frontiers))
+    random_frontiers, random_stats = _generate_random_frontiers_from_state_pool(
+        state_by_path=state_by_path,
+        reward_by_path=reward_by_path,
+        dataset_id=str(dataset_id),
+        goal_path=str(goal_path or ""),
+        onnx_frontier_size=int(frontier_target_size),
+        random_frontier_ratio=float(random_frontier_ratio),
+        random_frontier_with_failure_ratio=float(random_frontier_with_failure_ratio),
+        reference_frontier_count=int(reference_count),
+        seed=int(seed) + 811,
+        failure_reward_value=float(failure_reward_value),
+    )
+    final_frontiers, final_dedup_stats = _deduplicate_strategy_frontiers(
+        frontiers=[*gc_frontiers, *random_frontiers],
+        kind_of_data=kind_of_data,
+        failure_reward_value=float(failure_reward_value),
+    )
+
+    label_counts = {label: 0 for label in FRONTIER_LABEL_ORDER}
+    size_counts: Dict[int, int] = {}
+    for frontier in final_frontiers:
+        label = str(frontier.get("frontier_label", FRONTIER_LABEL_COMMON))
+        if label not in label_counts:
+            label_counts[label] = 0
+        label_counts[label] = int(label_counts[label] + 1)
+
+        size = int(len(frontier.get("successor_paths", [])))
+        size_counts[size] = int(size_counts.get(size, 0) + 1)
+
+    summary = {
+        "dataset_id": str(dataset_id),
+        "num_rows": int(len(rows)),
+        "num_states": int(len(state_by_path)),
+        "num_initial_states": int(len(roots)),
+        "expanded_nodes": int(expanded_nodes),
+        "onnx_frontier_size": int(frontier_target_size),
+        "random_frontier_ratio": float(random_frontier_ratio),
+        "random_frontier_with_failure_ratio": float(random_frontier_with_failure_ratio),
+        "generated_greedy_conservative_before_dedup": int(len(generated_frontiers_gc)),
+        "generated_greedy_conservative_after_dedup": int(len(gc_frontiers)),
+        "gc_deduplicated_to_common": int(gc_dedup_stats["deduplicated_to_common"]),
+        "gc_dropped_no_non_failure": int(gc_dedup_stats["dropped_no_non_failure"]),
+        "generated_random_frontiers": int(len(random_frontiers)),
+        "random_generation_stats": random_stats,
+        "generated_total_after_final_dedup": int(len(final_frontiers)),
+        "final_deduplicated_to_common": int(final_dedup_stats["deduplicated_to_common"]),
+        "final_dropped_no_non_failure": int(final_dedup_stats["dropped_no_non_failure"]),
+        "label_counts": {str(k): int(v) for k, v in sorted(label_counts.items())},
+        "size_counts": {str(k): int(v) for k, v in sorted(size_counts.items())},
+    }
+    return final_frontiers, summary
+
+
 def _flatten_candidates(frontiers: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     candidates: List[Dict[str, Any]] = []
     for frontier in frontiers:
         goal_path = str(frontier.get("goal_path", ""))
+        dataset_id = str(frontier.get("dataset_id", ""))
         paths = [str(x) for x in frontier.get("successor_paths", [])]
         distances = [float(x) for x in frontier.get("distances", [])]
         depths = [int(x) for x in frontier.get("depths", [])]
@@ -237,6 +1373,7 @@ def _flatten_candidates(frontiers: Sequence[Dict[str, Any]]) -> List[Dict[str, A
                     "depth": depths[i],
                     "reward": rewards[i],
                     "goal_path": goal_path,
+                    "dataset_id": dataset_id,
                 }
             )
     return candidates
@@ -247,6 +1384,7 @@ def _frontier_to_candidates(
     kind_of_data: str,
 ) -> List[Dict[str, Any]]:
     goal_path = str(frontier.get("goal_path", "")) if kind_of_data == "separated" else ""
+    dataset_id = str(frontier.get("dataset_id", ""))
     paths = [str(x) for x in frontier.get("successor_paths", [])]
     distances = [float(x) for x in frontier.get("distances", [])]
     depths = [int(x) for x in frontier.get("depths", [])]
@@ -261,6 +1399,7 @@ def _frontier_to_candidates(
                 "depth": depths[i],
                 "reward": rewards[i],
                 "goal_path": goal_path,
+                "dataset_id": dataset_id,
             }
         )
     return out
@@ -307,11 +1446,12 @@ def _deduplicate_candidates(
     candidates: Sequence[Dict[str, Any]],
     kind_of_data: str,
 ) -> List[Dict[str, Any]]:
-    best_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    best_by_key: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     for cand in candidates:
+        dataset_id = str(cand.get("dataset_id", ""))
         goal = str(cand.get("goal_path", "")) if kind_of_data == "separated" else ""
         path = str(cand["successor_path"])
-        key = (goal, path)
+        key = (dataset_id, goal, path)
         current = best_by_key.get(key)
         if current is None or float(cand["reward"]) > float(current["reward"]):
             best_by_key[key] = dict(cand)
@@ -523,6 +1663,10 @@ def build_frontier_samples(
     failure_reward_value: float = -1.0,
     n_max_dataset_queries: int = 1000,
     max_size_frontier: int = 25,
+    onnx_frontier_size: int = 32,
+    train_random_frontier_ratio: float = 0.2,
+    train_random_with_failure_ratio: float = 0.4,
+    train_frontier_jaccard_threshold: float = 0.75,
     build_eval_data: bool = True,
     enable_graph_cache: bool = True,
     **_: Any,
@@ -549,89 +1693,103 @@ def build_frontier_samples(
     all_eval_stress_lifo_frontiers: List[Dict[str, Any]] = []
     dataset_summaries: List[Dict[str, Any]] = []
 
-    dataset_counter = 0
+    dataset_entries: List[Tuple[Path, Path]] = []
     for prob_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         if list_subset_train and os.path.basename(prob_dir) not in list_subset_train:
             continue
         csv_files = sorted(p for p in prob_dir.iterdir() if p.suffix.lower() == ".csv")
         for csv_path in csv_files:
-            rows = read_frontier_csv(csv_path, kind_of_data=kind_of_data)
+            dataset_entries.append((prob_dir, csv_path))
+
+    for dataset_counter, (prob_dir, csv_path) in enumerate(
+        tqdm(
+            dataset_entries,
+            desc="Building strategy frontiers",
+            leave=False,
+        )
+    ):
+        rows = read_frontier_csv(csv_path, kind_of_data=kind_of_data)
+        dataset_id = f"{prob_dir.name}/{csv_path.name}"
+        train_frontiers, strategy_summary = build_tree_strategy_frontiers_for_dataset(
+            rows=rows,
+            kind_of_data=kind_of_data,
+            dataset_id=dataset_id,
+            onnx_frontier_size=int(onnx_frontier_size),
+            random_frontier_ratio=float(train_random_frontier_ratio),
+            random_frontier_with_failure_ratio=float(train_random_with_failure_ratio),
+            max_regular_distance_for_reward=float(max_regular_distance_for_reward),
+            failure_reward_value=float(failure_reward_value),
+            seed=int(seed) + 7919 * dataset_counter + 31,
+        )
+
+        train_frontiers = list(train_frontiers)
+
+        if build_eval_data:
             cleaned = group_clean_frontiers(
                 rows=rows,
                 kind_of_data=kind_of_data,
                 max_regular_distance_for_reward=float(max_regular_distance_for_reward),
                 failure_reward_value=float(failure_reward_value),
             )
-            dataset_id = f"{prob_dir.name}/{csv_path.name}"
-
-            if not cleaned:
-                dataset_summaries.append(
-                    {
-                        "dataset_id": dataset_id,
-                        "frontiers_cleaned": 0,
-                        "train_frontiers": 0,
-                        "eval_random_frontiers": 0,
-                        "eval_stress_fifo_frontiers": 0,
-                        "eval_stress_lifo_frontiers": 0,
-                    }
-                )
-                dataset_counter += 1
-                continue
-
-            train_frontiers = list(cleaned)
-
-            if build_eval_data:
-                eval_random_seed = int(seed + 104729 * dataset_counter + 17)
-                eval_random_frontiers = build_random_eval_frontiers_for_dataset(
+            eval_random_seed = int(seed + 104729 * dataset_counter + 17)
+            eval_random_frontiers = build_random_eval_frontiers_for_dataset(
+                clean_frontiers=cleaned,
+                kind_of_data=kind_of_data,
+                n_max_dataset_queries=int(n_max_dataset_queries),
+                seed=eval_random_seed,
+                dataset_tag=f"{prob_dir.name}_{csv_path.stem}",
+                failure_reward_value=float(failure_reward_value),
+            )
+            eval_stress_fifo_frontiers, eval_stress_lifo_frontiers = (
+                build_stress_eval_frontiers_for_dataset(
                     clean_frontiers=cleaned,
                     kind_of_data=kind_of_data,
                     n_max_dataset_queries=int(n_max_dataset_queries),
-                    seed=eval_random_seed,
+                    max_size_frontier=int(max_size_frontier),
                     dataset_tag=f"{prob_dir.name}_{csv_path.stem}",
                     failure_reward_value=float(failure_reward_value),
                 )
-                eval_stress_fifo_frontiers, eval_stress_lifo_frontiers = (
-                    build_stress_eval_frontiers_for_dataset(
-                        clean_frontiers=cleaned,
-                        kind_of_data=kind_of_data,
-                        n_max_dataset_queries=int(n_max_dataset_queries),
-                        max_size_frontier=int(max_size_frontier),
-                        dataset_tag=f"{prob_dir.name}_{csv_path.stem}",
-                        failure_reward_value=float(failure_reward_value),
-                    )
-                )
-            else:
-                eval_random_frontiers = []
-                eval_stress_fifo_frontiers = []
-                eval_stress_lifo_frontiers = []
-
-            for frontier in train_frontiers:
-                frontier["dataset_id"] = dataset_id
-            for frontier in eval_random_frontiers:
-                frontier["dataset_id"] = dataset_id
-            for frontier in eval_stress_fifo_frontiers:
-                frontier["dataset_id"] = dataset_id
-                frontier["stress_schedule"] = STRESS_SCHEDULE_FIFO
-            for frontier in eval_stress_lifo_frontiers:
-                frontier["dataset_id"] = dataset_id
-                frontier["stress_schedule"] = STRESS_SCHEDULE_LIFO
-
-            all_train_frontiers.extend(train_frontiers)
-            all_eval_random_frontiers.extend(eval_random_frontiers)
-            all_eval_stress_fifo_frontiers.extend(eval_stress_fifo_frontiers)
-            all_eval_stress_lifo_frontiers.extend(eval_stress_lifo_frontiers)
-
-            dataset_summaries.append(
-                {
-                    "dataset_id": dataset_id,
-                    "frontiers_cleaned": len(cleaned),
-                    "train_frontiers": len(train_frontiers),
-                    "eval_random_frontiers": len(eval_random_frontiers),
-                    "eval_stress_fifo_frontiers": len(eval_stress_fifo_frontiers),
-                    "eval_stress_lifo_frontiers": len(eval_stress_lifo_frontiers),
-                }
             )
-            dataset_counter += 1
+        else:
+            cleaned = []
+            eval_random_frontiers = []
+            eval_stress_fifo_frontiers = []
+            eval_stress_lifo_frontiers = []
+
+        for frontier in train_frontiers:
+            frontier["dataset_id"] = dataset_id
+        for frontier in eval_random_frontiers:
+            frontier["dataset_id"] = dataset_id
+        for frontier in eval_stress_fifo_frontiers:
+            frontier["dataset_id"] = dataset_id
+            frontier["stress_schedule"] = STRESS_SCHEDULE_FIFO
+        for frontier in eval_stress_lifo_frontiers:
+            frontier["dataset_id"] = dataset_id
+            frontier["stress_schedule"] = STRESS_SCHEDULE_LIFO
+
+        all_train_frontiers.extend(train_frontiers)
+        all_eval_random_frontiers.extend(eval_random_frontiers)
+        all_eval_stress_fifo_frontiers.extend(eval_stress_fifo_frontiers)
+        all_eval_stress_lifo_frontiers.extend(eval_stress_lifo_frontiers)
+
+        dataset_summaries.append(
+            {
+                "dataset_id": dataset_id,
+                "num_rows": int(len(rows)),
+                "strategy_summary": strategy_summary,
+                "frontiers_cleaned": len(cleaned),
+                "train_frontiers": len(train_frontiers),
+                "eval_random_frontiers": len(eval_random_frontiers),
+                "eval_stress_fifo_frontiers": len(eval_stress_fifo_frontiers),
+                "eval_stress_lifo_frontiers": len(eval_stress_lifo_frontiers),
+            }
+        )
+
+    all_train_frontiers, train_jaccard_prune_stats = _prune_frontiers_by_jaccard_similarity(
+        frontiers=all_train_frontiers,
+        jaccard_similarity_threshold=float(train_frontier_jaccard_threshold),
+        failure_reward_value=float(failure_reward_value),
+    )
 
     graph_loader, graph_load_stats = _build_graph_loader(
         dataset_type=dataset_type,
@@ -683,6 +1841,13 @@ def build_frontier_samples(
         for f in tqdm(all_eval_stress_lifo_frontiers, desc="Materializing eval-stress-lifo frontiers")
     ]
 
+    train_label_counts = {label: 0 for label in FRONTIER_LABEL_ORDER}
+    for sample in train_samples:
+        label = str(sample.get("frontier_label", FRONTIER_LABEL_COMMON))
+        if label not in train_label_counts:
+            train_label_counts[label] = 0
+        train_label_counts[label] = int(train_label_counts[label] + 1)
+
     params = {
         "folder_data": str(root),
         "kind_of_data": str(kind_of_data),
@@ -692,6 +1857,11 @@ def build_frontier_samples(
         "failure_reward_value": float(failure_reward_value),
         "n_max_dataset_queries": int(n_max_dataset_queries),
         "max_size_frontier": int(max_size_frontier),
+        "onnx_frontier_size": int(onnx_frontier_size),
+        "train_random_frontier_ratio": float(train_random_frontier_ratio),
+        "train_random_with_failure_ratio": float(train_random_with_failure_ratio),
+        "train_frontier_jaccard_threshold": float(train_frontier_jaccard_threshold),
+        "train_frontier_jaccard_pruning_pre_materialization": train_jaccard_prune_stats,
         "build_eval_data": bool(build_eval_data),
         "num_frontiers_train": len(train_samples),
         "num_frontiers_eval_random": len(eval_samples),
@@ -710,6 +1880,14 @@ def build_frontier_samples(
             "num_frontiers_eval": len(eval_samples),
             "num_frontiers_eval2": len(eval2_samples),
             "num_frontiers_eval3": len(eval3_samples),
+            "onnx_frontier_size": int(onnx_frontier_size),
+            "train_random_frontier_ratio": float(train_random_frontier_ratio),
+            "train_random_with_failure_ratio": float(train_random_with_failure_ratio),
+            "train_frontier_jaccard_threshold": float(train_frontier_jaccard_threshold),
+            "train_frontier_jaccard_pruning_pre_materialization": train_jaccard_prune_stats,
+            "train_frontier_label_counts": {
+                str(label): int(count) for label, count in sorted(train_label_counts.items())
+            },
             "dataset_summaries": dataset_summaries,
         },
         "graph_cache_requests": int(graph_load_stats["requests"]),
@@ -790,16 +1968,19 @@ def _materialize_frontier(
         "action_map": combined.action_map,
         "successor_ids": [str(p) for p in frontier["successor_paths"]],
         "reward_target": reward_targets,
-        "rewards": reward_targets.clone(),
+        "rewards": reward_targets,
         "distance_raw": distances,
-        "distances": distances.clone(),
+        "distances": distances,
         "is_failure": is_failure,
         "oracle_index": torch.tensor(best_idx, dtype=torch.long),
-        "oracle_reward": reward_targets[best_idx].clone(),
+        "oracle_reward": reward_targets[best_idx],
         "goal_path": str(frontier.get("goal_path", "")),
         "predecessor_path": str(frontier.get("predecessor_path", "")),
         "dataset_id": str(frontier.get("dataset_id", "")),
+        "frontier_label": str(frontier.get("frontier_label", FRONTIER_LABEL_COMMON)),
         "frontier_has_failure": bool(is_failure.any().item()),
+        "_reward_max_regular_distance": float(max_regular_distance_for_reward),
+        "_reward_failure_value": float(failure_reward_value),
     }
     if "stress_schedule" in frontier:
         sample["stress_schedule"] = str(frontier.get("stress_schedule", ""))
@@ -815,7 +1996,7 @@ def _materialize_frontier(
 
 class FrontierDataset(Dataset):
     def __init__(self, samples: Sequence[Dict[str, Any]]):
-        self.samples = list(samples)
+        self.samples = samples if isinstance(samples, list) else list(samples)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -1052,16 +2233,29 @@ def build_frontier_dataloader(
     num_workers: int = 0,
     pad_frontiers: bool = True,
     shuffle: bool = False,
+    pin_memory: Optional[bool] = None,
+    persistent_workers: Optional[bool] = None,
+    prefetch_factor: Optional[int] = None,
 ) -> DataLoader:
     generator = torch.Generator()
     generator.manual_seed(int(seed))
+    n_workers = int(max(0, num_workers))
+    pin = bool(torch.cuda.is_available()) if pin_memory is None else bool(pin_memory)
+    persistent = bool(n_workers > 0) if persistent_workers is None else bool(persistent_workers)
+    loader_kwargs: Dict[str, Any] = {
+        "batch_size": batch_size,
+        "shuffle": bool(shuffle),
+        "num_workers": n_workers,
+        "collate_fn": lambda x: frontier_collate_fn(x, pad_frontiers=pad_frontiers),
+        "generator": generator,
+        "pin_memory": pin,
+        "persistent_workers": bool(persistent and n_workers > 0),
+    }
+    if n_workers > 0 and prefetch_factor is not None:
+        loader_kwargs["prefetch_factor"] = int(max(1, prefetch_factor))
     return DataLoader(
         FrontierDataset(samples),
-        batch_size=batch_size,
-        shuffle=bool(shuffle),
-        num_workers=num_workers,
-        collate_fn=lambda x: frontier_collate_fn(x, pad_frontiers=pad_frontiers),
-        generator=generator,
+        **loader_kwargs,
     )
 
 

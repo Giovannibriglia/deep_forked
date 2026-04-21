@@ -13,8 +13,13 @@ if str(RL_HANDLER_ROOT) not in sys.path:
     sys.path.insert(0, str(RL_HANDLER_ROOT))
 
 from src.data import (
+    FRONTIER_LABEL_COMMON,
+    FRONTIER_LABEL_CONSERVATIVE,
+    FRONTIER_LABEL_GREEDY,
+    FRONTIER_LABEL_RANDOM,
     FrontierRow,
     build_frontier_samples,
+    build_tree_strategy_frontiers_for_dataset,
     build_stress_eval_frontiers_for_dataset,
     group_clean_frontiers,
     normalize_distance_to_reward,
@@ -138,7 +143,7 @@ class TestDatasetTypeAndRewardTargets(unittest.TestCase):
                 max_size_frontier=5,
             )
 
-            self.assertEqual(len(train_samples), 2)
+            self.assertGreaterEqual(len(train_samples), 1)
             self.assertTrue(len(eval_samples) >= 1)
             self.assertTrue(len(eval2_samples) >= 1)
             self.assertTrue(len(eval3_samples) >= 1)
@@ -220,6 +225,48 @@ class TestDatasetTypeAndRewardTargets(unittest.TestCase):
         self.assertEqual(len(fifo), len(lifo))
         self.assertEqual(fifo[0]["successor_paths"], lifo[0]["successor_paths"])
         self.assertNotEqual(fifo[1]["successor_paths"], lifo[1]["successor_paths"])
+
+    def test_tree_strategy_frontiers_generation_and_random_ratio(self) -> None:
+        rows = [
+            FrontierRow("s_a", 1, 1.0, "root", ""),
+            FrontierRow("s_b", 1, 70.0, "root", ""),
+            FrontierRow("s_c", 2, 3.0, "s_a", ""),
+            FrontierRow("s_d", 2, 90.0, "s_a", ""),
+            FrontierRow("s_e", 2, 2.0, "s_b", ""),
+            FrontierRow("s_f", 2, 110.0, "s_b", ""),
+        ]
+        frontiers, summary = build_tree_strategy_frontiers_for_dataset(
+            rows=rows,
+            kind_of_data="merged",
+            dataset_id="synthetic/frontiers.csv",
+            onnx_frontier_size=4,
+            random_frontier_ratio=0.5,
+            random_frontier_with_failure_ratio=0.5,
+            max_regular_distance_for_reward=50.0,
+            failure_reward_value=-1.0,
+            seed=7,
+        )
+
+        self.assertGreater(len(frontiers), 0)
+        valid_labels = {
+            FRONTIER_LABEL_GREEDY,
+            FRONTIER_LABEL_CONSERVATIVE,
+            FRONTIER_LABEL_RANDOM,
+            FRONTIER_LABEL_COMMON,
+        }
+        for frontier in frontiers:
+            self.assertIn(str(frontier.get("frontier_label", "")), valid_labels)
+            self.assertTrue(1 <= len(frontier["successor_paths"]) <= 4)
+            rewards = [float(x) for x in frontier["rewards"]]
+            self.assertTrue(any(r > -1.0 + 1e-9 for r in rewards))
+
+        self.assertIn("generated_greedy_conservative_after_dedup", summary)
+        self.assertIn("random_generation_stats", summary)
+        random_stats = summary["random_generation_stats"]
+        self.assertEqual(
+            int(random_stats["target_random_frontiers"]),
+            int(round(summary["generated_greedy_conservative_after_dedup"] * 0.5)),
+        )
 
     def test_hashed_node_ids_are_normalized_in_model(self) -> None:
         with tempfile.TemporaryDirectory() as td:
