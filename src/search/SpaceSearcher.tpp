@@ -140,14 +140,14 @@ bool SpaceSearcher<StateRepr, Strategy>::search_sequential(
 
 #ifdef DEBUG
 
-
-   /*       if (m_expanded_nodes % 250 == 0)
-          {
-              auto& os = ArgumentParser::get_instance().get_output_stream();
-              os << "[DEBUG] Expanded nodes: " << m_expanded_nodes << std::endl;
-          }
-*/
-    #endif
+    /*       if (m_expanded_nodes % 250 == 0)
+           {
+               auto& os = ArgumentParser::get_instance().get_output_stream();
+               os << "[DEBUG] Expanded nodes: " << m_expanded_nodes <<
+       std::endl;
+           }
+ */
+#endif
 
     for (const auto &action : actions) {
       if (current.is_executable(action)) {
