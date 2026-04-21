@@ -36,6 +36,7 @@ public:
    */
   void set_worlds(const KripkeWorldPointersSet &to_set);
 
+
   /** \brief Set the pointed world for this KripkeState.
    *  \param[in] to_set The KripkeWorld pointer to assign as pointed.
    */
@@ -45,6 +46,7 @@ public:
    *  \param[in] to_set The beliefs map to assign.
    */
   void set_beliefs(const KripkeWorldPointersTransitiveMap &to_set);
+
 
   /** \brief Clears the beliefs map for this KripkeState.
    * This is only usable by Bisimulation.
@@ -62,6 +64,11 @@ public:
    */
   [[nodiscard]] const KripkeWorldPointersSet &get_worlds() const noexcept;
 
+    /** \brief Get the vector of worlds in this KripkeState.
+ *  \return The vector of KripkeWorld pointers.
+ */
+    [[nodiscard]] const KripkeWorldPointersVec &get_worlds_vec() const noexcept;
+
   /** \brief Get the pointed world in this KripkeState.
    *  \return The pointed KripkeWorld pointer.
    */
@@ -72,6 +79,13 @@ public:
    */
   [[nodiscard]] const KripkeWorldPointersTransitiveMap &
   get_beliefs() const noexcept;
+
+    /** \brief Get the beliefs map in this KripkeState in vectorized form.
+ *  \return The beliefs map.
+ */
+    [[nodiscard]] const KripkeWorldPointersTransitiveMapVec &
+    get_beliefs_vec() const noexcept;
+
 
   /** \brief Get the maximum depth of this KripkeState.
    *  \return The max depth value.
@@ -205,6 +219,17 @@ private:
   KripkeWorldPointer m_pointed;
   /** \brief Beliefs of each agent in every world. */
   KripkeWorldPointersTransitiveMap m_beliefs;
+
+
+    /** \brief Set of pointers to each world in the structure -- empty otherwise. */
+    KripkeWorldPointersVec m_worlds_vec;
+    /** \brief Beliefs of each agent in every world in vector form for strong equivalence check -- empty otherwise. */
+    KripkeWorldPointersTransitiveMapVec m_beliefs_vec;
+
+    void set_worlds_vec();
+
+    void set_beliefs_vec();
+
 
   /** \brief Tensor version of this for the various NN-based heuristics */
   GraphTensor m_tensor_representation;
