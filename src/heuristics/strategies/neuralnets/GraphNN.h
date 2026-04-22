@@ -31,7 +31,7 @@ public:
    * \brief Create the singleton instance of GraphNN.
    */
 
-  //static void create_instance();
+  // static void create_instance();
 
   /**
    * \brief Converts a KripkeState to a minimal GraphTensor representation.
@@ -84,7 +84,7 @@ private:
    */
   GraphNN();
 
-  //static GraphNN *instance; ///< Singleton instance pointer
+  // static GraphNN *instance; ///< Singleton instance pointer
 
   std::string
       m_checking_file_path;     ///< Path to the file where the state is printed

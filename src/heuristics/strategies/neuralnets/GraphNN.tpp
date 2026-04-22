@@ -34,7 +34,7 @@ GraphNN<StateRepr> &GraphNN<StateRepr>::get_instance() {
 
 template <StateRepresentation StateRepr> GraphNN<StateRepr>::GraphNN() {
   // Use default StateRepresentation for dataset folder creation
-  //TrainingDataset<StateRepr>::create_instance();
+  // TrainingDataset<StateRepr>::create_instance();
   m_checking_file_path =
       TrainingDataset<StateRepr>::get_instance().get_folder() +
       "to_predict.dot";

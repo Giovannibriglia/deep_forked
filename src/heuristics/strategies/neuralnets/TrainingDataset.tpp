@@ -34,9 +34,8 @@ void TrainingDataset<StateRepr>::create_instance() {
 
 */
 
-
 template <StateRepresentation StateRepr>
-TrainingDataset<StateRepr>& TrainingDataset<StateRepr>::get_instance() {
+TrainingDataset<StateRepr> &TrainingDataset<StateRepr>::get_instance() {
   static TrainingDataset<StateRepr> instance;
   return instance;
 }
@@ -304,7 +303,6 @@ TrainingDataset<StateRepr>::TrainingDataset() {
                        // together
   }
 }
-
 
 template <StateRepresentation StateRepr>
 bool TrainingDataset<StateRepr>::generate_dataset() {

@@ -27,7 +27,8 @@
 // I am adding this to be seen by the linker because it is a static templated
 // singleton
 // template <>
-// TrainingDataset<KripkeState> *TrainingDataset<KripkeState>::instance = nullptr;
+// TrainingDataset<KripkeState> *TrainingDataset<KripkeState>::instance =
+// nullptr;
 
 PortfolioSearch::PortfolioSearch() {
   if (const auto config_file = ArgumentParser::get_instance().get_config_file();
