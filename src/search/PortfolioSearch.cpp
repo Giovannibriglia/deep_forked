@@ -163,16 +163,15 @@ bool PortfolioSearch::run_portfolio_search() const {
             }
             case SearchType::RL: {
 #ifdef USE_NEURALNETS
-                //FringeEvalRL<KripkeState>::create_instance();
-                SpaceSearcher<KripkeState, RL_BestFirst<KripkeState> > searcherRL{
-                    RL_BestFirst<KripkeState>(initial_state), found_goal
-                };
-                result = searcherRL.search(initial_state);
-                actions_id = searcherRL.get_plan_actions_id();
-                search_type_name = searcherRL.get_search_type();
-                elapsed = searcherRL.get_elapsed_seconds();
-                expanded = searcherRL.get_expanded_nodes();
-                break;
+      //FringeEvalRL<KripkeState>::create_instance();
+      SpaceSearcher<KripkeState, RL_BestFirst<KripkeState>> searcherRL{
+          RL_BestFirst<KripkeState>(initial_state), found_goal};
+      result = searcherRL.search(initial_state);
+      actions_id = searcherRL.get_plan_actions_id();
+      search_type_name = searcherRL.get_search_type();
+      elapsed = searcherRL.get_elapsed_seconds();
+      expanded = searcherRL.get_expanded_nodes();
+      break;
 #else
                 ExitHandler::exit_with_message(
                     ExitHandler::ExitCode::HeuristicsBadDeclaration,

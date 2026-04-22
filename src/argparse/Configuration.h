@@ -107,7 +107,9 @@ public:
   /**
    * \brief Sets the heuristic option.
    * \param val The heuristic option enum.
-   * \param check_consistency True if we want that to impose with this that the value of the heurisrics makes sense with the search strategy. Might be False if set from map when order of fields is not correct
+   * \param check_consistency True if we want that to impose with this that the
+   * value of the heurisrics makes sense with the search strategy. Might be
+   * False if set from map when order of fields is not correct
    */
   void set_heuristic_opt(const std::string &val, bool check_consistency);
 
@@ -131,8 +133,7 @@ public:
    */
   [[nodiscard]] RLHeuristicType get_RL_heuristics() const noexcept;
 
-    [[nodiscard]] std::string get_RL_heuristics_name() const noexcept;
-
+  [[nodiscard]] std::string get_RL_heuristics_name() const noexcept;
 
   /**
    * @brief Set the RL heuristic selection from string.
@@ -189,7 +190,7 @@ public:
    */
   void print(std::ostream &os) const;
 
-  void set_from_config_map(const std::map<std::string, std::string> & map);
+  void set_from_config_map(const std::map<std::string, std::string> &map);
 
 private:
   /**
@@ -232,12 +233,12 @@ private:
    */
   void set_bisimulation_type_bool();
 
-    /**
- * \brief Sets the field of the class to value
- * \param field The name of the field to set (based on the parsing from
- * command line) \param value The value to set the field to.
- */
-    void set_field_by_name(const std::string &field, const std::string &value);
+  /**
+   * \brief Sets the field of the class to value
+   * \param field The name of the field to set (based on the parsing from
+   * command line) \param value The value to set the field to.
+   */
+  void set_field_by_name(const std::string &field, const std::string &value);
 
   /**
    * \brief Thread-local flag to track initialization per thread.
