@@ -201,6 +201,13 @@ using TransitionMap = std::map<KripkeWorldPointer, KripkeWorldPointer>;
 using BeliefsVector =
     std::vector<std::tuple<KripkeWorldPointer, KripkeWorldPointer, Agent>>;
 using pg_bfs_score = std::map<BeliefFormula, unsigned short>;
+
+using KripkeWorldPointersVec = std::vector<KripkeWorldPointer>;
+using KripkeWorldPointersMapVec =
+    std::vector<std::pair<Agent, KripkeWorldPointersVec>>;
+using KripkeWorldPointersTransitiveMapVec =
+    std::vector<std::pair<KripkeWorldPointer, KripkeWorldPointersMapVec>>;
+
 ///@}
 ///
 

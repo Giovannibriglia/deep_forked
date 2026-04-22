@@ -24,6 +24,7 @@
 #include <ranges>
 #include <unordered_set>
 
+#include "KripkeEqualityHelper.h"
 #include "KripkeStorage.h"
 #include "SetHelper.h"
 #include "utilities/ExitHandler.h"
@@ -36,6 +37,13 @@
 
 void KripkeState::set_worlds(const KripkeWorldPointersSet &to_set) {
   m_worlds = to_set;
+  if (ArgumentParser::get_instance().get_strong_equality()) {
+    set_worlds_vec();
+  }
+}
+
+void KripkeState::set_worlds_vec() {
+  m_worlds_vec = KripkeEqualityHelper::canonicalize_worlds(m_worlds);
 }
 
 void KripkeState::set_pointed(const KripkeWorldPointer &to_set) {
@@ -44,11 +52,17 @@ void KripkeState::set_pointed(const KripkeWorldPointer &to_set) {
 
 void KripkeState::set_beliefs(const KripkeWorldPointersTransitiveMap &to_set) {
   m_beliefs = to_set;
+  if (ArgumentParser::get_instance().get_strong_equality()) {
+    set_beliefs_vec();
+  }
+}
+void KripkeState::set_beliefs_vec() {
+  m_beliefs_vec = KripkeEqualityHelper::canonicalize_transitive_map(m_beliefs);
 }
 
 void KripkeState::clear_beliefs() { m_beliefs.clear(); }
 
-void KripkeState::set_max_depth(unsigned int to_set) noexcept {
+void KripkeState::set_max_depth(const unsigned int to_set) noexcept {
   if (m_max_depth < to_set)
     m_max_depth = to_set;
 }
@@ -60,6 +74,10 @@ KripkeState::get_worlds() const noexcept {
   return m_worlds;
 }
 
+const KripkeWorldPointersVec &KripkeState::get_worlds_vec() const noexcept {
+  return m_worlds_vec;
+}
+
 [[nodiscard]] const KripkeWorldPointer &
 KripkeState::get_pointed() const noexcept {
   return m_pointed;
@@ -68,6 +86,11 @@ KripkeState::get_pointed() const noexcept {
 [[nodiscard]] const KripkeWorldPointersTransitiveMap &
 KripkeState::get_beliefs() const noexcept {
   return m_beliefs;
+}
+
+const KripkeWorldPointersTransitiveMapVec &
+KripkeState::get_beliefs_vec() const noexcept {
+  return m_beliefs_vec;
 }
 
 [[nodiscard]] unsigned int KripkeState::get_max_depth() const noexcept {
@@ -84,51 +107,15 @@ KripkeState &KripkeState::operator=(const KripkeState &to_copy) {
   return *this;
 }
 
-[[nodiscard]] bool
-KripkeState::operator==(const KripkeState &to_compare) const {
+bool KripkeState::operator==(const KripkeState &to_compare) const {
   return !((*this) < to_compare) && !(to_compare < (*this));
 }
 
-[[nodiscard]] bool KripkeState::operator<(const KripkeState &to_compare) const {
-  if (m_pointed != to_compare.get_pointed())
-    return m_pointed < to_compare.get_pointed();
-
-  if (m_worlds != to_compare.get_worlds())
-    return m_worlds < to_compare.get_worlds();
-
-  const auto &beliefs1 = m_beliefs;
-  const auto &beliefs2 = to_compare.get_beliefs();
-
-  auto it1 = beliefs1.begin();
-  auto it2 = beliefs2.begin();
-
-  while (it1 != beliefs1.end() && it2 != beliefs2.end()) {
-    if (it1->first != it2->first)
-      return it1->first < it2->first;
-
-    const auto &map1 = it1->second;
-    const auto &map2 = it2->second;
-
-    auto m1 = map1.begin();
-    auto m2 = map2.begin();
-
-    while (m1 != map1.end() && m2 != map2.end()) {
-      if (m1->first != m2->first)
-        return m1->first < m2->first;
-      if (m1->second != m2->second)
-        return m1->second < m2->second;
-      ++m1;
-      ++m2;
-    }
-    if (m1 != map1.end())
-      return false;
-    if (m2 != map2.end())
-      return true;
-
-    ++it1;
-    ++it2;
+bool KripkeState::operator<(const KripkeState &to_compare) const {
+  if (ArgumentParser::get_instance().get_strong_equality()) {
+    return KripkeEqualityHelper::strong_less_operator(*this, to_compare);
   }
-  return (it1 == beliefs1.end()) && (it2 != beliefs2.end());
+  return KripkeEqualityHelper::shallow_less_operator(*this, to_compare);
 }
 
 void KripkeState::print() const {
@@ -158,8 +145,9 @@ KripkeWorldPointer KripkeState::add_rep_world(const KripkeWorld &to_add,
   return tmp;
 }
 
-KripkeWorldPointer KripkeState::add_rep_world(const KripkeWorld &to_add,
-                                              unsigned short old_repetition) {
+KripkeWorldPointer
+KripkeState::add_rep_world(const KripkeWorld &to_add,
+                           const unsigned short old_repetition) {
   bool tmp = false;
   return add_rep_world(to_add, get_max_depth() + old_repetition, tmp);
 }
@@ -721,4 +709,5 @@ const GraphTensor &KripkeState::get_tensor_representation() {
 
 KripkeState::KripkeState(const KripkeState &other)
     : m_max_depth(other.m_max_depth), m_worlds(other.m_worlds),
-      m_pointed(other.m_pointed), m_beliefs(other.m_beliefs) {}
+      m_pointed(other.m_pointed), m_beliefs(other.m_beliefs),
+      m_worlds_vec(other.m_worlds_vec), m_beliefs_vec(other.m_beliefs_vec) {}
