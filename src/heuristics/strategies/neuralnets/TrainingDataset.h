@@ -2,6 +2,7 @@
 #include "Define.h"
 #include "State.h"
 #include <cmath>
+#include <mutex>
 #include <random>
 #include <set>
 #include <string>
@@ -39,7 +40,7 @@ public:
   /**
    * \brief Create the singleton instance of TrainingDataset.
    */
-  static void create_instance();
+  //static void create_instance();
 
   /**
    * \brief Generates the dataset for ML heuristics.
@@ -127,9 +128,10 @@ private:
    * \brief Private constructor for singleton pattern.
    */
   TrainingDataset();
+    static std::once_flag s_once;
 
   // --- Singleton instance ---
-  static TrainingDataset *instance; ///< Singleton instance pointer
+  //static TrainingDataset *instance; ///< Singleton instance pointer
 
   // --- Dataset and file management ---
   std::string m_folder;

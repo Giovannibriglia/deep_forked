@@ -11,6 +11,7 @@
 #include <sstream>
 #include <string>
 
+/*
 // --- Singleton implementation ---
 template <StateRepresentation StateRepr>
 TrainingDataset<StateRepr> &TrainingDataset<StateRepr>::get_instance() {
@@ -22,6 +23,22 @@ TrainingDataset<StateRepr> &TrainingDataset<StateRepr>::get_instance() {
     std::exit(static_cast<int>(ExitHandler::ExitCode::ExitForCompiler));
   }
   return *instance;
+}
+
+template <StateRepresentation StateRepr>
+void TrainingDataset<StateRepr>::create_instance() {
+  if (!instance) {
+    instance = new TrainingDataset();
+  }
+}
+
+*/
+
+
+template <StateRepresentation StateRepr>
+TrainingDataset<StateRepr>& TrainingDataset<StateRepr>::get_instance() {
+  static TrainingDataset<StateRepr> instance;
+  return instance;
 }
 
 template <StateRepresentation StateRepr>
@@ -288,12 +305,6 @@ TrainingDataset<StateRepr>::TrainingDataset() {
   }
 }
 
-template <StateRepresentation StateRepr>
-void TrainingDataset<StateRepr>::create_instance() {
-  if (!instance) {
-    instance = new TrainingDataset();
-  }
-}
 
 template <StateRepresentation StateRepr>
 bool TrainingDataset<StateRepr>::generate_dataset() {

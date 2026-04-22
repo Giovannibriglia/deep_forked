@@ -5,7 +5,7 @@
 #include <regex>
 
 // --- Singleton instance initialization ---
-template <StateRepresentation StateRepr>
+/*template <StateRepresentation StateRepr>
 GraphNN<StateRepr> *GraphNN<StateRepr>::instance = nullptr;
 
 template <StateRepresentation StateRepr>
@@ -24,11 +24,17 @@ void GraphNN<StateRepr>::create_instance() {
   if (!instance) {
     instance = new GraphNN();
   }
+}*/
+
+template <StateRepresentation StateRepr>
+GraphNN<StateRepr> &GraphNN<StateRepr>::get_instance() {
+  thread_local GraphNN<StateRepr> instance;
+  return instance;
 }
 
 template <StateRepresentation StateRepr> GraphNN<StateRepr>::GraphNN() {
   // Use default StateRepresentation for dataset folder creation
-  TrainingDataset<StateRepr>::create_instance();
+  //TrainingDataset<StateRepr>::create_instance();
   m_checking_file_path =
       TrainingDataset<StateRepr>::get_instance().get_folder() +
       "to_predict.dot";

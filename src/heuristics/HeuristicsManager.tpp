@@ -46,7 +46,7 @@ HeuristicsManager<StateRepr>::HeuristicsManager(
     break;
   case Heuristics::GNN:
 #ifdef USE_NEURALNETS
-    GraphNN<StateRepr>::create_instance();
+    //GraphNN<StateRepr>::create_instance();
     break;
 #else
     ExitHandler::exit_with_message(

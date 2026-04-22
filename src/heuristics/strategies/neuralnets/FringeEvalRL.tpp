@@ -34,7 +34,7 @@ FringeEvalRL<StateRepr> &FringeEvalRL<StateRepr>::get_instance() {
 template <StateRepresentation StateRepr>
 FringeEvalRL<StateRepr>::FringeEvalRL() {
   // Create GNN if not created yet
-  GraphNN<StateRepr>::create_instance();
+  //GraphNN<StateRepr>::create_instance();
   initialize_onnx_model();
 }
 
