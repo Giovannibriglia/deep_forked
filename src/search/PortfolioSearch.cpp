@@ -163,7 +163,7 @@ bool PortfolioSearch::run_portfolio_search() const {
             }
             case SearchType::RL: {
 #ifdef USE_NEURALNETS
-                FringeEvalRL<KripkeState>::create_instance();
+                //FringeEvalRL<KripkeState>::create_instance();
                 SpaceSearcher<KripkeState, RL_BestFirst<KripkeState> > searcherRL{
                     RL_BestFirst<KripkeState>(initial_state), found_goal
                 };
@@ -313,6 +313,10 @@ void PortfolioSearch::set_default_configurations() {
 
     // m_search_configurations.push_back({{"search", "RL"}, {"heuristics",
     // "GNN"}});
+
+#ifdef DEBUG
+    m_search_configurations.clear();
+#endif
 
     // This is to test RL with the RL Heuristics
     m_search_configurations.push_back(
