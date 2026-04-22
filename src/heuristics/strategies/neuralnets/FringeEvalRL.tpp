@@ -4,14 +4,13 @@
 #include <regex>
 
 // --- Singleton instance initialization ---
-//template <StateRepresentation StateRepr>
-//FringeEvalRL<StateRepr> *FringeEvalRL<StateRepr>::instance = nullptr;
-
+// template <StateRepresentation StateRepr>
+// FringeEvalRL<StateRepr> *FringeEvalRL<StateRepr>::instance = nullptr;
 
 template <StateRepresentation StateRepr>
 FringeEvalRL<StateRepr> &FringeEvalRL<StateRepr>::get_instance() {
-    thread_local FringeEvalRL<StateRepr> instance;
-    return instance;
+  thread_local FringeEvalRL<StateRepr> instance;
+  return instance;
 }
 
 /*template <StateRepresentation StateRepr>

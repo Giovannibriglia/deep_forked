@@ -58,7 +58,7 @@ HeuristicsManager<StateRepr>::HeuristicsManager(
 #endif
   case Heuristics::RL_H:
 #ifdef USE_NEURALNETS
-    //FringeEvalRL<StateRepr>::create_instance();
+    // FringeEvalRL<StateRepr>::create_instance();
     if (Configuration::get_instance().get_search_strategy() != SearchType::RL) {
       ExitHandler::exit_with_message(
           ExitHandler::ExitCode::HeuristicsBadDeclaration,

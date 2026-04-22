@@ -83,7 +83,7 @@ public:
    * \brief Create the singleton instance of FringeEvalRL.
    */
 
-  ///static void create_instance();
+  /// static void create_instance();
 
   /**
    * \brief Get the scores for a set of states (fringe) using RL
@@ -112,7 +112,7 @@ private:
    */
   FringeEvalRL();
 
-  //static FringeEvalRL *instance; ///< Singleton instance pointer
+  // static FringeEvalRL *instance; ///< Singleton instance pointer
 
   std::string m_model_path = ArgumentParser::get_instance()
                                  .get_RL_model_path(); ///< Path to the RL model
