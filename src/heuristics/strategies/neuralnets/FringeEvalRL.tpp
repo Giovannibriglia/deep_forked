@@ -462,14 +462,14 @@ std::vector<float> FringeEvalRL<StateRepr>::rankScores(const float *scores,
     ranks[paired[i].second] = static_cast<float>(i);
   }
 
-/*#ifdef DEBUG
-  std::cout << "[";
-  for (size_t i = 0; i < n; ++i) {
-    std::cout << scores[i] << ", " << ranks[i];
-    if (i + 1 < n)
-      std::cout << " -- ";
-  }
-  std::cout << "]\n";
-#endif*/
+  /*#ifdef DEBUG
+    std::cout << "[";
+    for (size_t i = 0; i < n; ++i) {
+      std::cout << scores[i] << ", " << ranks[i];
+      if (i + 1 < n)
+        std::cout << " -- ";
+    }
+    std::cout << "]\n";
+  #endif*/
   return ranks;
 }
