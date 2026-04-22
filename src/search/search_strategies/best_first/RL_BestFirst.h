@@ -95,12 +95,17 @@ public:
   }
 
   [[nodiscard]] std::string get_name() const override {
-    return std::string("RLBeam x BestFirst search (") +
-           (m_refill_mode == RefillMode::RANDOM
-                ? std::string("random")
-                : std::string("heuristic: ") +
-                      this->m_heuristics_manager.get_used_h_name()) +
-           ")";
+    std::string name = "RLBeam x BestFirst search (";
+    if (m_refill_mode == RefillMode::RANDOM) {
+      name += "random)";
+    } else {
+      name += "heuristic: " + this->m_heuristics_manager.get_used_h_name();
+      if (this->m_heuristics_manager.get_used_h() == Heuristics::RL_H) {
+        name += "-" + Configuration::get_instance().get_RL_heuristics_name();
+      }
+      name += ")";
+    }
+    return name;
   }
 
   void pop() override {

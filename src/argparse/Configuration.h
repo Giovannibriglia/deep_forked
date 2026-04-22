@@ -107,8 +107,9 @@ public:
   /**
    * \brief Sets the heuristic option.
    * \param val The heuristic option enum.
+   * \param check_consistency True if we want that to impose with this that the value of the heurisrics makes sense with the search strategy. Might be False if set from map when order of fields is not correct
    */
-  void set_heuristic_opt(const std::string &val);
+  void set_heuristic_opt(const std::string &val, bool check_consistency);
 
   /**
    * @brief Get the number of derived states (from expansion) to add to the RL
@@ -129,6 +130,9 @@ public:
    * @return RL heuristic type.
    */
   [[nodiscard]] RLHeuristicType get_RL_heuristics() const noexcept;
+
+    [[nodiscard]] std::string get_RL_heuristics_name() const noexcept;
+
 
   /**
    * @brief Set the RL heuristic selection from string.
@@ -169,12 +173,6 @@ public:
    */
   [[nodiscard]] const std::string &get_GNN_constant_path() const noexcept;
 
-  /**
-   * \brief Sets the field of the class to value
-   * \param field The name of the field to set (based on the parsing from
-   * command line) \param value The value to set the field to.
-   */
-  void set_field_by_name(const std::string &field, const std::string &value);
   void set_search_strategy_enum();
 
   /**
@@ -190,6 +188,8 @@ public:
    * \param os The output stream to print to.
    */
   void print(std::ostream &os) const;
+
+  void set_from_config_map(const std::map<std::string, std::string> & map);
 
 private:
   /**
@@ -231,6 +231,13 @@ private:
    * \brief Sets the bisimulation type as a boolean.
    */
   void set_bisimulation_type_bool();
+
+    /**
+ * \brief Sets the field of the class to value
+ * \param field The name of the field to set (based on the parsing from
+ * command line) \param value The value to set the field to.
+ */
+    void set_field_by_name(const std::string &field, const std::string &value);
 
   /**
    * \brief Thread-local flag to track initialization per thread.

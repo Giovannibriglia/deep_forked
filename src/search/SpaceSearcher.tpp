@@ -114,9 +114,9 @@ bool SpaceSearcher<StateRepr, Strategy>::search_sequential(
       configuration.get_search_strategy() == SearchType::RL;
 
   std::vector<State<StateRepr>> fringe_RL;
-#if DEBUG
+/*#if DEBUG
   ActionIdsList act_list_fringe;
-#endif
+#endif*/
 
   std::set<State<StateRepr>> visited_states;
   /// \warning cannot use unordered_set because I am missing a clear way of
@@ -138,16 +138,16 @@ bool SpaceSearcher<StateRepr, Strategy>::search_sequential(
     m_strategy.pop();
     ++m_expanded_nodes;
 
-#ifdef DEBUG
+ /*  #ifdef DEBUG
 
-    /*       if (m_expanded_nodes % 250 == 0)
+        if (m_expanded_nodes % 250 == 0)
            {
                auto& os = ArgumentParser::get_instance().get_output_stream();
                os << "[DEBUG] Expanded nodes: " << m_expanded_nodes <<
        std::endl;
            }
- */
-#endif
+
+#endif */
 
     for (const auto &action : actions) {
       if (current.is_executable(action)) {
@@ -171,9 +171,9 @@ bool SpaceSearcher<StateRepr, Strategy>::search_sequential(
             m_strategy.push(successor);
           }
 
-#if DEBUG
+/*#if DEBUG
           act_list_fringe.push_back(action.get_id());
-#endif
+#endif*/
           fringe_RL.push_back(successor);
         }
       }
@@ -181,12 +181,12 @@ bool SpaceSearcher<StateRepr, Strategy>::search_sequential(
     if (is_RL_search &&
         (fringe_RL.size() >= static_cast<size_t>(RL_node_to_add) ||
          m_strategy.empty())) {
-#if DEBUG
+/*#if DEBUG
       ArgumentParser::get_instance().get_output_stream() << std::endl;
       HelperPrint::get_instance().print_list(act_list_fringe);
       ArgumentParser::get_instance().get_output_stream() << std::endl;
       act_list_fringe.clear();
-#endif
+#endif*/
       m_strategy.push_vector(fringe_RL);
       fringe_RL.clear();
     }

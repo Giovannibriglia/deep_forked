@@ -49,7 +49,7 @@ Configuration &Configuration::get_instance() {
     instance.set_bisimulation_type(parser.get_bisimulation_type());
     instance.set_check_visited(parser.get_check_visited());
     instance.set_search_strategy(parser.get_search_strategy());
-    instance.set_heuristic_opt(parser.get_heuristic());
+    instance.set_heuristic_opt(parser.get_heuristic(), true);
     instance.set_GNN_model_path(parser.get_GNN_model_path());
     instance.set_GNN_constant_path(parser.get_GNN_constant_path());
     instance.set_RL_heuristics(parser.get_RL_heur_selection());
@@ -105,11 +105,11 @@ const Heuristics &Configuration::get_heuristic_opt() const noexcept {
   return m_heuristic_enum;
 }
 
-void Configuration::set_heuristic_opt(const std::string &val) {
+void Configuration::set_heuristic_opt(const std::string &val, const bool check_consistency = true) {
   m_heuristic_opt = val;
   set_heuristic_enum();
 
-  if (m_heuristic_opt == "RL_H" && m_search_strategy != "RL") {
+  if (check_consistency && m_heuristic_opt == "RL_H" && m_search_strategy != "RL") {
     ExitHandler::exit_with_message(
         ExitHandler::ExitCode::ArgParseError,
         "Heuristic RL_H can only be used with RL search.");
@@ -163,7 +163,7 @@ void Configuration::set_field_by_name(const std::string &field,
   else if (field == "search" || field == "s")
     set_search_strategy(value);
   else if (field == "heuristics" || field == "u")
-    set_heuristic_opt(value);
+    set_heuristic_opt(value,false);
   else if (field == "GNN_model")
     set_GNN_model_path(value);
   else if (field == "GNN_constant_file")
@@ -234,7 +234,7 @@ void Configuration::set_heuristic_enum() {
 }
 
 void Configuration::set_RL_heuristics(const std::string &val) {
-  m_heuristic_opt = val;
+  m_RL_heuristics_opt = val;
   set_RL_heuristics_enum();
 }
 
@@ -245,6 +245,8 @@ void Configuration::set_RL_heuristics_enum() {
     m_RL_heuristics_enum = RLHeuristicType::MAX;
   } else if (m_RL_heuristics_opt == "AVG") {
     m_RL_heuristics_enum = RLHeuristicType::AVG;
+  } else if (m_RL_heuristics_opt == "RNG") {
+    m_RL_heuristics_enum = RLHeuristicType::RNG;
   } else {
     ExitHandler::exit_with_message(
         ExitHandler::ExitCode::ArgParseError,
@@ -254,6 +256,10 @@ void Configuration::set_RL_heuristics_enum() {
 
 RLHeuristicType Configuration::get_RL_heuristics() const noexcept {
   return m_RL_heuristics_enum;
+}
+
+std::string Configuration::get_RL_heuristics_name() const noexcept {
+  return m_RL_heuristics_opt;
 }
 
 void Configuration::print(std::ostream &os) const {
@@ -294,5 +300,18 @@ void Configuration::print(std::ostream &os) const {
   }
   if (m_heuristic_enum == Heuristics::RL_H) {
     os << "    RL heuristics used is: " << m_RL_heuristics_opt << std::endl;
+  }
+}
+
+void Configuration::set_from_config_map(const std::map<std::string, std::string> &map) {
+  for (const auto &[key, value]: map) {
+    set_field_by_name(key, value);
+  }
+
+  //consistency check after map assignment (deactivated in function before because order of fields might not be correct)
+  if (m_heuristic_opt == "RL_H" && m_search_strategy != "RL") {
+    ExitHandler::exit_with_message(
+        ExitHandler::ExitCode::ArgParseError,
+        "Heuristic RL_H can only be used with RL search.");
   }
 }
