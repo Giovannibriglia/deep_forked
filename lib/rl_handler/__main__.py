@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import matplotlib.pyplot as plt
 import networkx as nx
 import pydot
 import re
@@ -9,9 +11,13 @@ import torch
 from dataclasses import dataclass
 from pathlib import Path
 from tqdm import tqdm
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from src.data import (
+    FRONTIER_LABEL_COMMON,
+    FRONTIER_LABEL_CONSERVATIVE,
+    FRONTIER_LABEL_GREEDY,
+    FRONTIER_LABEL_RANDOM,
     build_frontier_dataloader,
     build_frontier_samples,
     build_random_eval_frontiers_for_dataset,
@@ -136,8 +142,18 @@ def parse_args():
             "this fraction of train frontiers that have at least one failure state."
         ),
     )
+    parser.add_argument(
+        "--train-frontier-jaccard-threshold",
+        type=ratio_0_1,
+        default=0.75,
+        help=(
+            "Prune near-duplicate train frontiers using Jaccard similarity over "
+            "successor_ids. Keep the first frontier and drop later ones with "
+            "similarity >= threshold within the same dataset/label/size/failure bucket."
+        ),
+    )
 
-    parser.add_argument("--batch-size", type=int, default=9092)
+    parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--n-train-epochs", type=int, default=200)
     parser.add_argument("--eval-every", type=int, default=25)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -165,6 +181,17 @@ def parse_args():
     parser.add_argument("--conv-type", choices=["gine", "rgcn", "gcn"], default="gine")
     parser.add_argument("--pooling-type", choices=["mean", "sum", "max"], default="mean")
     parser.add_argument("--edge-emb-dim", type=int, default=32)
+    parser.add_argument(
+        "--K",
+        "--edge-label-buckets",
+        dest="edge_label_buckets",
+        type=int,
+        default=256,
+        help=(
+            "Fixed number of edge-label buckets (K) used by the model "
+            "edge embedding table."
+        ),
+    )
     parser.add_argument("--num-node-labels", type=int, default=4096)
     parser.add_argument("--use-global-context", type=str2bool, default=True)
     parser.add_argument("--mlp-depth", type=int, default=2)
@@ -185,6 +212,30 @@ def parse_args():
     parser.add_argument("--train", type=str2bool, default=True)
     parser.add_argument("--evaluate", type=str2bool, default=False)
     parser.add_argument("--export-onnx", type=str2bool, default=True)
+    parser.add_argument(
+        "--onnx-frontier-size",
+        type=int,
+        default=32,
+        help="Frontier size used for ONNX export tracing.",
+    )
+    parser.add_argument(
+        "--train-random-frontier-ratio",
+        type=ratio_0_1,
+        default=0.2,
+        help=(
+            "Number of random frontiers is this ratio times the count of "
+            "post-processed greedy/conservative/common frontiers."
+        ),
+    )
+    parser.add_argument(
+        "--train-random-frontier-with-failure-ratio",
+        type=ratio_0_1,
+        default=0.4,
+        help=(
+            "Target fraction of random frontiers that must include at least "
+            "one failure state (each frontier still includes a non-failure state)."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -246,9 +297,14 @@ def _build_or_load_train_samples(args, data_root: Path):
             failure_reward_value=args.failure_reward_value,
             n_max_dataset_queries=int(args.n_max_dataset_queries),
             max_size_frontier=int(args.max_size_frontier),
+            onnx_frontier_size=int(args.onnx_frontier_size),
+            train_random_frontier_ratio=float(args.train_random_frontier_ratio),
+            train_random_with_failure_ratio=float(args.train_random_frontier_with_failure_ratio),
+            train_frontier_jaccard_threshold=float(args.train_frontier_jaccard_threshold),
             build_eval_data=False,
         )
-        torch.save(list(train_samples), train_path)
+        train_samples = train_samples if isinstance(train_samples, list) else list(train_samples)
+        torch.save(train_samples, train_path)
         torch.save(dict(params or {}), params_path)
 
     if not train_path.exists():
@@ -259,7 +315,8 @@ def _build_or_load_train_samples(args, data_root: Path):
 
     train_samples = torch.load(train_path, weights_only=False)
     params = torch.load(params_path, weights_only=False) if params_path.exists() else {}
-    return list(train_samples), dict(params or {}), {"train": train_path, "params": params_path}
+    train_samples = train_samples if isinstance(train_samples, list) else list(train_samples)
+    return train_samples, dict(params or {}), {"train": train_path, "params": params_path}
 
 
 def _collect_clean_frontier_entries(
@@ -600,6 +657,148 @@ def _limit_failure_frontiers_in_train_dataset(
     }
 
 
+def _sample_successor_id_set(sample: Dict[str, Any]) -> set[str]:
+    successor_ids = sample.get("successor_ids")
+    if not isinstance(successor_ids, (list, tuple)):
+        return set()
+    out: set[str] = set()
+    for raw in successor_ids:
+        value = str(raw).strip()
+        if value:
+            out.add(value)
+    return out
+
+
+def _required_overlap_for_jaccard(size_a: int, size_b: int, threshold: float) -> int:
+    if threshold <= 0.0:
+        return 1
+    rhs = float(threshold) * float(int(size_a) + int(size_b)) / float(1.0 + float(threshold))
+    return max(1, int(math.ceil(rhs - 1e-12)))
+
+
+def _prune_near_duplicate_frontiers_by_jaccard(
+    train_samples: Sequence[Dict[str, Any]],
+    jaccard_similarity_threshold: float,
+) -> Tuple[list[Dict[str, Any]], Dict[str, Any]]:
+    threshold = float(jaccard_similarity_threshold)
+    if not train_samples:
+        return [], {
+            "threshold": float(threshold),
+            "n_total": 0,
+            "n_kept": 0,
+            "n_dropped": 0,
+            "n_missing_successor_ids": 0,
+            "n_groups": 0,
+        }
+
+    groups: Dict[Tuple[str, str, int, int], Dict[str, Any]] = {}
+    token_to_id: Dict[str, int] = {}
+    next_token_id = 0
+    kept_samples: list[Dict[str, Any]] = []
+    dropped = 0
+    missing_successor_ids = 0
+
+    for sample in train_samples:
+        successor_set = _sample_successor_id_set(sample)
+        if not successor_set:
+            kept_samples.append(sample)
+            missing_successor_ids += 1
+            continue
+        successor_token_ids: set[int] = set()
+        for token in successor_set:
+            token_id = token_to_id.get(token)
+            if token_id is None:
+                token_id = int(next_token_id)
+                token_to_id[token] = token_id
+                next_token_id += 1
+            successor_token_ids.add(int(token_id))
+
+        frontier_size = int(len(successor_token_ids))
+        group_key = (
+            str(sample.get("dataset_id", "")),
+            _normalize_frontier_label(sample.get("frontier_label", FRONTIER_LABEL_COMMON)),
+            int(frontier_size),
+            int(_sample_has_failure_state(sample)),
+        )
+        group = groups.setdefault(
+            group_key,
+            {
+                "sizes": [],
+                "inverted_index": {},
+            },
+        )
+        sizes = group["sizes"]
+        inverted_index = group["inverted_index"]
+
+        overlap_by_candidate: Dict[int, int] = {}
+        required_overlap = _required_overlap_for_jaccard(
+            size_a=int(frontier_size),
+            size_b=int(frontier_size),
+            threshold=float(threshold),
+        )
+        seed_token = min(
+            successor_token_ids,
+            key=lambda token_id: len(inverted_index.get(int(token_id), [])),
+        )
+        ordered_tokens: List[int] = [int(seed_token)]
+        for token_id in successor_token_ids:
+            if int(token_id) == int(seed_token):
+                continue
+            ordered_tokens.append(int(token_id))
+
+        remaining_tokens = int(frontier_size)
+        drop_current = False
+        size_a = int(frontier_size)
+        for token_id in ordered_tokens:
+            remaining_tokens = int(max(0, remaining_tokens - 1))
+            postings = inverted_index.get(int(token_id), [])
+            if not postings:
+                continue
+            for candidate_idx in postings:
+                candidate_i = int(candidate_idx)
+                new_overlap = int(overlap_by_candidate.get(candidate_i, 0) + 1)
+                overlap_by_candidate[candidate_i] = int(new_overlap)
+                if int(new_overlap) < int(required_overlap):
+                    continue
+                size_b = int(sizes[candidate_i])
+                denom = int(size_a + size_b - int(new_overlap))
+                similarity = (float(new_overlap) / float(denom)) if denom > 0 else 1.0
+                if similarity >= threshold:
+                    drop_current = True
+                    break
+            if drop_current:
+                break
+
+            if overlap_by_candidate and remaining_tokens > 0 and required_overlap > 1:
+                impossible = [
+                    candidate_i
+                    for candidate_i, overlap in overlap_by_candidate.items()
+                    if int(overlap) + int(remaining_tokens) < int(required_overlap)
+                ]
+                for candidate_i in impossible:
+                    del overlap_by_candidate[int(candidate_i)]
+
+        if drop_current:
+            dropped += 1
+            continue
+
+        local_idx = int(len(sizes))
+        sizes.append(size_a)
+        for token_id in successor_token_ids:
+            bucket = inverted_index.setdefault(int(token_id), [])
+            bucket.append(local_idx)
+        kept_samples.append(sample)
+
+    return kept_samples, {
+        "threshold": float(threshold),
+        "n_total": int(len(train_samples)),
+        "n_kept": int(len(kept_samples)),
+        "n_dropped": int(dropped),
+        "n_missing_successor_ids": int(missing_successor_ids),
+        "n_groups": int(len(groups)),
+    }
+
+
 def _count_sample_states(sample: Dict[str, Any]) -> Tuple[int, int]:
     is_failure = sample.get("is_failure")
     if isinstance(is_failure, torch.Tensor):
@@ -909,6 +1108,134 @@ def _infer_num_candidates(sample: Dict[str, Any]) -> int:
     if isinstance(membership, torch.Tensor) and membership.numel() > 0:
         return int(membership.max().item()) + 1
     return 0
+
+
+FRONTIER_STRATEGY_LABELS = [
+    FRONTIER_LABEL_GREEDY,
+    FRONTIER_LABEL_CONSERVATIVE,
+    FRONTIER_LABEL_RANDOM,
+    FRONTIER_LABEL_COMMON,
+]
+
+
+def _normalize_frontier_label(value: Any) -> str:
+    raw = str(value).strip().lower()
+    if raw in {
+        FRONTIER_LABEL_GREEDY,
+        FRONTIER_LABEL_CONSERVATIVE,
+        FRONTIER_LABEL_RANDOM,
+        FRONTIER_LABEL_COMMON,
+    }:
+        return raw
+    return FRONTIER_LABEL_COMMON
+
+
+def _build_train_frontier_definitions_for_dataloader(
+    train_samples: Sequence[Dict[str, Any]],
+) -> list[Dict[str, Any]]:
+    out: list[Dict[str, Any]] = []
+    for sample in train_samples:
+        successor_ids_raw = sample.get("successor_ids")
+        successor_ids = (
+            [str(x) for x in successor_ids_raw]
+            if isinstance(successor_ids_raw, (list, tuple))
+            else []
+        )
+        frontier_size = int(len(successor_ids))
+        if frontier_size <= 0:
+            frontier_size = int(_infer_num_candidates(sample))
+
+        out.append(
+            {
+                "dataset_id": str(sample.get("dataset_id", "")),
+                "predecessor_path": str(sample.get("predecessor_path", "")),
+                "goal_path": str(sample.get("goal_path", "")),
+                "frontier_label": _normalize_frontier_label(
+                    sample.get("frontier_label", FRONTIER_LABEL_COMMON)
+                ),
+                "successor_ids": successor_ids,
+                "frontier_size": int(frontier_size),
+                "frontier_has_failure": int(_sample_has_failure_state(sample)),
+            }
+        )
+    return out
+
+
+def _build_train_frontier_size_label_distribution(
+    train_samples: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    counts_by_label: Dict[str, Dict[int, int]] = {
+        label: {} for label in FRONTIER_STRATEGY_LABELS
+    }
+    for sample in train_samples:
+        size = int(_infer_num_candidates(sample))
+        if size <= 0:
+            continue
+        label = _normalize_frontier_label(sample.get("frontier_label", FRONTIER_LABEL_COMMON))
+        label_counts = counts_by_label.setdefault(label, {})
+        label_counts[size] = int(label_counts.get(size, 0) + 1)
+
+    sizes = sorted(
+        {
+            int(size)
+            for label_counts in counts_by_label.values()
+            for size in label_counts.keys()
+        }
+    )
+    by_label: Dict[str, Dict[str, Any]] = {}
+    for label in FRONTIER_STRATEGY_LABELS:
+        label_counts = counts_by_label.get(label, {})
+        total = int(sum(label_counts.values()))
+        by_size = []
+        for size in sizes:
+            count = int(label_counts.get(int(size), 0))
+            by_size.append(
+                {
+                    "frontier_size": int(size),
+                    "count": int(count),
+                    "frequency": float(count / total) if total > 0 else 0.0,
+                }
+            )
+        by_label[str(label)] = {
+            "total": int(total),
+            "by_size": by_size,
+        }
+
+    return {
+        "sizes": [int(size) for size in sizes],
+        "labels": by_label,
+    }
+
+
+def _plot_train_frontier_size_label_distribution(
+    train_samples: Sequence[Dict[str, Any]],
+    out_path: Path,
+) -> Dict[str, Any]:
+    dist = _build_train_frontier_size_label_distribution(train_samples)
+    sizes = [int(x) for x in dist.get("sizes", [])]
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8), dpi=300, sharex=True, sharey=True)
+    axis_list = [axes[0, 0], axes[0, 1], axes[1, 0], axes[1, 1]]
+    for idx, label in enumerate(FRONTIER_STRATEGY_LABELS):
+        ax = axis_list[idx]
+        label_payload = dist.get("labels", {}).get(label, {})
+        by_size = label_payload.get("by_size", [])
+        y_counts = [int(item.get("count", 0)) for item in by_size]
+        if sizes and any(v > 0 for v in y_counts):
+            ax.plot(sizes, y_counts, marker="o", linewidth=1.8)
+        else:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(label)
+        ax.set_xlabel("Frontier Size")
+        ax.set_ylabel("Frontier Count")
+        ax.grid(alpha=0.2, linewidth=0.5)
+
+    fig.suptitle("Train Frontier Size Distribution by Strategy", y=0.98)
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.96])
+    plt.savefig(out_path)
+    plt.close()
+    return dist
 
 
 def _sample_rewards_tensor(sample: Dict[str, Any]) -> torch.Tensor:
@@ -1781,11 +2108,28 @@ def main(args):
         max_regular_distance_for_reward=float(args.max_regular_distance_for_reward),
         failure_reward_value=float(args.failure_reward_value),
     )
+    metrics_root = model_root / "metrics"
+    metrics_root.mkdir(parents=True, exist_ok=True)
+    train_metrics_dir = metrics_root / "train"
+    train_metrics_dir.mkdir(parents=True, exist_ok=True)
+    train_size_dist_plot_path = train_metrics_dir / "frontier_size_distribution_by_strategy.png"
+    train_size_dist_json_path = train_metrics_dir / "frontier_size_distribution_by_strategy.json"
+
     train_samples, train_filter_stats = _limit_failure_frontiers_in_train_dataset(
         train_samples=train_samples,
         max_failure_states_per_dataset=float(args.max_failure_states_per_dataset),
         seed=int(args.seed),
     )
+    train_samples, train_jaccard_prune_stats = _prune_near_duplicate_frontiers_by_jaccard(
+        train_samples=train_samples,
+        jaccard_similarity_threshold=float(args.train_frontier_jaccard_threshold),
+    )
+    train_size_strategy_distribution = _plot_train_frontier_size_label_distribution(
+        train_samples=train_samples,
+        out_path=train_size_dist_plot_path,
+    )
+    with train_size_dist_json_path.open("w", encoding="utf-8") as fh:
+        json.dump(train_size_strategy_distribution, fh, indent=2)
     train_state_stats_overall, train_state_stats_by_dataset = _build_train_state_stats(
         train_samples
     )
@@ -1800,6 +2144,14 @@ def main(args):
         f"{train_filter_stats['n_total_kept']}"
     )
     print(
+        "[dataset-prune] train near-duplicates | threshold="
+        f"{float(args.train_frontier_jaccard_threshold):.3f} | total="
+        f"{train_jaccard_prune_stats['n_total']} | kept="
+        f"{train_jaccard_prune_stats['n_kept']} | dropped="
+        f"{train_jaccard_prune_stats['n_dropped']} | missing_successor_ids="
+        f"{train_jaccard_prune_stats['n_missing_successor_ids']}"
+    )
+    print(
         "[dataset-filter] train states | failure/all="
         f"{train_state_stats_overall['train_n_failure_states']}/"
         f"{train_state_stats_overall['train_n_all_states']}"
@@ -1808,6 +2160,29 @@ def main(args):
     if not train_samples:
         raise ValueError(
             f"No training frontiers loaded from {sample_paths['train']} after filtering."
+        )
+
+    train_frontier_definitions_path = train_metrics_dir / "frontier_definitions_for_dataloader.pt"
+    train_frontier_definitions_meta_path = (
+        train_metrics_dir / "frontier_definitions_for_dataloader_meta.json"
+    )
+    train_frontier_definitions = _build_train_frontier_definitions_for_dataloader(train_samples)
+    torch.save(train_frontier_definitions, train_frontier_definitions_path)
+    with train_frontier_definitions_meta_path.open("w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "n_frontiers": int(len(train_frontier_definitions)),
+                "source_train_samples_path": sample_paths["train"].as_posix(),
+                "source_samples_params_path": sample_paths["params"].as_posix(),
+                "max_failure_states_per_dataset": float(args.max_failure_states_per_dataset),
+                "train_frontier_jaccard_threshold": float(args.train_frontier_jaccard_threshold),
+                "train_frontier_jaccard_pruning": train_jaccard_prune_stats,
+                "seed": int(args.seed),
+                "batch_size": int(args.batch_size),
+                "num_workers": int(args.num_workers),
+            },
+            fh,
+            indent=2,
         )
 
     train_loader = build_frontier_dataloader(
@@ -1843,7 +2218,25 @@ def main(args):
     dataset_type_norm = str(args.dataset_type).upper()
     node_input_dim = 1 if dataset_type_norm == "HASHED" else int(train_samples[0]["node_features"].size(1))
     use_goal_separate_input = args.kind_of_data == "separated"
-    num_edge_labels = _infer_num_edge_labels(train_samples)
+    inferred_num_edge_labels = _infer_num_edge_labels(train_samples)
+    num_edge_labels = int(args.edge_label_buckets)
+    if num_edge_labels <= 0:
+        raise ValueError("--K/--edge-label-buckets must be > 0.")
+
+    print(
+        "[model] edge labels | inferred_train="
+        f"{inferred_num_edge_labels} | K={num_edge_labels}"
+    )
+    print(
+        "[model] edge-id bucketing: bucket = abs(edge_id) % K "
+        "(applied in-model and exported to ONNX)."
+    )
+    if (not bool(args.train)):
+        print(
+            "[warning] --train is false: --K/--edge-label-buckets only affects "
+            "newly trained checkpoints/exports. Existing checkpoints keep "
+            "their saved architecture."
+        )
 
     model = FrontierPolicyNetwork(
         node_input_dim=node_input_dim,
@@ -1868,10 +2261,6 @@ def main(args):
         max_grad_norm=args.max_grad_norm,
     )
 
-    metrics_root = model_root / "metrics"
-    metrics_root.mkdir(parents=True, exist_ok=True)
-    train_metrics_dir = metrics_root / "train"
-    train_metrics_dir.mkdir(parents=True, exist_ok=True)
     eval_onnx_root = metrics_root / "eval_onnx"
     eval_onnx_root.mkdir(parents=True, exist_ok=True)
     onnx_reports_dir = metrics_root / "onnx"
@@ -1964,7 +2353,11 @@ def main(args):
             )
             if should_eval:
                 eval_step += 1
-                trainer.to_onnx(onnx_path, node_input_dim=node_input_dim)
+                trainer.to_onnx(
+                    onnx_path,
+                    node_input_dim=node_input_dim,
+                    onnx_frontier_size=int(args.onnx_frontier_size),
+                )
                 step_summary_path = (
                     eval_step_reports_dir / f"step_{eval_step:04d}_epoch_{epoch + 1:04d}.json"
                 )
@@ -2100,7 +2493,11 @@ def main(args):
 
     must_export_onnx = bool(args.export_onnx) or bool(args.evaluate)
     if must_export_onnx:
-        trainer.to_onnx(onnx_path, node_input_dim=node_input_dim)
+        trainer.to_onnx(
+            onnx_path,
+            node_input_dim=node_input_dim,
+            onnx_frontier_size=int(args.onnx_frontier_size),
+        )
 
     final_eval_metrics: Dict[str, Dict[str, Any]] = {}
     if bool(args.evaluate):
@@ -2169,6 +2566,22 @@ def main(args):
         else 0.0
     )
     split_summary["max_failure_states_per_dataset"] = float(args.max_failure_states_per_dataset)
+    split_summary["train_frontier_jaccard_threshold"] = float(args.train_frontier_jaccard_threshold)
+    split_summary["train_frontier_jaccard_pruning"] = train_jaccard_prune_stats
+    split_summary["onnx_frontier_size"] = int(args.onnx_frontier_size)
+    split_summary["train_random_frontier_ratio"] = float(args.train_random_frontier_ratio)
+    split_summary["train_random_frontier_with_failure_ratio"] = float(
+        args.train_random_frontier_with_failure_ratio
+    )
+    split_summary["train_frontier_size_distribution"] = train_size_strategy_distribution
+    split_summary["train_frontier_size_distribution_plot"] = train_size_dist_plot_path.as_posix()
+    split_summary["train_frontier_size_distribution_json"] = train_size_dist_json_path.as_posix()
+    split_summary["train_frontier_definitions_for_dataloader"] = (
+        train_frontier_definitions_path.as_posix()
+    )
+    split_summary["train_frontier_definitions_for_dataloader_meta"] = (
+        train_frontier_definitions_meta_path.as_posix()
+    )
     split_summary["query_counts"] = _query_counts(flat_query_splits)
     split_summary["query_bundle_path"] = (
         query_bundle_path.as_posix() if query_bundle_path is not None else ""
@@ -2195,6 +2608,9 @@ def main(args):
     with (model_root / f"{args.model_name}_info.txt").open("w", encoding="utf-8") as fh:
         for key, value in vars(args).items():
             fh.write(f"{key} = {value}\n")
+        fh.write(f"inferred_num_edge_labels = {inferred_num_edge_labels}\n")
+        fh.write(f"effective_num_edge_labels = {num_edge_labels}\n")
+        fh.write("edge_id_bucket_mapping = abs(edge_id) % effective_num_edge_labels\n")
         fh.write(f"samples_train_path = {sample_paths['train']}\n")
         fh.write(f"samples_params_path = {sample_paths['params']}\n")
         fh.write(f"query_bundle_path = {query_bundle_path.as_posix() if query_bundle_path else ''}\n")
