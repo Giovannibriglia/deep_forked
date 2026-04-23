@@ -1043,6 +1043,13 @@ def _frontier_successor_path_set(frontier: Dict[str, Any]) -> set[str]:
     return out
 
 
+def _frontier_jaccard_bucket_key(frontier: Dict[str, Any], frontier_size: int) -> Tuple[str, int]:
+    return (
+        str(frontier.get("dataset_id", "")),
+        int(frontier_size),
+    )
+
+
 def _required_overlap_for_jaccard(size_a: int, size_b: int, threshold: float) -> int:
     if threshold <= 0.0:
         return 1
@@ -1055,6 +1062,8 @@ def _prune_frontiers_by_jaccard_similarity(
     jaccard_similarity_threshold: float,
     failure_reward_value: float,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    # Kept for API compatibility. Jaccard pruning now depends only on dataset + frontier size.
+    _ = failure_reward_value
     threshold = float(jaccard_similarity_threshold)
     if not frontiers:
         return [], {
@@ -1066,7 +1075,7 @@ def _prune_frontiers_by_jaccard_similarity(
             "n_groups": 0,
         }
 
-    groups: Dict[Tuple[str, str, int, int], Dict[str, Any]] = {}
+    groups: Dict[Tuple[str, int], Dict[str, Any]] = {}
     token_to_id: Dict[str, int] = {}
     next_token_id = 0
     kept_frontiers: List[Dict[str, Any]] = []
@@ -1088,15 +1097,10 @@ def _prune_frontiers_by_jaccard_similarity(
                 next_token_id += 1
             successor_token_ids.add(int(token_id))
 
-        rewards = [float(x) for x in frontier.get("rewards", [])]
-        has_failure = int(
-            any(_is_failure_reward(float(r), float(failure_reward_value)) for r in rewards)
-        )
-        group_key = (
-            str(frontier.get("dataset_id", "")),
-            str(frontier.get("frontier_label", FRONTIER_LABEL_COMMON)),
-            int(len(successor_token_ids)),
-            int(has_failure),
+        size_a = int(len(successor_token_ids))
+        group_key = _frontier_jaccard_bucket_key(
+            frontier=frontier,
+            frontier_size=int(size_a),
         )
         group = groups.setdefault(
             group_key,
@@ -1109,7 +1113,6 @@ def _prune_frontiers_by_jaccard_similarity(
         inverted_index = group["inverted_index"]
 
         overlap_by_candidate: Dict[int, int] = {}
-        size_a = int(len(successor_token_ids))
         required_overlap = _required_overlap_for_jaccard(
             size_a=int(size_a),
             size_b=int(size_a),

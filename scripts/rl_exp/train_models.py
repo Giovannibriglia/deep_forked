@@ -2,6 +2,7 @@ import argparse
 import concurrent.futures
 import multiprocessing
 import os
+import re
 import subprocess
 import time
 
@@ -15,6 +16,25 @@ def find_training_data_folders(batch_root):
     return training_data_folders
 
 
+def parse_onnx_frontier_size_values(raw_value):
+    text = str(raw_value).strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1].strip()
+    if not text:
+        raise ValueError("--onnx-frontier-size requires at least one value.")
+
+    values = []
+    seen = set()
+    for token in [tok for tok in re.split(r"[,\s]+", text) if tok]:
+        size = int(token)
+        if size <= 0:
+            raise ValueError("--onnx-frontier-size values must be > 0.")
+        if size not in seen:
+            seen.add(size)
+            values.append(size)
+    return values
+
+
 def run_training(
     training_data_folder,
     no_goal,
@@ -22,7 +42,7 @@ def run_training(
     edge_label_buckets,
     max_regular_distance_for_reward,
     n_max_dataset_queries,
-    onnx_frontier_size,
+    onnx_frontier_sizes,
     train_random_frontier_ratio,
     train_random_frontier_with_failure_ratio,
     lr,
@@ -31,7 +51,7 @@ def run_training(
     early_stopping_patience_evals,
     failure_reward_value,
     train_frontier_jaccard_threshold,
-    num_workers,
+    eval_frontier_jaccard_threshold,
     build_data,
     build_eval_data,
     evaluate,
@@ -74,7 +94,7 @@ def run_training(
         "--n-max-dataset-queries",
         str(n_max_dataset_queries),
         "--onnx-frontier-size",
-        str(onnx_frontier_size),
+        *[str(v) for v in onnx_frontier_sizes],
         "--train-random-frontier-ratio",
         str(train_random_frontier_ratio),
         "--train-random-frontier-with-failure-ratio",
@@ -93,8 +113,8 @@ def run_training(
         str(early_stopping_patience_evals),
         "--train-frontier-jaccard-threshold",
         str(train_frontier_jaccard_threshold),
-        "--num-workers",
-        str(num_workers),
+        "--eval-frontier-jaccard-threshold",
+        str(eval_frontier_jaccard_threshold),
     ]
     if no_goal:
         cmd.extend(["--kind-of-data", "separated"])
@@ -146,14 +166,18 @@ def main():
     parser.add_argument(
         "--n-max-dataset-queries",
         type=int,
-        default=1000,
-        help="Max generated ONNX-eval queries per dataset for random/fifo/stress.",
+        default=500,
+        help="Max generated ONNX-eval strategy frontiers per dataset.",
     )
     parser.add_argument(
         "--onnx-frontier-size",
         type=int,
-        default=32,
-        help="Frontier size used for ONNX export tracing.",
+        nargs="+",
+        default=[32, 64, 128],
+        help=(
+            "Frontier size used for ONNX export tracing. "
+            "Provide one or more integers (e.g. 32 or 16 32 64)."
+        ),
     )
     parser.add_argument(
         "--train-random-frontier-ratio",
@@ -181,14 +205,14 @@ def main():
     parser.add_argument(
         "--train-frontier-jaccard-threshold",
         type=float,
-        default=0.75,
+        default=0.6,
         help="Drop near-duplicate train frontiers with Jaccard similarity >= threshold.",
     )
     parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=0,
-        help="DataLoader worker processes used by rl_handler.",
+        "--eval-frontier-jaccard-threshold",
+        type=float,
+        default=0.3,
+        help="Drop near-duplicate evaluation frontiers with Jaccard similarity >= threshold.",
     )
     parser.add_argument(
         "--build-data",
@@ -199,7 +223,7 @@ def main():
     parser.add_argument(
         "--build-eval-data",
         choices=["true", "false"],
-        default="false",
+        default="true",
         help=(
             "Whether to rebuild ONNX-eval query definitions "
             "(train/test x random/fifo/stress) before evaluation."
@@ -208,9 +232,9 @@ def main():
     parser.add_argument(
         "--evaluate",
         choices=["true", "false"],
-        default="false",
+        default="true",
         help=(
-            "If evaluation data are present, perform (train/test) x (random/fifo/stress) evaluation."
+            "If evaluation data are present, perform strategy evaluation on train/test splits."
         ),
     )
     args = parser.parse_args()
@@ -226,6 +250,12 @@ def main():
         or args.train_frontier_jaccard_threshold > 1.0
     ):
         raise ValueError("--train-frontier-jaccard-threshold must be in [0.0, 1.0].")
+    if (
+        args.eval_frontier_jaccard_threshold < 0.0
+        or args.eval_frontier_jaccard_threshold > 1.0
+    ):
+        raise ValueError("--eval-frontier-jaccard-threshold must be in [0.0, 1.0].")
+    onnx_frontier_sizes = parse_onnx_frontier_size_values(args.onnx_frontier_size)
     folders = find_training_data_folders(args.batch_root)
     if not folders:
         print(f"[ERROR] No training_data folders found in {args.batch_root}/_models/")
@@ -242,7 +272,7 @@ def main():
                 args.edge_label_buckets,
                 args.max_regular_distance_for_reward,
                 args.n_max_dataset_queries,
-                args.onnx_frontier_size,
+                onnx_frontier_sizes,
                 args.train_random_frontier_ratio,
                 args.train_random_frontier_with_failure_ratio,
                 args.lr,
@@ -251,7 +281,7 @@ def main():
                 args.early_stopping_patience_evals,
                 args.failure_reward_value,
                 args.train_frontier_jaccard_threshold,
-                args.num_workers,
+                args.eval_frontier_jaccard_threshold,
                 args.build_data.lower() == "true",
                 args.build_eval_data.lower() == "true",
                 args.evaluate.lower() == "true",
