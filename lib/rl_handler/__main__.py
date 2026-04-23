@@ -149,7 +149,7 @@ def parse_args():
         help=(
             "Prune near-duplicate train frontiers using Jaccard similarity over "
             "successor_ids. Keep the first frontier and drop later ones with "
-            "similarity >= threshold within the same dataset/label/size/failure bucket."
+            "similarity >= threshold within the same dataset and frontier size."
         ),
     )
 
@@ -669,6 +669,13 @@ def _sample_successor_id_set(sample: Dict[str, Any]) -> set[str]:
     return out
 
 
+def _sample_jaccard_bucket_key(sample: Dict[str, Any], frontier_size: int) -> Tuple[str, int]:
+    return (
+        str(sample.get("dataset_id", "")),
+        int(frontier_size),
+    )
+
+
 def _required_overlap_for_jaccard(size_a: int, size_b: int, threshold: float) -> int:
     if threshold <= 0.0:
         return 1
@@ -691,7 +698,7 @@ def _prune_near_duplicate_frontiers_by_jaccard(
             "n_groups": 0,
         }
 
-    groups: Dict[Tuple[str, str, int, int], Dict[str, Any]] = {}
+    groups: Dict[Tuple[str, int], Dict[str, Any]] = {}
     token_to_id: Dict[str, int] = {}
     next_token_id = 0
     kept_samples: list[Dict[str, Any]] = []
@@ -714,11 +721,9 @@ def _prune_near_duplicate_frontiers_by_jaccard(
             successor_token_ids.add(int(token_id))
 
         frontier_size = int(len(successor_token_ids))
-        group_key = (
-            str(sample.get("dataset_id", "")),
-            _normalize_frontier_label(sample.get("frontier_label", FRONTIER_LABEL_COMMON)),
-            int(frontier_size),
-            int(_sample_has_failure_state(sample)),
+        group_key = _sample_jaccard_bucket_key(
+            sample=sample,
+            frontier_size=int(frontier_size),
         )
         group = groups.setdefault(
             group_key,
