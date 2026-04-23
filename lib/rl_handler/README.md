@@ -340,7 +340,6 @@ Main outputs (inside `--dir-save-data` / `--dir-save-model`, optionally under `-
 | `--batch-size`                    | `9092`  | Dataloader batch size (number of frontiers per step).                          |
 | `--n-train-epochs`                | `200`   | Number of training epochs.                                                     |
 | `--eval-every`                    | `20`    | Evaluate every N epochs during training.                                       |
-| `--num-workers`                   | `0`     | DataLoader worker processes.                                                   |
 | `--seed`                          | `42`    | RNG seed for split/build/sampling reproducibility.                             |
 | `--lr`                            | `1e-3`  | AdamW learning rate.                                                           |
 | `--weight-decay`                  | `0.0`   | AdamW weight decay.                                                            |
