@@ -20,9 +20,7 @@ from src.data import (
     FRONTIER_LABEL_RANDOM,
     build_frontier_dataloader,
     build_frontier_samples,
-    build_random_eval_frontiers_for_dataset,
-    build_stress_eval_frontiers_for_dataset,
-    group_clean_frontiers,
+    build_tree_strategy_frontiers_for_dataset,
     normalize_distance_to_reward,
     read_frontier_csv,
     refresh_frontier_sample_targets,
@@ -167,14 +165,14 @@ def parse_args():
     parser.add_argument(
         "--n-max-dataset-queries",
         type=int,
-        default=1000,
-        help="Maximum number of generated random/fifo/stress queries per dataset.",
+        default=500,
+        help="Maximum number of generated evaluation strategy frontiers per dataset.",
     )
     parser.add_argument(
         "--max-size-frontier",
         type=int,
         default=32,
-        help="Maximum frontier size used by stress-query generation.",
+        help="Maximum frontier size used by legacy auxiliary frontier generators.",
     )
     parser.add_argument(
         "--max-failure-states-per-dataset",
@@ -195,8 +193,17 @@ def parse_args():
             "similarity >= threshold within the same dataset and frontier size."
         ),
     )
+    parser.add_argument(
+        "--eval-frontier-jaccard-threshold",
+        type=ratio_0_1,
+        default=0.3,
+        help=(
+            "Prune near-duplicate evaluation frontiers using Jaccard similarity over "
+            "successor paths, applied independently per source dataset and frontier size."
+        ),
+    )
 
-    parser.add_argument("--batch-size", type=int, default=4096)
+    parser.add_argument("--batch-size", type=int, default=2048)
     parser.add_argument("--n-train-epochs", type=int, default=200)
     parser.add_argument("--eval-every", type=int, default=25)
     parser.add_argument("--seed", type=int, default=42)
@@ -247,7 +254,7 @@ def parse_args():
         type=str2bool,
         default=False,
         help=(
-            "If true, rebuild query definitions for ONNX evaluation from train/test roots; "
+            "If true, rebuild strategy query definitions for ONNX evaluation from train/test roots; "
             "otherwise load the saved query bundle."
         ),
     )
@@ -295,16 +302,6 @@ def _paths(args):
     data_root.mkdir(parents=True, exist_ok=True)
     model_root.mkdir(parents=True, exist_ok=True)
     return data_root, model_root
-
-
-def _dataset_tag(dataset_id: str) -> str:
-    return (
-        str(dataset_id)
-        .replace("/", "_")
-        .replace("\\", "_")
-        .replace(".", "_")
-        .replace(" ", "_")
-    )
 
 
 def _build_or_load_train_samples(
@@ -373,129 +370,374 @@ def _build_or_load_train_samples(
     return train_samples, dict(params or {}), {"train": train_path, "params": params_path}
 
 
-def _collect_clean_frontier_entries(
+def _collect_strategy_frontier_entries(
     root: Path,
     kind_of_data: str,
     subset_filter: Optional[set[str]],
     max_regular_distance_for_reward: float,
     failure_reward_value: float,
+    onnx_frontier_size: int,
+    train_random_frontier_ratio: float,
+    train_random_frontier_with_failure_ratio: float,
+    seed: int,
 ) -> list[Dict[str, Any]]:
     if not root.exists() or not root.is_dir():
         return []
 
-    entries: list[Dict[str, Any]] = []
+    dataset_entries: list[tuple[Path, Path]] = []
     for prob_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         if subset_filter and prob_dir.name not in subset_filter:
             continue
         for csv_path in sorted(p for p in prob_dir.iterdir() if p.suffix.lower() == ".csv"):
-            rows = read_frontier_csv(csv_path=csv_path, kind_of_data=kind_of_data)
-            clean_frontiers = group_clean_frontiers(
-                rows=rows,
-                kind_of_data=kind_of_data,
-                max_regular_distance_for_reward=float(max_regular_distance_for_reward),
-                failure_reward_value=float(failure_reward_value),
+            dataset_entries.append((prob_dir, csv_path))
+
+    entries: list[Dict[str, Any]] = []
+    for dataset_counter, (prob_dir, csv_path) in enumerate(dataset_entries):
+        rows = read_frontier_csv(csv_path=csv_path, kind_of_data=kind_of_data)
+        dataset_id = f"{prob_dir.name}/{csv_path.name}"
+        strategy_frontiers, strategy_summary = build_tree_strategy_frontiers_for_dataset(
+            rows=rows,
+            kind_of_data=kind_of_data,
+            dataset_id=dataset_id,
+            onnx_frontier_size=int(onnx_frontier_size),
+            random_frontier_ratio=float(train_random_frontier_ratio),
+            random_frontier_with_failure_ratio=float(train_random_frontier_with_failure_ratio),
+            max_regular_distance_for_reward=float(max_regular_distance_for_reward),
+            failure_reward_value=float(failure_reward_value),
+            seed=int(seed) + 7919 * dataset_counter + 31,
+        )
+        strategy_frontiers = list(strategy_frontiers)
+        for frontier in strategy_frontiers:
+            frontier["dataset_id"] = str(dataset_id)
+            frontier["frontier_label"] = _normalize_frontier_label(
+                frontier.get("frontier_label", FRONTIER_LABEL_COMMON)
             )
-            dataset_id = f"{prob_dir.name}/{csv_path.name}"
-            for frontier in clean_frontiers:
-                frontier["dataset_id"] = dataset_id
-            entries.append(
-                {
-                    "problem_name": str(prob_dir.name),
-                    "dataset_id": str(dataset_id),
-                    "csv_name": str(csv_path.name),
-                    "csv_stem": str(csv_path.stem),
-                    "n_rows": int(len(rows)),
-                    "n_clean_frontiers": int(len(clean_frontiers)),
-                    "clean_frontiers": clean_frontiers,
-                }
-            )
+
+        entries.append(
+            {
+                "problem_name": str(prob_dir.name),
+                "dataset_id": str(dataset_id),
+                "csv_name": str(csv_path.name),
+                "csv_stem": str(csv_path.stem),
+                "n_rows": int(len(rows)),
+                "n_strategy_frontiers": int(len(strategy_frontiers)),
+                "strategy_summary": dict(strategy_summary or {}),
+                "strategy_frontiers": strategy_frontiers,
+            }
+        )
     return entries
 
 
-def _attach_query_metadata(
+def _eval_frontier_successor_path_set(frontier: Dict[str, Any]) -> set[str]:
+    successor_paths = frontier.get("successor_paths")
+    if not isinstance(successor_paths, (list, tuple)):
+        return set()
+    out: set[str] = set()
+    for raw in successor_paths:
+        value = str(raw).strip()
+        if value:
+            out.add(value)
+    return out
+
+
+def _prune_eval_frontiers_by_jaccard_similarity(
+    frontiers: Sequence[Dict[str, Any]],
+    jaccard_similarity_threshold: float,
+) -> Tuple[list[Dict[str, Any]], Dict[str, Any]]:
+    threshold = float(jaccard_similarity_threshold)
+    if not frontiers:
+        return [], {
+            "threshold": float(threshold),
+            "n_total": 0,
+            "n_kept": 0,
+            "n_dropped": 0,
+            "n_missing_successor_paths": 0,
+            "n_groups": 0,
+        }
+
+    groups: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    token_to_id: Dict[str, int] = {}
+    next_token_id = 0
+    kept_frontiers: list[Dict[str, Any]] = []
+    dropped = 0
+    missing_successor_paths = 0
+
+    for frontier in frontiers:
+        successor_set = _eval_frontier_successor_path_set(frontier)
+        if not successor_set:
+            kept_frontiers.append(frontier)
+            missing_successor_paths += 1
+            continue
+        successor_token_ids: set[int] = set()
+        for token in successor_set:
+            token_id = token_to_id.get(token)
+            if token_id is None:
+                token_id = int(next_token_id)
+                token_to_id[token] = token_id
+                next_token_id += 1
+            successor_token_ids.add(int(token_id))
+
+        frontier_size = int(len(successor_token_ids))
+        group_key = (
+            str(frontier.get("dataset_id", "")),
+            int(frontier_size),
+        )
+        group = groups.setdefault(
+            group_key,
+            {
+                "sizes": [],
+                "inverted_index": {},
+            },
+        )
+        sizes = group["sizes"]
+        inverted_index = group["inverted_index"]
+
+        overlap_by_candidate: Dict[int, int] = {}
+        required_overlap = _required_overlap_for_jaccard(
+            size_a=int(frontier_size),
+            size_b=int(frontier_size),
+            threshold=float(threshold),
+        )
+        seed_token = min(
+            successor_token_ids,
+            key=lambda token_id: len(inverted_index.get(int(token_id), [])),
+        )
+        ordered_tokens: list[int] = [int(seed_token)]
+        for token_id in successor_token_ids:
+            if int(token_id) == int(seed_token):
+                continue
+            ordered_tokens.append(int(token_id))
+
+        remaining_tokens = int(frontier_size)
+        drop_current = False
+        for token_id in ordered_tokens:
+            remaining_tokens = int(max(0, remaining_tokens - 1))
+            postings = inverted_index.get(int(token_id), [])
+            if not postings:
+                continue
+            for candidate_idx in postings:
+                candidate_i = int(candidate_idx)
+                new_overlap = int(overlap_by_candidate.get(candidate_i, 0) + 1)
+                overlap_by_candidate[candidate_i] = int(new_overlap)
+                if int(new_overlap) < int(required_overlap):
+                    continue
+                size_b = int(sizes[candidate_i])
+                denom = int(frontier_size + size_b - int(new_overlap))
+                similarity = (float(new_overlap) / float(denom)) if denom > 0 else 1.0
+                if similarity >= threshold:
+                    drop_current = True
+                    break
+            if drop_current:
+                break
+            if overlap_by_candidate and remaining_tokens > 0 and required_overlap > 1:
+                impossible = [
+                    candidate_i
+                    for candidate_i, overlap in overlap_by_candidate.items()
+                    if int(overlap) + int(remaining_tokens) < int(required_overlap)
+                ]
+                for candidate_i in impossible:
+                    del overlap_by_candidate[int(candidate_i)]
+
+        if drop_current:
+            dropped += 1
+            continue
+
+        local_idx = int(len(sizes))
+        sizes.append(int(frontier_size))
+        for token_id in successor_token_ids:
+            bucket = inverted_index.setdefault(int(token_id), [])
+            bucket.append(local_idx)
+        kept_frontiers.append(frontier)
+
+    return kept_frontiers, {
+        "threshold": float(threshold),
+        "n_total": int(len(frontiers)),
+        "n_kept": int(len(kept_frontiers)),
+        "n_dropped": int(dropped),
+        "n_missing_successor_paths": int(missing_successor_paths),
+        "n_groups": int(len(groups)),
+    }
+
+
+def _select_size_diverse_eval_frontiers(
+    frontiers: Sequence[Dict[str, Any]],
+    n_max_dataset_queries: int,
+    seed: int,
+) -> Tuple[list[Dict[str, Any]], Dict[str, Any]]:
+    target = int(max(0, int(n_max_dataset_queries)))
+    if target <= 0 or not frontiers:
+        return [], {
+            "n_candidates": int(len(frontiers)),
+            "n_selected": 0,
+            "n_unique_sizes_available": 0,
+            "selected_sizes": [],
+        }
+
+    by_size: Dict[int, list[Dict[str, Any]]] = {}
+    for frontier in frontiers:
+        size = int(len(frontier.get("successor_paths", [])))
+        if size <= 0:
+            continue
+        by_size.setdefault(size, []).append(frontier)
+    if not by_size:
+        return [], {
+            "n_candidates": int(len(frontiers)),
+            "n_selected": 0,
+            "n_unique_sizes_available": 0,
+            "selected_sizes": [],
+        }
+
+    rng = torch.Generator()
+    rng.manual_seed(int(seed))
+    for size, bucket in by_size.items():
+        if len(bucket) <= 1:
+            continue
+        perm = torch.randperm(len(bucket), generator=rng).tolist()
+        by_size[size] = [bucket[i] for i in perm]
+
+    unique_sizes = sorted(int(s) for s in by_size.keys())
+    n_sizes_to_cover = int(min(len(unique_sizes), target))
+
+    selected_sizes: list[int] = []
+    if n_sizes_to_cover > 0 and unique_sizes:
+        selected_sizes.append(int(unique_sizes[0]))
+    if n_sizes_to_cover > 1 and int(unique_sizes[-1]) != int(unique_sizes[0]):
+        selected_sizes.append(int(unique_sizes[-1]))
+    while len(selected_sizes) < n_sizes_to_cover:
+        best_size = None
+        best_distance = -1.0
+        for size in unique_sizes:
+            if int(size) in selected_sizes:
+                continue
+            nearest = min(abs(float(size) - float(x)) for x in selected_sizes)
+            if nearest > best_distance:
+                best_distance = float(nearest)
+                best_size = int(size)
+        if best_size is None:
+            break
+        selected_sizes.append(int(best_size))
+    selected_sizes = sorted(set(int(s) for s in selected_sizes))
+
+    remaining_by_size = {int(s): list(by_size[int(s)]) for s in selected_sizes}
+    selected_frontiers: list[Dict[str, Any]] = []
+
+    for size in selected_sizes:
+        if len(selected_frontiers) >= target:
+            break
+        bucket = remaining_by_size.get(int(size), [])
+        if not bucket:
+            continue
+        selected_frontiers.append(bucket.pop(0))
+
+    while len(selected_frontiers) < target:
+        progressed = False
+        for size in selected_sizes:
+            if len(selected_frontiers) >= target:
+                break
+            bucket = remaining_by_size.get(int(size), [])
+            if not bucket:
+                continue
+            selected_frontiers.append(bucket.pop(0))
+            progressed = True
+        if not progressed:
+            break
+
+    selected_size_counter: Dict[int, int] = {}
+    for frontier in selected_frontiers:
+        size = int(len(frontier.get("successor_paths", [])))
+        selected_size_counter[size] = int(selected_size_counter.get(size, 0) + 1)
+
+    return selected_frontiers, {
+        "n_candidates": int(len(frontiers)),
+        "n_selected": int(len(selected_frontiers)),
+        "n_unique_sizes_available": int(len(unique_sizes)),
+        "selected_sizes": [int(s) for s in selected_sizes],
+        "selected_size_counts": {str(k): int(v) for k, v in sorted(selected_size_counter.items())},
+    }
+
+
+def _attach_strategy_query_metadata(
     frontiers: Sequence[Dict[str, Any]],
     dataset_id: str,
     source_tag: str,
-    query_type: str,
 ) -> list[Dict[str, Any]]:
     out: list[Dict[str, Any]] = []
     for frontier in frontiers:
         item = dict(frontier)
+        label = _normalize_frontier_label(item.get("frontier_label", FRONTIER_LABEL_COMMON))
         item["dataset_id"] = str(dataset_id)
         item["source_tag"] = str(source_tag)
-        item["query_type"] = str(query_type)
-        if query_type == "stress":
-            item["stress_schedule"] = "stress"
+        item["frontier_label"] = str(label)
+        item["query_label"] = str(label)
+        item["query_type"] = str(label)
+        item["frontier_size"] = int(len(item.get("successor_paths", [])))
         out.append(item)
     return out
 
 
-def _build_query_splits_from_entries(
+def _build_eval_strategy_split_from_entries(
     entries: Sequence[Dict[str, Any]],
-    kind_of_data: str,
     n_max_dataset_queries: int,
-    max_size_frontier: int,
+    eval_frontier_jaccard_threshold: float,
     seed: int,
     source_tag: str,
-    failure_reward_value: float,
-) -> Dict[str, list[Dict[str, Any]]]:
-    splits: Dict[str, list[Dict[str, Any]]] = {
-        "random": [],
-        "fifo": [],
-        "stress": [],
-    }
+) -> Tuple[list[Dict[str, Any]], list[Dict[str, Any]]]:
+    split_frontiers: list[Dict[str, Any]] = []
+    entry_summaries: list[Dict[str, Any]] = []
     for dataset_idx, entry in enumerate(entries):
-        clean_frontiers = list(entry.get("clean_frontiers", []))
-        if not clean_frontiers:
+        strategy_frontiers = list(entry.get("strategy_frontiers", []))
+        dataset_id = str(entry.get("dataset_id", ""))
+        if not strategy_frontiers:
+            entry_summaries.append(
+                {
+                    "dataset_id": dataset_id,
+                    "n_strategy_frontiers_total": 0,
+                    "eval_jaccard_pruning": {
+                        "threshold": float(eval_frontier_jaccard_threshold),
+                        "n_total": 0,
+                        "n_kept": 0,
+                        "n_dropped": 0,
+                        "n_missing_successor_paths": 0,
+                        "n_groups": 0,
+                    },
+                    "eval_selection": {
+                        "n_candidates": 0,
+                        "n_selected": 0,
+                        "n_unique_sizes_available": 0,
+                        "selected_sizes": [],
+                    },
+                }
+            )
             continue
 
-        dataset_id = str(entry["dataset_id"])
-        dataset_tag = _dataset_tag(dataset_id)
-        dataset_seed = int(seed + 104729 * dataset_idx + 17)
-
-        random_frontiers = build_random_eval_frontiers_for_dataset(
-            clean_frontiers=clean_frontiers,
-            kind_of_data=kind_of_data,
+        pruned, prune_stats = _prune_eval_frontiers_by_jaccard_similarity(
+            frontiers=strategy_frontiers,
+            jaccard_similarity_threshold=float(eval_frontier_jaccard_threshold),
+        )
+        selected, selection_stats = _select_size_diverse_eval_frontiers(
+            frontiers=pruned,
             n_max_dataset_queries=int(n_max_dataset_queries),
-            seed=dataset_seed,
-            dataset_tag=dataset_tag,
-            failure_reward_value=float(failure_reward_value),
+            seed=int(seed) + 1299709 * dataset_idx + 101,
         )
-        fifo_frontiers, lifo_frontiers = build_stress_eval_frontiers_for_dataset(
-            clean_frontiers=clean_frontiers,
-            kind_of_data=kind_of_data,
-            n_max_dataset_queries=int(n_max_dataset_queries),
-            max_size_frontier=int(max_size_frontier),
-            dataset_tag=dataset_tag,
-            failure_reward_value=float(failure_reward_value),
-        )
-
-        splits["random"].extend(
-            _attach_query_metadata(
-                random_frontiers,
+        split_frontiers.extend(
+            _attach_strategy_query_metadata(
+                frontiers=selected,
                 dataset_id=dataset_id,
                 source_tag=source_tag,
-                query_type="random",
             )
         )
-        splits["fifo"].extend(
-            _attach_query_metadata(
-                fifo_frontiers,
-                dataset_id=dataset_id,
-                source_tag=source_tag,
-                query_type="fifo",
-            )
+        entry_summaries.append(
+            {
+                "dataset_id": dataset_id,
+                "problem_name": str(entry.get("problem_name", "")),
+                "csv_name": str(entry.get("csv_name", "")),
+                "n_rows": int(entry.get("n_rows", 0)),
+                "n_strategy_frontiers_total": int(len(strategy_frontiers)),
+                "eval_jaccard_pruning": prune_stats,
+                "eval_selection": selection_stats,
+            }
         )
-        # "stress" maps to the second stress schedule (LIFO-based windowing).
-        splits["stress"].extend(
-            _attach_query_metadata(
-                lifo_frontiers,
-                dataset_id=dataset_id,
-                source_tag=source_tag,
-                query_type="stress",
-            )
-        )
-    return splits
+    return split_frontiers, entry_summaries
 
 
 def _resolve_test_data_root(args, model_root: Path) -> Path:
@@ -504,8 +746,17 @@ def _resolve_test_data_root(args, model_root: Path) -> Path:
     return model_root / "test_data"
 
 
-def _build_or_load_query_bundle(args, data_root: Path, model_root: Path):
+def _build_or_load_query_bundle(
+    args,
+    data_root: Path,
+    model_root: Path,
+    onnx_frontier_size: int,
+    cache_namespace: str = "",
+):
     data_dir = data_root / "processed_data"
+    namespace = str(cache_namespace).strip()
+    if namespace:
+        data_dir = data_dir / namespace
     data_dir.mkdir(parents=True, exist_ok=True)
     query_path = data_dir / "query_bundle.json"
     legacy_query_candidates = [
@@ -524,53 +775,71 @@ def _build_or_load_query_bundle(args, data_root: Path, model_root: Path):
     if can_load:
         with query_path.open("r", encoding="utf-8") as fh:
             bundle = json.load(fh)
-        return bundle, query_path, test_data_root
+        bundle_meta = bundle.get("meta", {}) if isinstance(bundle, dict) else {}
+        bundle_format = str(bundle_meta.get("eval_bundle_format", "")).strip().lower()
+        if bundle_format == "strategy_v1":
+            stored_eval_size = int(bundle_meta.get("onnx_frontier_size_for_eval_data", 0) or 0)
+            requested_eval_size = int(max(1, int(onnx_frontier_size)))
+            if stored_eval_size >= requested_eval_size:
+                return bundle, query_path, test_data_root
 
-    train_entries = _collect_clean_frontier_entries(
+    train_entries = _collect_strategy_frontier_entries(
         root=Path(args.folder_raw_data),
         kind_of_data=args.kind_of_data,
         subset_filter=set(args.subset_train) if args.subset_train else None,
         max_regular_distance_for_reward=float(args.max_regular_distance_for_reward),
         failure_reward_value=float(args.failure_reward_value),
-    )
-    train_splits = _build_query_splits_from_entries(
-        entries=train_entries,
-        kind_of_data=args.kind_of_data,
-        n_max_dataset_queries=int(args.n_max_dataset_queries),
-        max_size_frontier=int(args.max_size_frontier),
+        onnx_frontier_size=int(onnx_frontier_size),
+        train_random_frontier_ratio=float(args.train_random_frontier_ratio),
+        train_random_frontier_with_failure_ratio=float(args.train_random_frontier_with_failure_ratio),
         seed=int(args.seed),
+    )
+    train_queries, train_eval_entry_summaries = _build_eval_strategy_split_from_entries(
+        entries=train_entries,
+        n_max_dataset_queries=int(args.n_max_dataset_queries),
+        eval_frontier_jaccard_threshold=float(args.eval_frontier_jaccard_threshold),
+        seed=int(args.seed) + 170141183,
         source_tag="train",
-        failure_reward_value=float(args.failure_reward_value),
     )
 
     if test_data_root.exists() and test_data_root.is_dir():
-        test_entries = _collect_clean_frontier_entries(
+        test_entries = _collect_strategy_frontier_entries(
             root=test_data_root,
             kind_of_data=args.kind_of_data,
             subset_filter=None,
             max_regular_distance_for_reward=float(args.max_regular_distance_for_reward),
             failure_reward_value=float(args.failure_reward_value),
-        )
-        test_splits = _build_query_splits_from_entries(
-            entries=test_entries,
-            kind_of_data=args.kind_of_data,
-            n_max_dataset_queries=int(args.n_max_dataset_queries),
-            max_size_frontier=int(args.max_size_frontier),
+            onnx_frontier_size=int(onnx_frontier_size),
+            train_random_frontier_ratio=float(args.train_random_frontier_ratio),
+            train_random_frontier_with_failure_ratio=float(args.train_random_frontier_with_failure_ratio),
             seed=int(args.seed) + 73,
+        )
+        test_queries, test_eval_entry_summaries = _build_eval_strategy_split_from_entries(
+            entries=test_entries,
+            n_max_dataset_queries=int(args.n_max_dataset_queries),
+            eval_frontier_jaccard_threshold=float(args.eval_frontier_jaccard_threshold),
+            seed=int(args.seed) + 170141183 + 73,
             source_tag="test",
-            failure_reward_value=float(args.failure_reward_value),
         )
     else:
         test_entries = []
-        test_splits = {"random": [], "fifo": [], "stress": []}
+        test_queries = []
+        test_eval_entry_summaries = []
 
     bundle = {
         "meta": {
+            "eval_bundle_format": "strategy_v1",
             "kind_of_data": str(args.kind_of_data),
             "dataset_type": str(args.dataset_type),
             "seed": int(args.seed),
             "n_max_dataset_queries": int(args.n_max_dataset_queries),
             "max_size_frontier": int(args.max_size_frontier),
+            "onnx_frontier_size_for_eval_data": int(onnx_frontier_size),
+            "eval_frontier_jaccard_threshold": float(args.eval_frontier_jaccard_threshold),
+            "train_random_frontier_ratio": float(args.train_random_frontier_ratio),
+            "train_random_frontier_with_failure_ratio": float(
+                args.train_random_frontier_with_failure_ratio
+            ),
             "folder_raw_data": str(args.folder_raw_data),
             "folder_test_data": test_data_root.as_posix(),
         },
@@ -580,7 +849,8 @@ def _build_or_load_query_bundle(args, data_root: Path, model_root: Path):
                 "problem_name": e["problem_name"],
                 "csv_name": e["csv_name"],
                 "n_rows": e["n_rows"],
-                "n_clean_frontiers": e["n_clean_frontiers"],
+                "n_strategy_frontiers": e["n_strategy_frontiers"],
+                "strategy_summary": e.get("strategy_summary", {}),
             }
             for e in train_entries
         ],
@@ -590,12 +860,15 @@ def _build_or_load_query_bundle(args, data_root: Path, model_root: Path):
                 "problem_name": e["problem_name"],
                 "csv_name": e["csv_name"],
                 "n_rows": e["n_rows"],
-                "n_clean_frontiers": e["n_clean_frontiers"],
+                "n_strategy_frontiers": e["n_strategy_frontiers"],
+                "strategy_summary": e.get("strategy_summary", {}),
             }
             for e in test_entries
         ],
-        "train": train_splits,
-        "test": test_splits,
+        "train_eval_entries": train_eval_entry_summaries,
+        "test_eval_entries": test_eval_entry_summaries,
+        "train": train_queries,
+        "test": test_queries,
     }
     with query_path.open("w", encoding="utf-8") as fh:
         json.dump(bundle, fh, indent=2)
@@ -605,13 +878,30 @@ def _build_or_load_query_bundle(args, data_root: Path, model_root: Path):
 def _flatten_query_splits(bundle: Dict[str, Any]) -> Dict[str, list[Dict[str, Any]]]:
     out: Dict[str, list[Dict[str, Any]]] = {}
     for source in ("train", "test"):
-        source_payload = bundle.get(source, {})
-        if not isinstance(source_payload, dict):
-            source_payload = {}
-        for query_type in ("random", "fifo", "stress"):
-            key = f"{source}_{query_type}"
-            values = source_payload.get(query_type, [])
-            out[key] = list(values) if isinstance(values, list) else []
+        source_payload = bundle.get(source, [])
+        if isinstance(source_payload, list):
+            out[source] = list(source_payload)
+            continue
+        # Legacy fallback: flatten old random/fifo/stress bundle format.
+        if isinstance(source_payload, dict):
+            merged_values: list[Dict[str, Any]] = []
+            for query_type in ("random", "fifo", "stress"):
+                values = source_payload.get(query_type, [])
+                if not isinstance(values, list):
+                    continue
+                for item in values:
+                    if not isinstance(item, dict):
+                        continue
+                    entry = dict(item)
+                    label = _normalize_frontier_label(entry.get("frontier_label", query_type))
+                    entry["query_label"] = str(label)
+                    entry["query_type"] = str(label)
+                    entry["frontier_label"] = str(label)
+                    entry["source_tag"] = str(source)
+                    merged_values.append(entry)
+            out[source] = merged_values
+            continue
+        out[source] = []
     return out
 
 
@@ -1408,6 +1698,71 @@ def _infer_static_onnx_output_len(ort_sess: Any) -> Optional[int]:
     return None
 
 
+def _build_metric_curve_by_size(
+    trainer: RLFrontierTrainer,
+    frontier_sizes: Sequence[int],
+    values: Sequence[float],
+) -> Dict[str, List[float]]:
+    by_size: Dict[int, List[float]] = {}
+    for size, value in zip(frontier_sizes, values):
+        by_size.setdefault(int(size), []).append(float(value))
+    ordered_sizes = sorted(by_size.keys())
+    iqm: list[float] = []
+    iqr_std: list[float] = []
+    for size in ordered_sizes:
+        stats = trainer._iqm_iqr_stats(by_size[size])
+        iqm.append(float(stats["iqm"]))
+        iqr_std.append(float(stats["iqr_std"]))
+    return {
+        "sizes": [int(s) for s in ordered_sizes],
+        "iqm": iqm,
+        "iqr_std": iqr_std,
+    }
+
+
+def _build_query_label_metrics(
+    trainer: RLFrontierTrainer,
+    query_labels: Sequence[str],
+    chosen_rewards: Sequence[float],
+    accuracies: Sequence[int],
+    frontier_sizes: Sequence[int],
+    abs_reward_gaps: Sequence[float],
+) -> Dict[str, Dict[str, Any]]:
+    labels = [_normalize_frontier_label(x) for x in query_labels]
+    metrics: Dict[str, Dict[str, Any]] = {}
+    for label in FRONTIER_STRATEGY_LABELS:
+        mask = [lbl == label for lbl in labels]
+        label_rewards = [float(r) for r, keep in zip(chosen_rewards, mask) if keep]
+        label_accuracies = [int(a) for a, keep in zip(accuracies, mask) if keep]
+        label_frontier_sizes = [int(s) for s, keep in zip(frontier_sizes, mask) if keep]
+        label_abs_reward_gaps = [float(g) for g, keep in zip(abs_reward_gaps, mask) if keep]
+        metrics[label] = {
+            "label": str(label),
+            "n_frontiers": int(len(label_rewards)),
+            "reward_by_size": _build_metric_curve_by_size(
+                trainer=trainer,
+                frontier_sizes=label_frontier_sizes,
+                values=label_rewards,
+            ),
+            "accuracy_by_size": _build_metric_curve_by_size(
+                trainer=trainer,
+                frontier_sizes=label_frontier_sizes,
+                values=label_accuracies,
+            ),
+            "abs_reward_gap_by_size": _build_metric_curve_by_size(
+                trainer=trainer,
+                frontier_sizes=label_frontier_sizes,
+                values=label_abs_reward_gaps,
+            ),
+            "regret_by_size": _build_metric_curve_by_size(
+                trainer=trainer,
+                frontier_sizes=label_frontier_sizes,
+                values=label_abs_reward_gaps,
+            ),
+        }
+    return metrics
+
+
 def _build_eval_metrics_from_frontier_decisions(
     trainer: RLFrontierTrainer,
     chosen_rewards: Sequence[float],
@@ -1415,6 +1770,7 @@ def _build_eval_metrics_from_frontier_decisions(
     frontier_has_failure: Sequence[int],
     frontier_sizes: Sequence[int],
     abs_reward_gaps: Sequence[float],
+    query_labels: Optional[Sequence[str]] = None,
 ) -> Dict[str, object]:
     regimes = trainer._build_regime_metrics(
         rewards=chosen_rewards,
@@ -1427,6 +1783,12 @@ def _build_eval_metrics_from_frontier_decisions(
     all_accuracy_stats = regimes[REGIME_ALL]["accuracy_stats"]
     all_abs_gap_stats = regimes[REGIME_ALL]["abs_reward_gap_stats"]
 
+    labels = (
+        [_normalize_frontier_label(x) for x in query_labels]
+        if query_labels is not None
+        else [FRONTIER_LABEL_COMMON for _ in chosen_rewards]
+    )
+
     metrics: Dict[str, object] = {
         "n_frontiers": len(chosen_rewards),
         "chosen_rewards": [float(x) for x in chosen_rewards],
@@ -1434,6 +1796,7 @@ def _build_eval_metrics_from_frontier_decisions(
         "frontier_has_failure": [int(x) for x in frontier_has_failure],
         "frontier_sizes": [int(x) for x in frontier_sizes],
         "abs_reward_gaps": [float(x) for x in abs_reward_gaps],
+        "query_labels": [str(x) for x in labels],
         "regimes": regimes,
         "mean_reward": float(all_reward_stats["mean"]),
         "std_reward": float(all_reward_stats["std"]),
@@ -1447,8 +1810,22 @@ def _build_eval_metrics_from_frontier_decisions(
         "iqm_abs_reward_gap": float(all_abs_gap_stats["iqm"]),
         "iqr_abs_reward_gap": float(all_abs_gap_stats["iqr"]),
         "iqr_std_abs_reward_gap": float(all_abs_gap_stats["iqr_std"]),
+        "mean_regret": float(all_abs_gap_stats["mean"]),
+        "std_regret": float(all_abs_gap_stats["std"]),
+        "iqm_regret": float(all_abs_gap_stats["iqm"]),
+        "iqr_regret": float(all_abs_gap_stats["iqr"]),
+        "iqr_std_regret": float(all_abs_gap_stats["iqr_std"]),
         "oracle_accuracy": float(all_accuracy_stats["mean"]),
     }
+    metrics["query_label_metrics"] = _build_query_label_metrics(
+        trainer=trainer,
+        query_labels=labels,
+        chosen_rewards=chosen_rewards,
+        accuracies=accuracies,
+        frontier_sizes=frontier_sizes,
+        abs_reward_gaps=abs_reward_gaps,
+    )
+    metrics["query_type_metrics"] = metrics["query_label_metrics"]
 
     n_frontiers = len(chosen_rewards)
     n_failure_frontiers = int(sum(frontier_has_failure))
@@ -1841,6 +2218,24 @@ def _run_single_sample_pytorch_and_onnx(
     }
 
 
+def _cap_query_frontier_to_size(
+    frontier: Dict[str, Any],
+    frontier_size_cap: Optional[int],
+) -> Dict[str, Any]:
+    if frontier_size_cap is None:
+        return dict(frontier)
+    cap = int(max(0, int(frontier_size_cap)))
+    out = dict(frontier)
+    for key in ("successor_paths", "distances", "depths", "rewards"):
+        values = out.get(key)
+        if isinstance(values, list):
+            out[key] = list(values[:cap])
+        elif isinstance(values, tuple):
+            out[key] = list(values[:cap])
+    out["frontier_size"] = int(len(out.get("successor_paths", [])))
+    return out
+
+
 def _evaluate_onnx_query_split(
     trainer: RLFrontierTrainer,
     split_name: str,
@@ -1851,6 +2246,7 @@ def _evaluate_onnx_query_split(
     failure_reward_value: float,
     onnx_ctx: OnnxEvalContext,
     graph_cache: Dict[str, _EvalGraphTensors],
+    frontier_size_cap: Optional[int] = None,
 ) -> Dict[str, Any]:
     dataset_type_norm = str(dataset_type).upper()
 
@@ -1867,14 +2263,29 @@ def _evaluate_onnx_query_split(
     frontier_has_failure: list[int] = []
     frontier_sizes: list[int] = []
     abs_reward_gaps: list[float] = []
+    query_labels: list[str] = []
     failed_frontiers: list[Dict[str, Any]] = []
 
     for idx, frontier in enumerate(
         tqdm(frontiers, desc=f"Evaluating {split_name}", leave=False)
     ):
+        capped_frontier = _cap_query_frontier_to_size(
+            frontier=frontier,
+            frontier_size_cap=frontier_size_cap,
+        )
+        if int(len(capped_frontier.get("successor_paths", []))) <= 0:
+            failed_frontiers.append(
+                {
+                    "query_index": int(idx),
+                    "dataset_id": str(frontier.get("dataset_id", "")),
+                    "predecessor_path": str(frontier.get("predecessor_path", "")),
+                    "error": "query has no candidates after frontier-size cap.",
+                }
+            )
+            continue
         try:
             sample = _materialize_query_frontier_no_pyg(
-                frontier=frontier,
+                frontier=capped_frontier,
                 kind_of_data=kind_of_data,
                 dataset_type=dataset_type_norm,
                 max_regular_distance_for_reward=float(max_regular_distance_for_reward),
@@ -1885,8 +2296,8 @@ def _evaluate_onnx_query_split(
             failed_frontiers.append(
                 {
                     "query_index": int(idx),
-                    "dataset_id": str(frontier.get("dataset_id", "")),
-                    "predecessor_path": str(frontier.get("predecessor_path", "")),
+                    "dataset_id": str(capped_frontier.get("dataset_id", "")),
+                    "predecessor_path": str(capped_frontier.get("predecessor_path", "")),
                     "error": f"materialization failed: {exc}",
                 }
             )
@@ -1902,8 +2313,8 @@ def _evaluate_onnx_query_split(
             failed_frontiers.append(
                 {
                     "query_index": int(idx),
-                    "dataset_id": str(frontier.get("dataset_id", "")),
-                    "predecessor_path": str(frontier.get("predecessor_path", "")),
+                    "dataset_id": str(capped_frontier.get("dataset_id", "")),
+                    "predecessor_path": str(capped_frontier.get("predecessor_path", "")),
                     "error": str(result.get("error", "unknown error")),
                 }
             )
@@ -1914,6 +2325,14 @@ def _evaluate_onnx_query_split(
         frontier_has_failure.append(int(result["frontier_has_failure"]))
         frontier_sizes.append(int(result["frontier_size"]))
         abs_reward_gaps.append(float(result["abs_reward_gap"]))
+        query_labels.append(
+            _normalize_frontier_label(
+                capped_frontier.get(
+                    "query_label",
+                    capped_frontier.get("frontier_label", FRONTIER_LABEL_COMMON),
+                )
+            )
+        )
 
     metrics = _build_eval_metrics_from_frontier_decisions(
         trainer=trainer,
@@ -1922,6 +2341,7 @@ def _evaluate_onnx_query_split(
         frontier_has_failure=frontier_has_failure,
         frontier_sizes=frontier_sizes,
         abs_reward_gaps=abs_reward_gaps,
+        query_labels=query_labels,
     )
     metrics["split_name"] = str(split_name)
     metrics["n_attempted_frontiers"] = int(len(frontiers))
@@ -1930,6 +2350,9 @@ def _evaluate_onnx_query_split(
     metrics["onnx_requires_goal_inputs"] = bool(onnx_ctx.use_goal_inputs)
     metrics["onnx_static_output_len"] = (
         int(onnx_ctx.static_onnx_len) if onnx_ctx.static_onnx_len is not None else None
+    )
+    metrics["frontier_size_cap_for_eval"] = (
+        int(frontier_size_cap) if frontier_size_cap is not None else None
     )
     if failed_frontiers:
         metrics["failed_frontiers"] = failed_frontiers
@@ -1960,6 +2383,111 @@ def _init_eval_trackers(
             regime_history=trainer._empty_regime_history(),
         )
     return trackers
+
+
+def _plot_query_label_metric_curves(
+    out_path: Path,
+    split_name: str,
+    metric_title: str,
+    ylabel: str,
+    query_label_metrics: Dict[str, Any],
+    curve_key: str,
+    y_lim: Optional[Tuple[float, float]] = None,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(8, 4), dpi=300)
+    plotted = False
+    for label in FRONTIER_STRATEGY_LABELS:
+        label_metrics = query_label_metrics.get(label, {})
+        curve = label_metrics.get(curve_key, {})
+        sizes = [int(x) for x in curve.get("sizes", [])]
+        iqm = [float(x) for x in curve.get("iqm", [])]
+        if not sizes or not iqm or len(sizes) != len(iqm):
+            continue
+        plotted = True
+        plt.plot(sizes, iqm, marker="o", linewidth=1.8, label=str(label))
+
+    if plotted:
+        plt.legend(loc="best")
+    else:
+        plt.text(0.5, 0.5, "No query-label data", ha="center", va="center")
+    plt.xlabel("Frontier Size")
+    plt.ylabel(ylabel)
+    if y_lim is not None:
+        plt.ylim(y_lim[0], y_lim[1])
+    plt.title(f"{split_name.upper()} | {metric_title} by Frontier Size and Query Label")
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+
+def _save_eval_query_label_step_plots(
+    tracker: EvalSplitTracker,
+    epoch: int,
+    eval_step: int,
+    metrics: Dict[str, Any],
+) -> None:
+    query_label_metrics = metrics.get("query_label_metrics", {})
+    if not isinstance(query_label_metrics, dict) or not query_label_metrics:
+        return
+
+    step_dir = tracker.eval_dir / f"step_{int(eval_step):04d}_epoch_{int(epoch):04d}"
+    step_dir.mkdir(parents=True, exist_ok=True)
+    _plot_query_label_metric_curves(
+        out_path=step_dir / "query_label_reward_by_frontier_size.png",
+        split_name=tracker.split_name,
+        metric_title="Reward (IQM)",
+        ylabel="Reward",
+        query_label_metrics=query_label_metrics,
+        curve_key="reward_by_size",
+        y_lim=(-1.0, 0.05),
+    )
+    _plot_query_label_metric_curves(
+        out_path=step_dir / "query_label_accuracy_by_frontier_size.png",
+        split_name=tracker.split_name,
+        metric_title="Accuracy (IQM)",
+        ylabel="Accuracy",
+        query_label_metrics=query_label_metrics,
+        curve_key="accuracy_by_size",
+        y_lim=(-0.05, 1.05),
+    )
+    _plot_query_label_metric_curves(
+        out_path=step_dir / "query_label_regret_by_frontier_size.png",
+        split_name=tracker.split_name,
+        metric_title="Regret |best reward - taken reward| (IQM)",
+        ylabel="Regret",
+        query_label_metrics=query_label_metrics,
+        curve_key="regret_by_size",
+        y_lim=(0.0, 1.05),
+    )
+
+    _plot_query_label_metric_curves(
+        out_path=tracker.eval_dir / "query_label_reward_by_frontier_size_latest.png",
+        split_name=tracker.split_name,
+        metric_title="Reward (IQM)",
+        ylabel="Reward",
+        query_label_metrics=query_label_metrics,
+        curve_key="reward_by_size",
+        y_lim=(-1.0, 0.05),
+    )
+    _plot_query_label_metric_curves(
+        out_path=tracker.eval_dir / "query_label_accuracy_by_frontier_size_latest.png",
+        split_name=tracker.split_name,
+        metric_title="Accuracy (IQM)",
+        ylabel="Accuracy",
+        query_label_metrics=query_label_metrics,
+        curve_key="accuracy_by_size",
+        y_lim=(-0.05, 1.05),
+    )
+    _plot_query_label_metric_curves(
+        out_path=tracker.eval_dir / "query_label_regret_by_frontier_size_latest.png",
+        split_name=tracker.split_name,
+        metric_title="Regret |best reward - taken reward| (IQM)",
+        ylabel="Regret",
+        query_label_metrics=query_label_metrics,
+        curve_key="regret_by_size",
+        y_lim=(0.0, 1.05),
+    )
 
 
 def _update_eval_tracker(
@@ -2014,6 +2542,12 @@ def _update_eval_tracker(
         eval_name=tracker.split_name,
         regime_history=tracker.regime_history,
     )
+    _save_eval_query_label_step_plots(
+        tracker=tracker,
+        epoch=int(epoch),
+        eval_step=int(eval_step),
+        metrics=metrics,
+    )
 
     with (tracker.eval_dir / "history.json").open("w", encoding="utf-8") as fh:
         json.dump(
@@ -2024,6 +2558,7 @@ def _update_eval_tracker(
                 "iqm_abs_reward_gap": tracker.history["iqm_abs_reward_gap"],
                 "iqr_std_abs_reward_gap": tracker.history["iqr_std_abs_reward_gap"],
                 "regimes": tracker.regime_history,
+                "latest_query_label_metrics": metrics.get("query_label_metrics", {}),
             },
             fh,
             indent=2,
@@ -2034,12 +2569,8 @@ def _select_first_query_for_example(
     query_splits: Dict[str, Sequence[Dict[str, Any]]],
 ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     preferred_order = [
-        "train_random",
-        "train_fifo",
-        "train_stress",
-        "test_random",
-        "test_fifo",
-        "test_stress",
+        "train",
+        "test",
     ]
     for split_name in preferred_order:
         frontiers = query_splits.get(split_name, [])
@@ -2059,6 +2590,7 @@ def _run_example_parity_check(
     dataset_type: str,
     max_regular_distance_for_reward: float,
     failure_reward_value: float,
+    frontier_size_cap: Optional[int],
     report_path: Path,
 ) -> None:
     split_name, query = _select_first_query_for_example(query_splits)
@@ -2083,9 +2615,14 @@ def _run_example_parity_check(
             graph_cache[key] = graph
         return graph
 
+    query_capped = _cap_query_frontier_to_size(
+        frontier=query,
+        frontier_size_cap=frontier_size_cap,
+    )
+
     try:
         sample = _materialize_query_frontier_no_pyg(
-            frontier=query,
+            frontier=query_capped,
             kind_of_data=kind_of_data,
             dataset_type=dataset_type_norm,
             max_regular_distance_for_reward=float(max_regular_distance_for_reward),
@@ -2100,16 +2637,16 @@ def _run_example_parity_check(
         report = {
             "status": str(parity.get("status", "error")),
             "split_name": split_name,
-            "dataset_id": str(query.get("dataset_id", "")),
-            "predecessor_path": str(query.get("predecessor_path", "")),
+            "dataset_id": str(query_capped.get("dataset_id", "")),
+            "predecessor_path": str(query_capped.get("predecessor_path", "")),
             "result": parity,
         }
     except Exception as exc:
         report = {
             "status": "error",
             "split_name": split_name,
-            "dataset_id": str(query.get("dataset_id", "")),
-            "predecessor_path": str(query.get("predecessor_path", "")),
+            "dataset_id": str(query_capped.get("dataset_id", "")),
+            "predecessor_path": str(query_capped.get("predecessor_path", "")),
             "error": str(exc),
         }
 
@@ -2126,6 +2663,7 @@ def _evaluate_all_splits_with_onnx(
     dataset_type: str,
     max_regular_distance_for_reward: float,
     failure_reward_value: float,
+    frontier_size_cap: Optional[int] = None,
     trackers: Optional[Dict[str, EvalSplitTracker]] = None,
     epoch: Optional[int] = None,
     eval_step: Optional[int] = None,
@@ -2149,6 +2687,7 @@ def _evaluate_all_splits_with_onnx(
             failure_reward_value=float(failure_reward_value),
             onnx_ctx=onnx_ctx,
             graph_cache=graph_cache,
+            frontier_size_cap=frontier_size_cap,
         )
         all_metrics[split_name] = metrics
         if (
@@ -2188,6 +2727,7 @@ def _evaluate_all_splits_with_onnx(
             dataset_type=dataset_type,
             max_regular_distance_for_reward=float(max_regular_distance_for_reward),
             failure_reward_value=float(failure_reward_value),
+            frontier_size_cap=frontier_size_cap,
             report_path=example_report_path,
         )
 
@@ -2204,17 +2744,18 @@ def _select_eval_score(
             continue
         if int(metrics.get("n_evaluated_frontiers", 0)) <= 0:
             continue
-        return float(metrics.get("mean_reward", 0.0)), split_name
+        return float(metrics.get("mean_abs_reward_gap", float("inf"))), split_name
     for split_name, metrics in eval_metrics.items():
         if int(metrics.get("n_evaluated_frontiers", 0)) <= 0:
             continue
-        return float(metrics.get("mean_reward", 0.0)), split_name
-    return -float("inf"), None
+        return float(metrics.get("mean_abs_reward_gap", float("inf"))), split_name
+    return float("inf"), None
 
 
 def _save_best_model_performance(
     out_path: Path,
     best_eval_epoch: Optional[int],
+    best_eval_regret: Optional[float],
     best_eval_reward: Optional[float],
     best_eval_split: Optional[str],
     best_metrics_by_split: Dict[str, Any],
@@ -2224,8 +2765,10 @@ def _save_best_model_performance(
         json.dump(
             {
                 "best_model_name": "frontier_policy.pt",
-                "selection_metric": "mean_reward",
+                "selection_metric": "mean_abs_reward_gap",
+                "selection_goal": "minimize",
                 "best_eval_epoch": best_eval_epoch,
+                "best_eval_regret": best_eval_regret,
                 "best_eval_reward": best_eval_reward,
                 "best_eval_split": best_eval_split,
                 "best_metrics_by_split": best_metrics_by_split,
@@ -2290,6 +2833,30 @@ def _prepare_train_context(
         "train_filter_stats": train_filter_stats,
         "train_jaccard_prune_stats": train_jaccard_prune_stats,
         "train_loader": train_loader,
+        "base_onnx_frontier_size": int(onnx_frontier_size),
+    }
+
+
+def _prepare_eval_context(
+    args,
+    data_root: Path,
+    model_root: Path,
+    onnx_frontier_size: int,
+    cache_namespace: str = "",
+) -> Dict[str, Any]:
+    query_bundle, query_bundle_path, test_data_root = _build_or_load_query_bundle(
+        args=args,
+        data_root=data_root,
+        model_root=model_root,
+        onnx_frontier_size=int(onnx_frontier_size),
+        cache_namespace=str(cache_namespace),
+    )
+    flat_query_splits = _flatten_query_splits(query_bundle)
+    return {
+        "query_bundle": query_bundle,
+        "query_bundle_path": query_bundle_path,
+        "test_data_root": test_data_root,
+        "flat_query_splits": flat_query_splits,
         "base_onnx_frontier_size": int(onnx_frontier_size),
     }
 
@@ -2490,6 +3057,7 @@ def _run_single_frontier_size(
     frontier_size: int,
     all_frontier_sizes: Sequence[int],
     prepared_train_context: Optional[Dict[str, Any]] = None,
+    prepared_eval_context: Optional[Dict[str, Any]] = None,
 ):
     seed_everything(args.seed)
     data_root, model_root = _paths(args)
@@ -2608,17 +3176,38 @@ def _run_single_frontier_size(
     query_bundle_path: Optional[Path] = None
     test_data_root = _resolve_test_data_root(args=args, model_root=model_root)
     flat_query_splits: Dict[str, list[Dict[str, Any]]] = {}
+    base_onnx_frontier_size_for_eval = int(base_onnx_frontier_size)
     if bool(args.evaluate):
-        query_bundle, query_bundle_path, test_data_root = _build_or_load_query_bundle(
-            args=args,
-            data_root=data_root,
-            model_root=model_root,
+        if prepared_eval_context is None:
+            prepared_eval_context = _prepare_eval_context(
+                args=args,
+                data_root=data_root,
+                model_root=model_root,
+                onnx_frontier_size=int(base_onnx_frontier_size),
+                cache_namespace=run_tag,
+            )
+        query_bundle = dict(prepared_eval_context.get("query_bundle") or {})
+        raw_query_path = prepared_eval_context.get("query_bundle_path")
+        query_bundle_path = Path(raw_query_path) if raw_query_path is not None else None
+        raw_test_root = prepared_eval_context.get("test_data_root")
+        if raw_test_root is not None:
+            test_data_root = Path(raw_test_root)
+        flat_query_splits = {
+            str(name): list(values)
+            for name, values in dict(prepared_eval_context.get("flat_query_splits") or {}).items()
+        }
+        base_onnx_frontier_size_for_eval = int(
+            prepared_eval_context.get("base_onnx_frontier_size", base_onnx_frontier_size)
         )
-        flat_query_splits = _flatten_query_splits(query_bundle)
         counts = _query_counts(flat_query_splits)
         print("[queries] built/loaded query counts:")
         for split_name in sorted(counts.keys()):
             print(f"  - {split_name}: {counts[split_name]}")
+        if int(base_onnx_frontier_size_for_eval) != int(frontier_size):
+            print(
+                "[multi-frontier] active frontier size="
+                f"{int(frontier_size)} (base eval data built at {int(base_onnx_frontier_size_for_eval)})."
+            )
         if all(v == 0 for v in counts.values()):
             print(
                 "[warning] Evaluation is enabled but all query splits are empty. "
@@ -2698,23 +3287,21 @@ def _run_single_frontier_size(
         "train_std_reward": [],
         "train_mean_loss": [],
         "eval_epochs": [],
-        "eval_selection_score": [],
+        "eval_selection_regret": [],
+        "eval_selection_reward": [],
         "eval_selection_split": [],
     }
 
-    best_eval_reward = -float("inf")
+    best_eval_regret = float("inf")
+    best_eval_reward: Optional[float] = None
     best_eval_epoch: Optional[int] = None
     best_eval_split: Optional[str] = None
     best_metrics_by_split: Dict[str, Any] = {}
     no_improve_eval_steps = 0
     eval_step = 0
     selection_order = [
-        "train_random",
-        "test_random",
-        "train_fifo",
-        "train_stress",
-        "test_fifo",
-        "test_stress",
+        "test",
+        "train",
     ]
 
     if bool(args.train):
@@ -2787,22 +3374,30 @@ def _run_single_frontier_size(
                     dataset_type=args.dataset_type,
                     max_regular_distance_for_reward=float(args.max_regular_distance_for_reward),
                     failure_reward_value=float(args.failure_reward_value),
+                    frontier_size_cap=int(frontier_size),
                     trackers=eval_trackers,
                     epoch=epoch + 1,
                     eval_step=eval_step,
                     summary_path=step_summary_path,
                     example_report_path=step_example_path,
                 )
-                eval_score, eval_split = _select_eval_score(
+                eval_regret, eval_split = _select_eval_score(
                     eval_metrics=step_metrics,
                     preferred_order=selection_order,
                 )
+                eval_reward = (
+                    float(step_metrics.get(str(eval_split), {}).get("mean_reward", 0.0))
+                    if eval_split is not None
+                    else 0.0
+                )
                 history["eval_epochs"].append(epoch + 1)
-                history["eval_selection_score"].append(float(eval_score))
+                history["eval_selection_regret"].append(float(eval_regret))
+                history["eval_selection_reward"].append(float(eval_reward))
                 history["eval_selection_split"].append(str(eval_split or ""))
 
-                if eval_score > best_eval_reward:
-                    best_eval_reward = float(eval_score)
+                if float(eval_regret) < float(best_eval_regret):
+                    best_eval_regret = float(eval_regret)
+                    best_eval_reward = float(eval_reward)
                     best_eval_epoch = int(epoch + 1)
                     best_eval_split = str(eval_split) if eval_split else None
                     best_metrics_by_split = dict(step_metrics)
@@ -2811,6 +3406,7 @@ def _run_single_frontier_size(
                         best_ckpt,
                         metrics={
                             "best_eval_epoch": best_eval_epoch,
+                            "best_eval_regret": best_eval_regret,
                             "best_eval_reward": best_eval_reward,
                             "best_eval_split": best_eval_split,
                         },
@@ -2819,6 +3415,7 @@ def _run_single_frontier_size(
                         model_ckpt,
                         metrics={
                             "best_eval_epoch": best_eval_epoch,
+                            "best_eval_regret": best_eval_regret,
                             "best_eval_reward": best_eval_reward,
                             "best_eval_split": best_eval_split,
                         },
@@ -2826,6 +3423,7 @@ def _run_single_frontier_size(
                     _save_best_model_performance(
                         out_path=metrics_root / "best_model_performance.json",
                         best_eval_epoch=best_eval_epoch,
+                        best_eval_regret=best_eval_regret,
                         best_eval_reward=best_eval_reward,
                         best_eval_split=best_eval_split,
                         best_metrics_by_split=best_metrics_by_split,
@@ -2835,7 +3433,7 @@ def _run_single_frontier_size(
 
                 epoch_pbar.set_postfix(
                     train_iqm=f"{float(train_stats['iqm']):.4f}",
-                    eval_score=f"{float(eval_score):.4f}",
+                    eval_regret=f"{float(eval_regret):.4f}",
                     eval_split=str(eval_split or "n/a"),
                 )
 
@@ -2845,7 +3443,7 @@ def _run_single_frontier_size(
                 ):
                     print(
                         "Early stopping: "
-                        f"no eval-score improvement for {no_improve_eval_steps} checkpoints."
+                        f"no eval-regret improvement for {no_improve_eval_steps} checkpoints."
                     )
                     break
             else:
@@ -2873,6 +3471,7 @@ def _run_single_frontier_size(
                 best_ckpt,
                 metrics={
                     "best_eval_epoch": None,
+                    "best_eval_regret": None,
                     "best_eval_reward": None,
                     "best_eval_split": None,
                     "note": "No ONNX evaluation checkpoint selected; saved final training weights.",
@@ -2882,6 +3481,7 @@ def _run_single_frontier_size(
                 model_ckpt,
                 metrics={
                     "best_eval_epoch": None,
+                    "best_eval_regret": None,
                     "best_eval_reward": None,
                     "best_eval_split": None,
                     "note": "No ONNX evaluation checkpoint selected; saved final training weights.",
@@ -2890,6 +3490,7 @@ def _run_single_frontier_size(
             _save_best_model_performance(
                 out_path=metrics_root / "best_model_performance.json",
                 best_eval_epoch=None,
+                best_eval_regret=None,
                 best_eval_reward=None,
                 best_eval_split=None,
                 best_metrics_by_split={},
@@ -2928,6 +3529,7 @@ def _run_single_frontier_size(
                 dataset_type=args.dataset_type,
                 max_regular_distance_for_reward=float(args.max_regular_distance_for_reward),
                 failure_reward_value=float(args.failure_reward_value),
+                frontier_size_cap=int(frontier_size),
                 trackers=None,
                 epoch=best_eval_epoch,
                 eval_step=None,
@@ -2939,6 +3541,35 @@ def _run_single_frontier_size(
                 split_dir.mkdir(parents=True, exist_ok=True)
                 with (split_dir / "final_metrics.json").open("w", encoding="utf-8") as fh:
                     json.dump(metrics, fh, indent=2)
+                query_label_metrics = metrics.get("query_label_metrics", {})
+                if isinstance(query_label_metrics, dict) and query_label_metrics:
+                    _plot_query_label_metric_curves(
+                        out_path=split_dir / "query_label_reward_by_frontier_size_final.png",
+                        split_name=str(split_name),
+                        metric_title="Reward (IQM)",
+                        ylabel="Reward",
+                        query_label_metrics=query_label_metrics,
+                        curve_key="reward_by_size",
+                        y_lim=(-1.0, 0.05),
+                    )
+                    _plot_query_label_metric_curves(
+                        out_path=split_dir / "query_label_accuracy_by_frontier_size_final.png",
+                        split_name=str(split_name),
+                        metric_title="Accuracy (IQM)",
+                        ylabel="Accuracy",
+                        query_label_metrics=query_label_metrics,
+                        curve_key="accuracy_by_size",
+                        y_lim=(-0.05, 1.05),
+                    )
+                    _plot_query_label_metric_curves(
+                        out_path=split_dir / "query_label_regret_by_frontier_size_final.png",
+                        split_name=str(split_name),
+                        metric_title="Regret |best reward - taken reward| (IQM)",
+                        ylabel="Regret",
+                        query_label_metrics=query_label_metrics,
+                        curve_key="regret_by_size",
+                        y_lim=(0.0, 1.05),
+                    )
         else:
             print(
                 "[warning] Evaluation requested but query splits are empty. "
@@ -2982,8 +3613,10 @@ def _run_single_frontier_size(
     split_summary["max_failure_states_per_dataset"] = float(args.max_failure_states_per_dataset)
     split_summary["train_frontier_jaccard_threshold"] = float(args.train_frontier_jaccard_threshold)
     split_summary["train_frontier_jaccard_pruning"] = train_jaccard_prune_stats
+    split_summary["eval_frontier_jaccard_threshold"] = float(args.eval_frontier_jaccard_threshold)
     split_summary["onnx_frontier_size"] = int(frontier_size)
     split_summary["base_onnx_frontier_size_for_train_data"] = int(base_onnx_frontier_size)
+    split_summary["base_onnx_frontier_size_for_eval_data"] = int(base_onnx_frontier_size_for_eval)
     split_summary["train_random_frontier_ratio"] = float(args.train_random_frontier_ratio)
     split_summary["train_random_frontier_with_failure_ratio"] = float(
         args.train_random_frontier_with_failure_ratio
@@ -3025,6 +3658,7 @@ def _run_single_frontier_size(
             fh.write(f"{key} = {value}\n")
         fh.write(f"effective_onnx_frontier_size = {int(frontier_size)}\n")
         fh.write(f"base_onnx_frontier_size_for_train_data = {int(base_onnx_frontier_size)}\n")
+        fh.write(f"base_onnx_frontier_size_for_eval_data = {int(base_onnx_frontier_size_for_eval)}\n")
         fh.write(f"inferred_num_edge_labels = {inferred_num_edge_labels}\n")
         fh.write(f"effective_num_edge_labels = {num_edge_labels}\n")
         fh.write("edge_id_bucket_mapping = abs(edge_id) % effective_num_edge_labels\n")
@@ -3038,6 +3672,7 @@ def _run_single_frontier_size(
         fh.write(f"model_checkpoint_loaded = {load_ckpt.as_posix()}\n")
         fh.write(f"best_checkpoint = {best_ckpt.as_posix()}\n")
         fh.write(f"best_eval_epoch = {best_eval_epoch}\n")
+        fh.write(f"best_eval_regret = {best_eval_regret if best_eval_epoch is not None else None}\n")
         fh.write(f"best_eval_reward = {best_eval_reward if best_eval_epoch is not None else None}\n")
         fh.write(f"best_eval_split = {best_eval_split}\n")
         fh.write(f"onnx_path = {onnx_path.as_posix()}\n")
@@ -3064,12 +3699,23 @@ def main(args):
     data_root, _ = _paths(args)
     shared_args = argparse.Namespace(**vars(args))
     shared_args.onnx_frontier_size = int(max_frontier_size)
+    shared_cache_namespace = f"onnx_frontier_size_{int(max_frontier_size)}_shared"
     shared_train_context = _prepare_train_context(
         args=shared_args,
         data_root=data_root,
         onnx_frontier_size=int(max_frontier_size),
-        cache_namespace=f"onnx_frontier_size_{int(max_frontier_size)}_shared",
+        cache_namespace=shared_cache_namespace,
     )
+    shared_eval_context: Optional[Dict[str, Any]] = None
+    if bool(args.evaluate):
+        _, model_root = _paths(args)
+        shared_eval_context = _prepare_eval_context(
+            args=shared_args,
+            data_root=data_root,
+            model_root=model_root,
+            onnx_frontier_size=int(max_frontier_size),
+            cache_namespace=shared_cache_namespace,
+        )
 
     run_summaries: list[Dict[str, Any]] = []
     for frontier_size in frontier_sizes:
@@ -3080,6 +3726,7 @@ def main(args):
             frontier_size=int(frontier_size),
             all_frontier_sizes=frontier_sizes,
             prepared_train_context=shared_train_context,
+            prepared_eval_context=shared_eval_context,
         )
         run_summaries.append(
             {
@@ -3098,7 +3745,9 @@ def main(args):
             {
                 "onnx_frontier_sizes": [int(v) for v in frontier_sizes],
                 "base_onnx_frontier_size_for_train_data": int(max_frontier_size),
+                "base_onnx_frontier_size_for_eval_data": int(max_frontier_size),
                 "single_dataloader_reused_across_frontier_sizes": True,
+                "single_eval_bundle_reused_across_frontier_sizes": bool(args.evaluate),
                 "runs": run_summaries,
             },
             fh,
