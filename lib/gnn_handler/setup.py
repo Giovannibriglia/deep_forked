@@ -18,14 +18,14 @@ CWD = pathlib.Path(__file__).absolute().parent
 
 
 setup(
-    name="epistemic_rl",
+    name="epistemic_gnn_handler",
     version="0.1.0",
     description="Epistemic Reinforcement Learning",
     long_description=open("README.md").read(),
-    url="https://github.com/Giovannibriglia/epistemic_rl",
+    url="https://github.com/FrancescoFabiano/deep/lib/gnn_handler",
     license="GPLv3",
     author="Giovanni Briglia",
-    author_email="giovanni.briglia@unimore.it",
+    author_email="giovanni.briglia@phd.unipi.it",
     packages=find_packages(),
     install_requires=["torch"],
     include_package_data=True,
