@@ -289,12 +289,12 @@ Main outputs (inside `--dir-save-data` / `--dir-save-model`, optionally under `-
 
 - `processed_data/train_samples.pt`
 - `processed_data/samples_params.pt`
-- `processed_data/query_bundle.json` (train/test x random/fifo/stress queries)
+- `processed_data/query_bundle.json` (strategy eval queries for `train` and optional `test`)
 - `best.pt`
 - `metrics/<model_name>.pt`
 - `<model_name>.onnx`
 - `metrics/eval_reports/*.json` (per-eval-step summaries)
-- `metrics/eval_onnx/**/final_metrics.json` (ONNX evaluation by split)
+- `metrics/eval_onnx/**/final_metrics.json` (ONNX evaluation by split: `train` / `test`)
 - `metrics/onnx/*.json` (example parity checks)
 
 ## Deployment checklist
@@ -324,14 +324,15 @@ Main outputs (inside `--dir-save-data` / `--dir-save-model`, optionally under `-
 |-------------------------------------|---------------------|---------------------------------------------------------------------------|
 | `--dataset_type`                    | `HASHED`            | Node encoding mode: `HASHED`, `MAPPED`, `BITMASK`.                        |
 | `--kind-of-data`                    | `merged`            | Frontier composition mode: `merged` or `separated`.                       |
-| `--n-max-dataset-queries`           | `1000`              | Max random/stress eval queries generated per dataset.                     |
-| `--max-size-frontier`               | `25`                | Max frontier size in stress FIFO/LIFO scheduling.                         |
+| `--n-max-dataset-queries`           | `500`               | Max strategy-eval frontiers selected per dataset (for train/test eval).    |
+| `--max-size-frontier`               | `32`                | Max frontier size in legacy stress FIFO/LIFO scheduling.                   |
 | `--max-failure-states-per-dataset`  | `0.3`               | Caps train frontiers with failures (ratio to no-failure train frontiers). |
+| `--eval-frontier-jaccard-threshold` | `0.3`               | Jaccard threshold used to prune near-duplicate evaluation frontiers.       |
 | `--reward-formulation`              | `negative_distance` | Reward mode label (pipeline uses distance-derived rewards).               |
 | `--max-regular-distance-for-reward` | `50.0`              | Distance threshold used for reward scaling and failure cut.               |
 | `--failure-reward-value`            | `-1.0`              | Reward assigned to failure states (`distance > max_regular_distance`).    |
 | `--build-data`                      | `true`              | Rebuild materialized train samples from raw data.                         |
-| `--build-eval-data`                 | `true`              | Rebuild query bundle for ONNX eval (`train/test × random/fifo/stress`).   |
+| `--build-eval-data`                 | `false`             | Rebuild strategy query bundle for ONNX eval (`train` and optional `test`). |
 
 ### Training and optimization
 
