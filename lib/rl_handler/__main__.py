@@ -156,6 +156,8 @@ def parse_args():
     )
 
     parser.add_argument("--batch-size", type=int, default=2048)
+    parser.add_argument("--eval-batch-size", type=int, default=None, help="Batch size to use for evaluation dataloaders. If not set, uses --batch-size")
+    parser.add_argument("--eval-num-workers", type=int, default=0, help="Number of workers for evaluation dataloaders.")
     parser.add_argument("--n-train-epochs", type=int, default=200)
     parser.add_argument("--eval-every", type=int, default=25)
     parser.add_argument("--seed", type=int, default=42)
@@ -2773,12 +2775,74 @@ def _prepare_eval_context(
         cache_namespace=str(cache_namespace),
     )
     flat_query_splits = _flatten_query_splits(query_bundle)
+
+    # Materialize evaluation frontiers into samples and build DataLoaders
+    eval_samples: Dict[str, list[Dict[str, Any]]] = {}
+    eval_loaders: Dict[str, Any] = {}
+
+    dataset_type_norm = str(args.dataset_type).upper()
+    kind_of_data = str(args.kind_of_data)
+    frontier_cap = int(max(1, int(onnx_frontier_size)))
+    graph_cache: Dict[str, _EvalGraphTensors] = {}
+
+    def _load_graph(path: str) -> _EvalGraphTensors:
+        key = str(path)
+        graph = graph_cache.get(key)
+        if graph is None:
+            graph = _load_graph_tensors_no_pyg(key, dataset_type=dataset_type_norm)
+            graph_cache[key] = graph
+        return graph
+
+    for split_name in ("train", "test"):
+        frontiers = flat_query_splits.get(split_name, []) or []
+        samples: list[Dict[str, Any]] = []
+        failed_indices: list[int] = []
+        for idx, frontier in enumerate(frontiers):
+            capped_frontier = _cap_query_frontier_to_size(
+                frontier=frontier, frontier_size_cap=frontier_cap
+            )
+            if int(len(capped_frontier.get("successor_paths", []))) <= 0:
+                failed_indices.append(idx)
+                continue
+            try:
+                sample = _materialize_query_frontier_no_pyg(
+                    frontier=capped_frontier,
+                    kind_of_data=kind_of_data,
+                    dataset_type=dataset_type_norm,
+                    max_regular_distance_for_reward=float(args.max_regular_distance_for_reward),
+                    failure_reward_value=float(args.failure_reward_value),
+                    graph_loader=_load_graph,
+                )
+                samples.append(sample)
+            except Exception:
+                # Skip problematic frontiers but continue materializing others
+                failed_indices.append(idx)
+                continue
+
+        eval_samples[split_name] = samples
+        if samples:
+            eval_batch_size = int(args.eval_batch_size) if getattr(args, "eval_batch_size", None) else int(args.batch_size)
+            eval_num_workers = int(getattr(args, "eval_num_workers", 0))
+            loader = build_frontier_dataloader(
+                samples=samples,
+                batch_size=eval_batch_size,
+                seed=int(args.seed),
+                num_workers=eval_num_workers,
+                pad_frontiers=True,
+                shuffle=False,
+            )
+            eval_loaders[split_name] = loader
+        else:
+            eval_loaders[split_name] = None
+
     return {
         "query_bundle": query_bundle,
         "query_bundle_path": query_bundle_path,
         "test_data_root": test_data_root,
         "flat_query_splits": flat_query_splits,
         "base_onnx_frontier_size": int(onnx_frontier_size),
+        "eval_samples": eval_samples,
+        "eval_loaders": eval_loaders,
     }
 
 
@@ -3092,6 +3156,15 @@ def _run_single_frontier_size(
     loader_generator = getattr(train_loader, "generator", None)
     if isinstance(loader_generator, torch.Generator):
         loader_generator.manual_seed(int(args.seed))
+    # Seed eval dataloaders (if any) for reproducibility
+    if prepared_eval_context is not None:
+        eval_loaders = dict(prepared_eval_context.get("eval_loaders") or {})
+        for _name, loader in eval_loaders.items():
+            if loader is None:
+                continue
+            loader_generator = getattr(loader, "generator", None)
+            if isinstance(loader_generator, torch.Generator):
+                loader_generator.manual_seed(int(args.seed))
 
     query_bundle = {}
     query_bundle_path: Optional[Path] = None
