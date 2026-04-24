@@ -34,9 +34,31 @@ from src.trainer import (
     REGIME_ALL,
     RLFrontierTrainer,
 )
+try:
+    from utils import (
+        I64_MAX,
+        I64_MIN,
+        node_feature_dtypes_for_dataset as _node_feature_dtypes_for_dataset,
+        parse_numeric_node_label_eval as _parse_numeric_node_label_eval,
+        parse_onnx_frontier_sizes as _parse_onnx_frontier_sizes,
+        ratio_0_1,
+        str2bool,
+        strip_quotes as _strip_quotes,
+        validate_int64_range_eval as _validate_int64_range_eval,
+    )
+except ImportError:
+    from .utils import (
+        I64_MAX,
+        I64_MIN,
+        node_feature_dtypes_for_dataset as _node_feature_dtypes_for_dataset,
+        parse_numeric_node_label_eval as _parse_numeric_node_label_eval,
+        parse_onnx_frontier_sizes as _parse_onnx_frontier_sizes,
+        ratio_0_1,
+        str2bool,
+        strip_quotes as _strip_quotes,
+        validate_int64_range_eval as _validate_int64_range_eval,
+    )
 
-I64_MIN = -(1 << 63)
-I64_MAX = (1 << 63) - 1
 _BARE_NEGATIVE_INT_RE = re.compile(r'(?<!["\w])-([0-9]+)(?!["\w])')
 
 
@@ -62,76 +84,6 @@ class EvalSplitTracker:
     eval_dir: Path
     history: Dict[str, list[float]]
     regime_history: Dict[str, Dict[str, list[float]]]
-
-
-def str2bool(v):
-    if isinstance(v, bool):
-        return v
-    v = v.lower()
-    if v in ("yes", "y", "true", "t"):
-        return True
-    if v in ("no", "n", "false", "f"):
-        return False
-    raise argparse.ArgumentTypeError("Boolean value expected (true/false).")
-
-
-def ratio_0_1(v):
-    try:
-        ratio = float(v)
-    except (TypeError, ValueError) as exc:
-        raise argparse.ArgumentTypeError("Expected a float value.") from exc
-    if ratio < 0.0 or ratio > 1.0:
-        raise argparse.ArgumentTypeError("Expected a value in [0.0, 1.0].")
-    return ratio
-
-
-def _parse_onnx_frontier_sizes(raw_value: Any) -> List[int]:
-    def _flatten(value: Any) -> List[str]:
-        if isinstance(value, bool):
-            raise ValueError("Boolean is not a valid frontier-size value.")
-        if isinstance(value, int):
-            return [str(int(value))]
-        if isinstance(value, float):
-            if not float(value).is_integer():
-                raise ValueError(f"Invalid frontier-size value '{value}'.")
-            return [str(int(value))]
-        if isinstance(value, (list, tuple, set)):
-            tokens: List[str] = []
-            for item in value:
-                tokens.extend(_flatten(item))
-            return tokens
-        text = str(value).strip()
-        if not text:
-            return []
-        if text.startswith("[") and text.endswith("]"):
-            text = text[1:-1].strip()
-        if not text:
-            return []
-        return [tok for tok in re.split(r"[,\s]+", text) if tok]
-
-    tokens = _flatten(raw_value)
-    if not tokens:
-        raise ValueError("At least one onnx frontier size is required.")
-
-    sizes: List[int] = []
-    seen = set()
-    for token in tokens:
-        try:
-            size = int(token)
-        except ValueError as exc:
-            raise ValueError(f"Invalid frontier-size token '{token}'.") from exc
-        if size <= 0:
-            raise ValueError(f"onnx frontier size must be > 0, got {size}.")
-        if size not in seen:
-            seen.add(size)
-            sizes.append(size)
-    return sizes
-
-
-def _node_feature_dtypes_for_dataset(dataset_type: str) -> tuple[torch.dtype, str]:
-    if str(dataset_type).upper() == "BITMASK":
-        return torch.float32, "float32"
-    return torch.int64, "int64"
 
 
 def parse_args():
@@ -1298,37 +1250,6 @@ def _infer_num_edge_labels(samples: Sequence[Dict[str, Any]]) -> int:
             max_label = max(max_label, int(edge_ids.max().item()))
             found_label = True
     return (max_label + 1) if found_label else 1
-
-
-def _strip_quotes(v: Any) -> str:
-    return str(v).replace('"', "").strip()
-
-
-def _parse_numeric_node_label_eval(node_obj: object) -> int:
-    if isinstance(node_obj, bool):
-        raise TypeError("Boolean node labels are not supported.")
-    if isinstance(node_obj, int):
-        return int(node_obj)
-    if isinstance(node_obj, float):
-        if not float(node_obj).is_integer():
-            raise ValueError(f"Node label '{node_obj}' is not an integer.")
-        return int(node_obj)
-    if isinstance(node_obj, str):
-        s = node_obj.strip()
-        try:
-            return int(s)
-        except ValueError:
-            parsed = float(s)
-            if not parsed.is_integer():
-                raise ValueError(f"Node label '{node_obj}' is not an integer.")
-            return int(parsed)
-    raise TypeError(f"Unsupported node label type: {type(node_obj)}")
-
-
-def _validate_int64_range_eval(value: int, *, context: str) -> int:
-    if value < I64_MIN or value > I64_MAX:
-        raise ValueError(f"{context} is out of int64 range [{I64_MIN}, {I64_MAX}].")
-    return int(value)
 
 
 def _load_graph_tensors_no_pyg(path: str, dataset_type: str) -> _EvalGraphTensors:
