@@ -156,7 +156,7 @@ def main():
         "--edge-label-buckets",
         dest="edge_label_buckets",
         type=int,
-        default=256,
+        default=128,
         help=(
             "Fixed number of edge-label buckets (K) passed to RL model "
             "edge embeddings."
@@ -167,7 +167,7 @@ def main():
         "--n-max-dataset-queries",
         type=int,
         default=500,
-        help="Max generated ONNX-eval strategy frontiers per dataset.",
+        help="Max generated evaluation strategy frontiers per dataset.",
     )
     parser.add_argument(
         "--onnx-frontier-size",
@@ -175,7 +175,7 @@ def main():
         nargs="+",
         default=[32, 64, 128],
         help=(
-            "Frontier size used for ONNX export tracing. "
+            "Frontier size cap used during training/evaluation (and optional ONNX export). "
             "Provide one or more integers (e.g. 32 or 16 32 64)."
         ),
     )
@@ -225,7 +225,7 @@ def main():
         choices=["true", "false"],
         default="true",
         help=(
-            "Whether to rebuild ONNX-eval query definitions "
+            "Whether to rebuild evaluation query definitions "
             "(train/test x random/fifo/stress) before evaluation."
         ),
     )
