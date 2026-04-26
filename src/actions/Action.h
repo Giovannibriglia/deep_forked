@@ -33,11 +33,11 @@ public:
    * \brief Copy constructor.
    * \param other The Action to copy from.
    */
-    Action(const Action&) = default;
-    Action(Action&&) noexcept = default;
-    Action& operator=(const Action&) = default;
-    Action& operator=(Action&&) noexcept = default;
-    ~Action() = default;
+  Action(const Action &) = default;
+  Action(Action &&) noexcept = default;
+  Action &operator=(const Action &) = default;
+  Action &operator=(Action &&) noexcept = default;
+  ~Action() = default;
   ///@}
 
   /// \name Getters and Setters

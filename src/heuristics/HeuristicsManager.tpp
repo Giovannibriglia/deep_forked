@@ -163,7 +163,7 @@ int HeuristicsManager<StateRepr>::get_heuristic_value(
         break;
       }
       default:
-          ret_heuristics = -1;
+        ret_heuristics = -1;
         ExitHandler::exit_with_message(
             ExitHandler::ExitCode::HeuristicsBadDeclaration,
             "Wrong RL Heuristic Selection in HeuristicsManager. Please check "
