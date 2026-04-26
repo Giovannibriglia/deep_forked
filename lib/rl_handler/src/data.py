@@ -103,8 +103,13 @@ def normalize_distance_to_reward(
     max_dist = max(1e-9, float(max_regular_distance))
     dist = max(0.0, float(distance))
     if dist > max_dist:
+        warnings.warn(
+            f"distance {dist} greater than max_regular_distance {max_dist}; "
+            "returning failure_reward_value",
+            RuntimeWarning,
+        )
         return float(failure_reward_value)
-    return -0.9 * dist / max_dist
+    return -0.7 * dist / max_dist
 
 
 def refresh_frontier_sample_targets(
@@ -155,7 +160,7 @@ def refresh_frontier_sample_targets(
             continue
 
         clamped_distances = torch.clamp_min(distances_t, 0.0)
-        reward_targets = -0.9 * clamped_distances / float(max_dist)
+        reward_targets = -0.7 * clamped_distances / float(max_dist)
         reward_targets = torch.where(
             clamped_distances > float(max_dist),
             torch.full_like(reward_targets, float(failure_value)),
