@@ -115,7 +115,11 @@ if(ENABLE_NEURALNETS)
     message(STATUS "ONNX inference is ENABLED")
 
     set(ONNXRUNTIME_DIR "${CMAKE_SOURCE_DIR}/lib/onnxruntime" CACHE PATH "Path to ONNX Runtime")
-    set(ONNXRUNTIME_LIB "${ONNXRUNTIME_DIR}/lib/libonnxruntime.so")
+    if(APPLE)
+        set(ONNXRUNTIME_LIB "${ONNXRUNTIME_DIR}/lib/libonnxruntime.dylib")
+    else()
+        set(ONNXRUNTIME_LIB "${ONNXRUNTIME_DIR}/lib/libonnxruntime.so")
+    endif()
 
     # Add ONNXRuntime as an IMPORTED shared library target
     add_library(onnxruntime SHARED IMPORTED GLOBAL)
@@ -156,7 +160,7 @@ find_package(Boost CONFIG REQUIRED)
 target_link_libraries(deep PRIVATE Boost::boost)
 
 # === Compiler flags ===
-target_compile_options(deep PRIVATE -Wall -Wextra -Wpedantic -ansi -Wfatal-errors -pthread -std=c++20)
+target_compile_options(deep PRIVATE -Wall -Wextra -Wpedantic -Wfatal-errors -pthread -std=c++20)
 
 if(CMAKE_BUILD_TYPE MATCHES "^[Dd][Ee][Bb][Uu][Gg]$")
     message(STATUS "Building in Debug mode")

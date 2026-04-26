@@ -23,13 +23,6 @@ Action::Action(const std::string &name, ActionId id) {
   set_id(std::move(id));
 }
 
-Action::Action(const Action &other)
-    : m_name(other.m_name), m_id(other.m_id), m_executor(other.m_executor),
-      m_type(other.m_type), m_executability(other.m_executability),
-      m_fully_observants(other.m_fully_observants),
-      m_partially_observants(other.m_partially_observants),
-      m_effects(other.m_effects) {}
-
 std::string Action::get_name() const { return m_name; }
 
 void Action::set_name(const std::string &name) { m_name = name; }
@@ -134,20 +127,6 @@ void Action::add_proposition(const Proposition &to_add) {
 }
 
 bool Action::operator<(const Action &act) const { return m_id < act.get_id(); }
-
-Action &Action::operator=(const Action &act) {
-  if (this != &act) {
-    set_name(act.get_name());
-    set_id(act.get_id());
-    m_type = act.get_type();
-    m_executability = act.get_executability();
-    m_executor = act.get_executor();
-    m_fully_observants = act.get_fully_observants();
-    m_partially_observants = act.get_partially_observants();
-    m_effects = act.get_effects();
-  }
-  return *this;
-}
 
 void Action::print() const {
   auto &os = ArgumentParser::get_instance().get_output_stream();

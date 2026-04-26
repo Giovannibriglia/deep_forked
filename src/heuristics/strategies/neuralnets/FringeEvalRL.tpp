@@ -439,7 +439,7 @@ std::vector<float> FringeEvalRL<StateRepr>::get_score(
 
   // Get the result (assuming scalar output)
   // Get the result
-  const float *output_data = output_tensors[0].GetTensorData<float>();
+  const float *output_data = output_tensors[0].template GetTensorData<float>();
   const auto output_info = output_tensors[0].GetTensorTypeAndShapeInfo();
 
   return rankScores(output_data, states.size());

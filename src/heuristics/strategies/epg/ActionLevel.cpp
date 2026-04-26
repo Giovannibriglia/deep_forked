@@ -32,11 +32,11 @@ const ActionsSet &ActionLevel::get_actions() const noexcept {
   return m_actions;
 }
 
-ActionLevel &ActionLevel::operator=(const ActionLevel &to_assign) {
-  set_actions(to_assign.get_actions());
-  set_depth(to_assign.get_depth());
-  return (*this);
-}
+// ActionLevel &ActionLevel::operator=(const ActionLevel &to_assign) {
+//   set_actions(to_assign.get_actions());
+//   set_depth(to_assign.get_depth());
+//   return (*this);
+// }
 
 void ActionLevel::print() const {
   /**

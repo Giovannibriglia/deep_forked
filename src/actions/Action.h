@@ -33,7 +33,11 @@ public:
    * \brief Copy constructor.
    * \param other The Action to copy from.
    */
-  Action(const Action &other);
+    Action(const Action&) = default;
+    Action(Action&&) noexcept = default;
+    Action& operator=(const Action&) = default;
+    Action& operator=(Action&&) noexcept = default;
+    ~Action() = default;
   ///@}
 
   /// \name Getters and Setters
@@ -100,8 +104,6 @@ public:
   /** \brief Operator < implemented to use Action in std::set. */
   bool operator<(const Action &) const;
 
-  /** \brief Assignment operator. */
-  Action &operator=(const Action &);
   ///@}
 
 private:

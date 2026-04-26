@@ -89,7 +89,11 @@ public:
    * \param[in] to_assign The ActionLevel to copy into this.
    * \return True if assignment was successful.
    */
-  ActionLevel &operator=(const ActionLevel &to_assign);
+  ActionLevel(const ActionLevel&) = default;
+  ActionLevel(ActionLevel&&) = default;
+  ActionLevel& operator=(const ActionLevel&) = default;
+  ActionLevel& operator=(ActionLevel&&) = default;
+  ~ActionLevel() = default;
 
   /**
    * \brief Prints this ActionLevel to the given output stream.

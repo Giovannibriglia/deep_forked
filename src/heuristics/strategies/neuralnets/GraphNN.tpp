@@ -405,7 +405,7 @@ float GraphNN<StateRepr>::run_inference(const GraphTensor &tensor) const {
       input_tensors.size(), output_names_cstr.data(), output_names_cstr.size());
 
   // Get the result (assuming scalar output)
-  const auto *output_data = output_tensors[0].GetTensorData<float>();
+  const auto *output_data = output_tensors[0].template GetTensorData<float>();
   const float score = output_data[0];
 
   return score;
