@@ -147,11 +147,19 @@ def parse_args():
         ),
     )
 
-    parser.add_argument("--batch-size", type=int, default=2048)
-    parser.add_argument("--eval-batch-size", type=int, default=None, help="Batch size to use for evaluation dataloaders. If not set, uses --batch-size")
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--eval-batch-size", type=int, default=128, help="Batch size to use for evaluation dataloaders. If not set, uses --batch-size")
     parser.add_argument("--eval-num-workers", type=int, default=0, help="Number of workers for evaluation dataloaders.")
-    parser.add_argument("--n-train-epochs", type=int, default=12)
-    parser.add_argument("--eval-every", type=int, default=3)
+    parser.add_argument("--n-train-epochs", type=int, default=100)
+    parser.add_argument(
+        "--n-checkpoints-evaluation",
+        type=int,
+        default=5,
+        help=(
+            "Number of evaluation checkpoints during training. "
+            "Checkpoints are uniformly distributed across --n-train-epochs."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
@@ -219,7 +227,7 @@ def parse_args():
         "--onnx-frontier-size",
         type=int,
         nargs="+",
-        default=[32, 64, 128],
+        default=[8, 16, 32, 64],
         help=(
             "Frontier size used for ONNX export tracing. "
             "Provide one or more integers (e.g. 32 or 16 32 64)."
@@ -1983,6 +1991,31 @@ def _select_eval_score(
     return float("inf"), None
 
 
+def _uniform_eval_epochs(n_train_epochs: int, n_checkpoints_evaluation: int) -> list[int]:
+    n_epochs = int(n_train_epochs)
+    n_checkpoints = int(n_checkpoints_evaluation)
+    if n_epochs <= 0:
+        raise ValueError("--n-train-epochs must be > 0.")
+    if n_checkpoints <= 0:
+        raise ValueError("--n-checkpoints-evaluation must be > 0.")
+    if n_checkpoints > n_epochs:
+        raise ValueError(
+            "--n-checkpoints-evaluation cannot exceed --n-train-epochs because "
+            "evaluation checkpoints must be unique epochs."
+        )
+
+    epochs = [
+        int(math.ceil(float(idx * n_epochs) / float(n_checkpoints)))
+        for idx in range(1, n_checkpoints + 1)
+    ]
+    if len(set(epochs)) != n_checkpoints:
+        raise ValueError(
+            "Unable to build uniform evaluation checkpoints with unique epochs. "
+            "Use --n-checkpoints-evaluation <= --n-train-epochs."
+        )
+    return epochs
+
+
 def _save_best_model_performance(
     out_path: Path,
     best_eval_epoch: Optional[int],
@@ -2341,6 +2374,7 @@ def _adapt_train_batch_to_frontier_size(
         if isinstance(value, torch.Tensor) and value.dim() >= 1 and int(value.size(0)) == old_total_candidates:
             out[key] = value.index_select(0, keep_idx)
 
+    node_remap: Optional[torch.Tensor] = None
     if isinstance(raw_batch.get("membership"), torch.Tensor):
         membership = raw_batch["membership"].to(torch.long).view(-1)
         candidate_mask = membership >= 0
@@ -2352,7 +2386,50 @@ def _adapt_train_batch_to_frontier_size(
             if bool(valid_old.any().item()):
                 mapped_values[valid_old] = remap[old_membership[valid_old]]
             membership_new[candidate_mask] = mapped_values
-        out["membership"] = membership_new
+        keep_node_mask = membership_new >= 0
+        keep_node_index = (
+            torch.nonzero(keep_node_mask, as_tuple=False).view(-1)
+            if bool(keep_node_mask.any().item())
+            else torch.zeros((0,), dtype=torch.long)
+        )
+        node_remap = torch.full((membership_new.numel(),), -1, dtype=torch.long)
+        if keep_node_index.numel() > 0:
+            node_remap[keep_node_index] = torch.arange(
+                keep_node_index.numel(), dtype=torch.long
+            )
+
+        node_features = raw_batch.get("node_features")
+        if isinstance(node_features, torch.Tensor):
+            out["node_features"] = node_features.index_select(0, keep_node_index)
+        out["membership"] = membership_new.index_select(0, keep_node_index)
+
+        edge_index = raw_batch.get("edge_index")
+        if isinstance(edge_index, torch.Tensor):
+            edge_index_t = edge_index.to(torch.long)
+            edge_attr = raw_batch.get("edge_attr")
+            if edge_index_t.numel() > 0 and keep_node_index.numel() > 0:
+                src = edge_index_t[0]
+                dst = edge_index_t[1]
+                keep_edge_mask = keep_node_mask[src] & keep_node_mask[dst]
+                edge_index_kept = edge_index_t[:, keep_edge_mask]
+                out["edge_index"] = (
+                    node_remap[edge_index_kept]
+                    if edge_index_kept.numel() > 0
+                    else torch.zeros((2, 0), dtype=torch.long)
+                )
+                if (
+                    isinstance(edge_attr, torch.Tensor)
+                    and edge_attr.dim() >= 1
+                    and int(edge_attr.size(0)) == int(edge_index_t.size(1))
+                ):
+                    out["edge_attr"] = edge_attr[keep_edge_mask]
+            else:
+                out["edge_index"] = torch.zeros((2, 0), dtype=torch.long)
+                if isinstance(edge_attr, torch.Tensor):
+                    trailing_shape = tuple(edge_attr.shape[1:])
+                    out["edge_attr"] = edge_attr.new_zeros((0, *trailing_shape))
+                else:
+                    out["edge_attr"] = torch.zeros((0, 1), dtype=torch.int64)
 
     if isinstance(raw_batch.get("pool_membership"), torch.Tensor) and isinstance(
         raw_batch.get("pool_node_index"), torch.Tensor
@@ -2364,8 +2441,19 @@ def _adapt_train_batch_to_frontier_size(
         if bool(valid_old.any().item()):
             mapped_pool[valid_old] = remap[pool_membership[valid_old]]
         keep_pool_mask = mapped_pool >= 0
-        out["pool_membership"] = mapped_pool[keep_pool_mask]
-        out["pool_node_index"] = pool_node_index[keep_pool_mask]
+        mapped_pool_kept = mapped_pool[keep_pool_mask]
+        pool_node_kept = pool_node_index[keep_pool_mask]
+        if node_remap is not None:
+            node_valid_mask = (pool_node_kept >= 0) & (pool_node_kept < node_remap.numel())
+            pool_node_new = torch.full((pool_node_kept.numel(),), -1, dtype=torch.long)
+            if bool(node_valid_mask.any().item()):
+                pool_node_new[node_valid_mask] = node_remap[pool_node_kept[node_valid_mask]]
+            keep_new_pool_mask = pool_node_new >= 0
+            out["pool_membership"] = mapped_pool_kept[keep_new_pool_mask]
+            out["pool_node_index"] = pool_node_new[keep_new_pool_mask]
+        else:
+            out["pool_membership"] = mapped_pool_kept
+            out["pool_node_index"] = pool_node_kept
 
     counts_t = torch.tensor(keep_counts, dtype=torch.long)
     frontier_ptr_new = torch.zeros((n_frontiers + 1,), dtype=torch.long)
@@ -2774,6 +2862,19 @@ def _run_single_frontier_size(
         "test",
         "train",
     ]
+    eval_epochs: list[int] = []
+    eval_epochs_set: set[int] = set()
+    if bool(args.train):
+        eval_epochs = _uniform_eval_epochs(
+            n_train_epochs=int(args.n_train_epochs),
+            n_checkpoints_evaluation=int(args.n_checkpoints_evaluation),
+        )
+        eval_epochs_set = set(int(v) for v in eval_epochs)
+        if bool(args.evaluate) and bool(flat_query_splits):
+            print(
+                "[eval-schedule] checkpoints="
+                f"{len(eval_epochs)} | epochs={eval_epochs}"
+            )
 
     if bool(args.train):
         epoch_pbar = tqdm(range(int(args.n_train_epochs)), desc="training", leave=True)
@@ -2821,7 +2922,7 @@ def _run_single_frontier_size(
             should_eval = (
                 bool(args.evaluate)
                 and bool(flat_query_splits)
-                and ((epoch + 1) % int(args.eval_every) == 0)
+                and ((epoch + 1) in eval_epochs_set)
             )
             if should_eval:
                 eval_step += 1

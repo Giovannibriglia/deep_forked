@@ -230,12 +230,16 @@ class GNNEncoder(nn.Module):
         node_ids = self._node_label_ids(raw_nodes, device=edge_index.device)
         x = x + self.node_label_embedding(node_ids)
         edge_ids = self._edge_label_ids(edge_attr, device=edge_index.device)
+        shared_edge_attr = None
+        if self.conv_type == "gine":
+            shared_edge_attr = self.edge_embedding(edge_ids)
+            shared_edge_attr = self.edge_proj(shared_edge_attr)
 
         for conv in self.layers:
             if isinstance(conv, GINEConv):
-                e = self.edge_embedding(edge_ids)
-                e = self.edge_proj(e)
-                x = F.relu(conv(x, edge_index, e))
+                if shared_edge_attr is None:
+                    raise RuntimeError("Expected shared edge attributes for GINEConv.")
+                x = F.relu(conv(x, edge_index, shared_edge_attr))
             elif isinstance(conv, RGCNConv):
                 x = F.relu(conv(x, edge_index, edge_ids))
             else:

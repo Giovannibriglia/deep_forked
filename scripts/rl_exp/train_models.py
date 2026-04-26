@@ -6,6 +6,8 @@ import re
 import subprocess
 import time
 
+from requests.compat import str
+
 
 def find_training_data_folders(batch_root):
     models_root = os.path.join(batch_root, "_models")
@@ -39,6 +41,10 @@ def run_training(
     training_data_folder,
     no_goal,
     dataset_type,
+    batch_size,
+    eval_batch_size,
+    n_train_epochs,
+    n_checkpoints_evaluation,
     edge_label_buckets,
     max_regular_distance_for_reward,
     n_max_dataset_queries,
@@ -83,6 +89,14 @@ def run_training(
         model_dir,
         "--dataset_type",
         dataset_type,
+        "--batch-size",
+        str(batch_size),
+        "--eval-batch-size",
+        str(eval_batch_size),
+        "--n-train-epochs",
+        str(n_train_epochs),
+        "--n-checkpoints-evaluation",
+        str(n_checkpoints_evaluation),
         "--K",
         str(edge_label_buckets),
         "--build-data",
@@ -151,6 +165,20 @@ def main():
     parser.add_argument("batch_root")
     parser.add_argument("--no_goal", action="store_true")
     parser.add_argument("--dataset_type", choices=["MAPPED", "HASHED", "BITMASK"], default="HASHED")
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=128,
+        help="Batch size for evaluation dataloaders.",
+    )
+    parser.add_argument("--n-train-epochs", type=int, default=100)
+    parser.add_argument(
+        "--n-checkpoints-evaluation",
+        type=int,
+        default=5,
+        help="Number of uniformly-distributed evaluation checkpoints during training.",
+    )
     parser.add_argument(
         "--K",
         "--edge-label-buckets",
@@ -255,6 +283,18 @@ def main():
         or args.eval_frontier_jaccard_threshold > 1.0
     ):
         raise ValueError("--eval-frontier-jaccard-threshold must be in [0.0, 1.0].")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be > 0.")
+    if args.eval_batch_size <= 0:
+        raise ValueError("--eval-batch-size must be > 0.")
+    if args.n_train_epochs <= 0:
+        raise ValueError("--n-train-epochs must be > 0.")
+    if args.n_checkpoints_evaluation <= 0:
+        raise ValueError("--n-checkpoints-evaluation must be > 0.")
+    if args.n_checkpoints_evaluation > args.n_train_epochs:
+        raise ValueError(
+            "--n-checkpoints-evaluation cannot exceed --n-train-epochs."
+        )
     onnx_frontier_sizes = parse_onnx_frontier_size_values(args.onnx_frontier_size)
     folders = find_training_data_folders(args.batch_root)
     if not folders:
@@ -269,6 +309,10 @@ def main():
                 folder,
                 args.no_goal,
                 args.dataset_type,
+                args.batch_size,
+                args.eval_batch_size,
+                args.n_train_epochs,
+                args.n_checkpoints_evaluation,
                 args.edge_label_buckets,
                 args.max_regular_distance_for_reward,
                 args.n_max_dataset_queries,

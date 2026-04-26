@@ -102,10 +102,18 @@ class RLFrontierTrainer:
         if self.max_grad_norm < 0.0:
             raise ValueError("max_grad_norm must be >= 0.")
 
+    def _model_device(self) -> torch.device:
+        try:
+            return next(self.model.parameters()).device
+        except StopIteration:
+            return self.device
+
     def _move_to_device(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        target_device = self._model_device()
+        self.device = target_device
         out = {}
         for k, v in batch.items():
-            out[k] = v.to(self.device) if isinstance(v, torch.Tensor) else v
+            out[k] = v.to(target_device) if isinstance(v, torch.Tensor) else v
         return out
 
     def _build_model_kwargs(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -124,6 +132,10 @@ class RLFrontierTrainer:
             kwargs["goal_edge_index"] = batch["goal_edge_index"]
             kwargs["goal_edge_attr"] = batch["goal_edge_attr"]
             kwargs["goal_batch"] = batch["goal_batch"]
+        target_device = self._model_device()
+        for key, value in list(kwargs.items()):
+            if isinstance(value, torch.Tensor) and value.device != target_device:
+                kwargs[key] = value.to(target_device)
         return kwargs
 
     @staticmethod
