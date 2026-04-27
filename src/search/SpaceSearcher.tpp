@@ -138,7 +138,7 @@ bool SpaceSearcher<StateRepr, Strategy>::search_sequential(
     m_strategy.pop();
     ++m_expanded_nodes;
 
-    /*  #ifdef DEBUG
+      #ifdef DEBUG
 
            if (m_expanded_nodes % 250 == 0)
               {
@@ -147,7 +147,7 @@ bool SpaceSearcher<StateRepr, Strategy>::search_sequential(
           std::endl;
               }
 
-   #endif */
+   #endif
 
     for (const auto &action : actions) {
       if (current.is_executable(action)) {

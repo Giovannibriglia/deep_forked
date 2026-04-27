@@ -292,14 +292,9 @@ void PortfolioSearch::set_default_configurations() {
       {{"search", "HFS"}, {"heuristics", "S_PG"}});
   m_search_configurations.push_back(
       {{"search", "HFS"}, {"heuristics", "C_PG"}});
-  m_search_configurations.push_back(
-      {{"search", "Astar"}, {"heuristics", "GNN"}});
-  m_search_configurations.push_back({{"search", "IDFS"}});
-
-#ifdef DEBUG
-  m_search_configurations.clear();
-#endif
-
+  //m_search_configurations.push_back(
+    //  {{"search", "Astar"}, {"heuristics", "GNN"}});
+  //m_search_configurations.push_back({{"search", "IDFS"}});
   // This is to test RL with the various other Heuristics
   m_search_configurations.push_back(
       {{"search", "RL"}, {"heuristics", "SUBGOALS"}});

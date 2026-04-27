@@ -53,6 +53,8 @@ docs/html/*
 # Out files
 out/
 out/*
+combined_results/
+combined_results/*
 *.tmp
 callgrind.out*
 
