@@ -1245,6 +1245,8 @@ def build_tree_strategy_frontiers_for_dataset(
         }
 
     frontier_target_size = max(1, int(onnx_frontier_size))
+    strategy_size_rng = random.Random(int(seed) + 104_729)
+    strategy_target_size_counts: Dict[int, int] = {}
     queue: deque[str] = deque()
     available_state_set = set(str(path) for path in state_by_path.keys())
     discovered_set: set[str] = set()
@@ -1279,7 +1281,18 @@ def build_tree_strategy_frontiers_for_dataset(
                 expanded_state_set.add(current)
                 expanded_state_order.append(current)
             if expanded_state_order:
-                target_size = int(frontier_target_size)
+                if int(frontier_target_size) <= 1:
+                    target_size = 1
+                else:
+                    # Keep a bias toward the configured size cap while still
+                    # allowing smaller frontiers for policy training.
+                    if strategy_size_rng.random() < 0.75:
+                        target_size = int(frontier_target_size)
+                    else:
+                        target_size = int(strategy_size_rng.randint(1, int(frontier_target_size) - 1))
+                strategy_target_size_counts[int(target_size)] = int(
+                    strategy_target_size_counts.get(int(target_size), 0) + 1
+                )
 
                 greedy_paths = _select_greedy_paths(
                     expanded_node=current,
@@ -1405,6 +1418,10 @@ def build_tree_strategy_frontiers_for_dataset(
         "generated_total_after_final_dedup": int(len(final_frontiers)),
         "final_deduplicated_to_common": int(final_dedup_stats["deduplicated_to_common"]),
         "final_dropped_no_non_failure": int(final_dedup_stats["dropped_no_non_failure"]),
+        "strategy_target_size_counts": {
+            str(k): int(v)
+            for k, v in sorted(strategy_target_size_counts.items())
+        },
         "label_counts": {str(k): int(v) for k, v in sorted(label_counts.items())},
         "size_counts": {str(k): int(v) for k, v in sorted(size_counts.items())},
     }

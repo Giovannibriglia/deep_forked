@@ -2558,6 +2558,19 @@ def _adapt_train_batch_to_frontier_size(
     return out
 
 
+def _iter_capped_frontier_batches(
+    loader: Any,
+    frontier_size: int,
+):
+    # Reuse the same deterministic prefix-capping used for training so
+    # per-run evaluation remains consistent with the active frontier size.
+    for raw_batch in loader:
+        yield _adapt_train_batch_to_frontier_size(
+            raw_batch=raw_batch,
+            frontier_size=int(frontier_size),
+        )
+
+
 def _run_single_frontier_size(
     args,
     frontier_size: int,
@@ -2937,7 +2950,13 @@ def _run_single_frontier_size(
                     if loader is None:
                         continue
                     # Batched evaluation on trainer.model (uses trainer.device)
-                    metrics = trainer.evaluate(loader, verbose=False)
+                    metrics = trainer.evaluate(
+                        _iter_capped_frontier_batches(
+                            loader=loader,
+                            frontier_size=int(frontier_size),
+                        ),
+                        verbose=False,
+                    )
                     all_metrics[split_name] = metrics
                     # Update trackers (plots/history) if requested
                     if (
@@ -3106,7 +3125,13 @@ def _run_single_frontier_size(
                 loader = eval_loaders.get(split_name)
                 if loader is None:
                     continue
-                metrics = trainer.evaluate(loader, verbose=False)
+                metrics = trainer.evaluate(
+                    _iter_capped_frontier_batches(
+                        loader=loader,
+                        frontier_size=int(frontier_size),
+                    ),
+                    verbose=False,
+                )
                 final_eval_metrics[split_name] = metrics
                 split_dir = eval_root / split_name
                 split_dir.mkdir(parents=True, exist_ok=True)
