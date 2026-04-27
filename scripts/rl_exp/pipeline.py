@@ -8,7 +8,7 @@ def run(cmd):
 if __name__ == "__main__":
     data = sys.argv[1]
 
-    #run(f"python3 scripts/rl_exp/run_all.py {data}")
+    run(f"python3 scripts/rl_exp/run_all.py {data}")
     run("python3 scripts/rl_exp/aggregate.py")
     run("python3 scripts/rl_exp/analyze_results.py")
     run("python3 scripts/rl_exp/advanced_analysis.py")

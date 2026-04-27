@@ -13,9 +13,10 @@ OUT = Path("combined_results")
 OUT.mkdir(exist_ok=True)
 #print(f"[DEBUG] Output dir: {OUT.resolve()}")
 
-FRINGES = [8, 16, 32, 64]
+#FRINGES = [8, 16, 32, 64]
+#STRICT_FLAGS = [True, False]
+FRINGES = [32, 64]
 STRICT_FLAGS = [True, False]
-
 
 def run(label, args, split_path, prefix, fringe, strict):
     #print("\n[DEBUG] ===== RUN START =====")
