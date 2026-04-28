@@ -103,11 +103,6 @@ def normalize_distance_to_reward(
     max_dist = max(1e-9, float(max_regular_distance))
     dist = max(0.0, float(distance))
     if dist > max_dist:
-        warnings.warn(
-            f"distance {dist} greater than max_regular_distance {max_dist}; "
-            "returning failure_reward_value",
-            RuntimeWarning,
-        )
         return float(failure_reward_value)
     return -0.7 * dist / max_dist
 
@@ -837,6 +832,8 @@ def _generate_random_frontiers_from_state_pool(
     def _try_generate(size: int, require_failure: bool, max_attempts: int) -> bool:
         nonlocal generated_with_failure
         size_i = int(size)
+        if int(len(generated)) >= int(target_total):
+            return False
         if int(generated_by_size.get(size_i, 0)) >= int(feasible_any_by_size.get(size_i, 0)):
             return False
         if bool(require_failure):
@@ -850,23 +847,20 @@ def _generate_random_frontiers_from_state_pool(
             ):
                 return False
 
-        attempts = int(
-            max(
-                16,
-                min(
-                    int(max_attempts),
-                    int(
-                        6
-                        * max(
-                            1,
-                            int(feasible_any_by_size.get(size_i, 0))
-                            - int(generated_by_size.get(size_i, 0)),
-                        )
-                    ),
-                ),
-            )
+        attempts_cap = int(max(16, int(max_attempts)))
+        remaining_capacity = int(feasible_any_by_size.get(size_i, 0)) - int(
+            generated_by_size.get(size_i, 0)
         )
+        if remaining_capacity <= 0:
+            return False
+        # Avoid multiplying huge integers when capacity is astronomically large.
+        if remaining_capacity >= int((attempts_cap + 5) // 6):
+            attempts = int(attempts_cap)
+        else:
+            attempts = int(max(16, 6 * max(1, remaining_capacity)))
         for _ in range(attempts):
+            if int(len(generated)) >= int(target_total):
+                return False
             selected_paths = _sample_random_paths_from_state_pool(
                 all_paths=all_paths,
                 non_failure_paths=non_failure_paths,
@@ -899,6 +893,8 @@ def _generate_random_frontiers_from_state_pool(
             )
             if require_failure and not has_failure:
                 continue
+            if (not bool(require_failure)) and has_failure:
+                continue
 
             seen_signatures.add(signature)
             generated.append(frontier)
@@ -923,7 +919,10 @@ def _generate_random_frontiers_from_state_pool(
         target_with_failure = int(target_with_failure_by_size.get(int(size), 0))
         target_without_failure = int(max(0, size_target - target_with_failure))
 
-        while int(generated_with_failure_by_size.get(int(size), 0)) < int(target_with_failure):
+        while (
+            int(generated_with_failure_by_size.get(int(size), 0)) < int(target_with_failure)
+            and int(len(generated)) < int(target_total)
+        ):
             ok = _try_generate(
                 size=int(size),
                 require_failure=True,
@@ -931,7 +930,10 @@ def _generate_random_frontiers_from_state_pool(
             )
             if not ok:
                 break
-        while int(generated_without_failure_by_size.get(int(size), 0)) < int(target_without_failure):
+        while (
+            int(generated_without_failure_by_size.get(int(size), 0)) < int(target_without_failure)
+            and int(len(generated)) < int(target_total)
+        ):
             ok = _try_generate(
                 size=int(size),
                 require_failure=False,

@@ -314,6 +314,7 @@ Main outputs (inside `--dir-save-data` / `--dir-save-model`, optionally under `-
 | `--subset-train`    | `[]`              | Restrict training to specific dataset subfolders.       |
 | `--folder-raw-data` | `out/NN/Training` | Root containing raw CSV/DOT training data.              |
 | `--dir-save-data`   | `data`            | Output root for materialized `.pt` samples.             |
+| `--path-data`       | `""`              | Optional processed-data cache directory to reuse.       |
 | `--dir-save-model`  | `models`          | Output root for checkpoints, metrics, ONNX.             |
 | `--experiment-name` | `""`              | Optional subdirectory under save roots (run isolation). |
 | `--model-name`      | `frontier_policy` | Base filename for model/ONNX/report artifacts.          |
@@ -333,6 +334,9 @@ Main outputs (inside `--dir-save-data` / `--dir-save-model`, optionally under `-
 | `--failure-reward-value`            | `-1.0`              | Reward assigned to failure states (`distance > max_regular_distance`).    |
 | `--build-data`                      | `true`              | Rebuild materialized train samples from raw data.                         |
 | `--build-eval-data`                 | `false`             | Rebuild strategy query bundle for ONNX eval (`train` and optional `test`). |
+
+When `--build-data false` and/or `--build-eval-data false`, the pipeline reuses cached artifacts from
+`--path-data` (or default `processed_data`) and rebuilds only missing artifacts.
 
 ### Training and optimization
 

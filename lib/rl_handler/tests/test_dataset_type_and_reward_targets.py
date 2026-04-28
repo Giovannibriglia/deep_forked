@@ -17,6 +17,8 @@ from src.data import (
     FRONTIER_LABEL_CONSERVATIVE,
     FRONTIER_LABEL_GREEDY,
     FRONTIER_LABEL_RANDOM,
+    _TreeState,
+    _generate_random_frontiers_from_state_pool,
     FrontierRow,
     build_frontier_samples,
     build_tree_strategy_frontiers_for_dataset,
@@ -267,6 +269,32 @@ class TestDatasetTypeAndRewardTargets(unittest.TestCase):
             int(random_stats["target_random_frontiers"]),
             int(round(summary["generated_greedy_conservative_after_dedup"] * 0.5)),
         )
+
+    def test_random_generation_respects_target_when_without_failure_is_requested(self) -> None:
+        state_by_path = {}
+        reward_by_path = {}
+        for idx in range(30):
+            path = f"s_{idx}"
+            distance = 1.0 if idx == 0 else 100.0
+            state_by_path[path] = _TreeState(depth=idx, distance=distance, parent_path="")
+            reward_by_path[path] = -0.014 if idx == 0 else -1.0
+
+        frontiers, stats = _generate_random_frontiers_from_state_pool(
+            state_by_path=state_by_path,
+            reward_by_path=reward_by_path,
+            dataset_id="synthetic/random_cap",
+            goal_path="",
+            onnx_frontier_size=20,
+            random_frontier_ratio=0.2,
+            random_frontier_with_failure_ratio=0.0,
+            reference_frontier_count=30,
+            seed=42,
+            failure_reward_value=-1.0,
+        )
+
+        self.assertEqual(int(stats["target_random_frontiers"]), 6)
+        self.assertEqual(int(stats["generated_random_frontiers"]), len(frontiers))
+        self.assertLessEqual(len(frontiers), int(stats["target_random_frontiers"]))
 
     def test_hashed_node_ids_are_normalized_in_model(self) -> None:
         with tempfile.TemporaryDirectory() as td:
