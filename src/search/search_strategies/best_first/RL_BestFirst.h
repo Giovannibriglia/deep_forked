@@ -95,7 +95,7 @@ public:
   }
 
   [[nodiscard]] std::string get_name() const override {
-    std::string name = "RLBeam x BestFirst search (";
+    std::string name = "RLBeam x BestFirst Search (";
     if (m_refill_mode == RefillMode::RANDOM) {
       name += "random)";
     } else {

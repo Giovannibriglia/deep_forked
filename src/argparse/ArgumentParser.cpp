@@ -377,7 +377,7 @@ ArgumentParser::ArgumentParser() : app("deep") {
           "--config_file", m_config_file,
           "Enable reading portfolio configuration from a file. If set, the "
           "planner will read the configuration from the specified file. "
-          "An example can be found in `utils/configs/config.ut`. "
+          "An example can be found in `utils/configs/config-ALL.ut`. "
           "Please check the command line arguments for the possible field "
           "names (search-related options without the - or -- prefix). "
           "Whatever is set in the file will be used; otherwise, the given "
