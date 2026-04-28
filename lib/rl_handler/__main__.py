@@ -91,6 +91,16 @@ def parse_args():
         help="Optional test-data root. If empty, uses <model_root>/test_data.",
     )
     parser.add_argument("--dir-save-data", type=str, default="data")
+    parser.add_argument(
+        "--path-data",
+        type=str,
+        default="",
+        help=(
+            "Optional path to an existing processed-data cache directory. "
+            "When provided, cached train/eval artifacts are loaded from this path "
+            "and only missing artifacts are rebuilt."
+        ),
+    )
     parser.add_argument("--dir-save-model", type=str, default="models")
     parser.add_argument("--experiment-name", type=str, default="")
     parser.add_argument("--model-name", type=str, default="frontier_policy")
@@ -266,17 +276,56 @@ def _paths(args):
     return data_root, model_root
 
 
+def _resolve_processed_data_dir(
+    args,
+    data_root: Path,
+    cache_namespace: str = "",
+) -> Path:
+    namespace = str(cache_namespace).strip()
+    path_data_raw = str(getattr(args, "path_data", "") or "").strip()
+
+    if path_data_raw:
+        configured_dir = Path(path_data_raw)
+        if configured_dir.exists() and (not configured_dir.is_dir()):
+            raise ValueError(
+                f"--path-data must point to a directory, got file: {configured_dir.as_posix()}."
+            )
+        if namespace:
+            if configured_dir.name == namespace:
+                data_dir = configured_dir
+            elif configured_dir.name == "processed_data":
+                data_dir = configured_dir / namespace
+            elif (configured_dir / namespace).exists():
+                data_dir = configured_dir / namespace
+            else:
+                data_dir = configured_dir
+        else:
+            data_dir = configured_dir
+    else:
+        data_dir = data_root / "processed_data"
+        if namespace:
+            data_dir = data_dir / namespace
+
+    if data_dir.exists() and (not data_dir.is_dir()):
+        raise ValueError(
+            f"Resolved processed-data path is not a directory: {data_dir.as_posix()}."
+        )
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir
+
+
 def _build_or_load_train_samples(
     args,
     data_root: Path,
     onnx_frontier_size: int,
     cache_namespace: str = "",
 ):
-    data_dir = data_root / "processed_data"
     namespace = str(cache_namespace).strip()
-    if namespace:
-        data_dir = data_dir / namespace
-    data_dir.mkdir(parents=True, exist_ok=True)
+    data_dir = _resolve_processed_data_dir(
+        args=args,
+        data_root=data_root,
+        cache_namespace=namespace,
+    )
     train_path = data_dir / "train_samples.pt"
     params_path = data_dir / "samples_params.pt"
     legacy_train_candidates = [
@@ -720,11 +769,12 @@ def _build_or_load_query_bundle(
     model_root: Path,
     cache_namespace: str = "",
 ):
-    data_dir = data_root / "processed_data"
     namespace = str(cache_namespace).strip()
-    if namespace:
-        data_dir = data_dir / namespace
-    data_dir.mkdir(parents=True, exist_ok=True)
+    data_dir = _resolve_processed_data_dir(
+        args=args,
+        data_root=data_root,
+        cache_namespace=namespace,
+    )
     query_path = data_dir / "query_bundle.json"
     legacy_query_candidates = [
         data_root / "data" / "query_bundle.json",
@@ -2122,11 +2172,12 @@ def _prepare_eval_context(
     flat_query_splits = _flatten_query_splits(query_bundle)
     eval_frontier_size = int(max(1, int(getattr(args, "onnx_frontier_size", args.max_size_frontier))))
 
-    data_dir = data_root / "processed_data"
     namespace = str(cache_namespace).strip()
-    if namespace:
-        data_dir = data_dir / namespace
-    data_dir.mkdir(parents=True, exist_ok=True)
+    data_dir = _resolve_processed_data_dir(
+        args=args,
+        data_root=data_root,
+        cache_namespace=namespace,
+    )
     eval_cache_paths = {
         "train": data_dir / "eval_train_samples.pt",
         "test": data_dir / "eval_test_samples.pt",
@@ -2151,54 +2202,68 @@ def _prepare_eval_context(
     eval_samples_loaded_from_cache = False
     eval_loaders: Dict[str, Any] = {}
     eval_cache_rebuild_reason: Optional[str] = None
+    eval_splits: Tuple[str, str] = ("train", "test")
+    splits_to_materialize: set[str] = set(eval_splits)
 
     if not bool(args.build_eval_data):
-        missing_cache_paths = [eval_cache_meta_path, *eval_cache_paths.values()]
-        missing_cache_paths = [p for p in missing_cache_paths if not p.exists()]
-        if missing_cache_paths:
+        if not eval_cache_meta_path.exists():
             eval_cache_rebuild_reason = (
-                "missing cache files: "
-                + ", ".join(path.as_posix() for path in missing_cache_paths)
+                f"missing cache metadata file: {eval_cache_meta_path.as_posix()}"
             )
+        else:
+            try:
+                with eval_cache_meta_path.open("r", encoding="utf-8") as fh:
+                    cache_meta = json.load(fh)
+                cache_signature = dict(cache_meta.get("signature") or {})
+                if cache_signature == eval_cache_signature:
+                    eval_materialization_stats = {
+                        str(k): dict(v)
+                        for k, v in dict(cache_meta.get("materialization_stats") or {}).items()
+                    }
+                    splits_to_materialize = set()
+                    missing_or_invalid_splits: list[str] = []
+                    for split_name in eval_splits:
+                        split_path = eval_cache_paths[split_name]
+                        if not split_path.exists():
+                            missing_or_invalid_splits.append(split_name)
+                            splits_to_materialize.add(split_name)
+                            continue
+                        try:
+                            cached_samples = torch.load(
+                                split_path,
+                                weights_only=False,
+                            )
+                        except Exception:
+                            missing_or_invalid_splits.append(split_name)
+                            splits_to_materialize.add(split_name)
+                            continue
+                        eval_samples[split_name] = (
+                            cached_samples
+                            if isinstance(cached_samples, list)
+                            else list(cached_samples)
+                        )
 
-    if (
-        (not bool(args.build_eval_data))
-        and eval_cache_meta_path.exists()
-        and all(path.exists() for path in eval_cache_paths.values())
-    ):
-        try:
-            with eval_cache_meta_path.open("r", encoding="utf-8") as fh:
-                cache_meta = json.load(fh)
-            cache_signature = dict(cache_meta.get("signature") or {})
-            if cache_signature == eval_cache_signature:
-                for split_name in ("train", "test"):
-                    cached_samples = torch.load(
-                        eval_cache_paths[split_name],
-                        weights_only=False,
-                    )
-                    eval_samples[split_name] = (
-                        cached_samples
-                        if isinstance(cached_samples, list)
-                        else list(cached_samples)
-                    )
-                eval_materialization_stats = {
-                    str(k): dict(v)
-                    for k, v in dict(cache_meta.get("materialization_stats") or {}).items()
-                }
-                eval_samples_loaded_from_cache = True
-            else:
-                eval_cache_rebuild_reason = "cache signature mismatch"
-        except Exception:
-            eval_samples = {}
-            eval_materialization_stats = {}
-            eval_samples_loaded_from_cache = False
-            eval_cache_rebuild_reason = "failed to load eval cache metadata/samples"
+                    if not splits_to_materialize:
+                        eval_samples_loaded_from_cache = True
+                    else:
+                        eval_cache_rebuild_reason = (
+                            "missing/invalid cache splits: "
+                            + ", ".join(sorted(missing_or_invalid_splits))
+                        )
+                else:
+                    eval_cache_rebuild_reason = "cache signature mismatch"
+            except Exception:
+                eval_samples = {}
+                eval_materialization_stats = {}
+                eval_samples_loaded_from_cache = False
+                splits_to_materialize = set(eval_splits)
+                eval_cache_rebuild_reason = "failed to load eval cache metadata"
 
-    if not eval_samples_loaded_from_cache:
+    if splits_to_materialize:
         if (not bool(args.build_eval_data)) and (eval_cache_rebuild_reason is not None):
             print(
-                "[cache-miss] --build-eval-data false but eval sample cache cannot be reused "
-                f"({eval_cache_rebuild_reason}). Rebuilding evaluation samples."
+                "[cache-miss] --build-eval-data false but eval sample cache cannot be fully reused "
+                f"({eval_cache_rebuild_reason}). Rebuilding missing evaluation samples."
             )
         dataset_type_norm = str(args.dataset_type).upper()
         kind_of_data = str(args.kind_of_data)
@@ -2213,7 +2278,9 @@ def _prepare_eval_context(
                 graph_cache[key] = graph
             return graph
 
-        for split_name in ("train", "test"):
+        for split_name in eval_splits:
+            if split_name not in splits_to_materialize:
+                continue
             frontiers = flat_query_splits.get(split_name, []) or []
             samples: list[Dict[str, Any]] = []
             failed_indices: list[int] = []
@@ -2261,7 +2328,19 @@ def _prepare_eval_context(
                 "n_failed_materialization": int(len(failed_indices)),
             }
 
-        for split_name in ("train", "test"):
+        for split_name in eval_splits:
+            if split_name not in eval_samples:
+                eval_samples[split_name] = list(eval_samples.get(split_name, []) or [])
+            if split_name not in eval_materialization_stats:
+                n_queries = int(len(flat_query_splits.get(split_name, []) or []))
+                eval_materialization_stats[split_name] = {
+                    "n_queries": n_queries,
+                    "n_materialized_samples": int(len(eval_samples[split_name])),
+                    "n_failed_materialization": max(
+                        0,
+                        n_queries - int(len(eval_samples[split_name])),
+                    ),
+                }
             torch.save(eval_samples.get(split_name, []), eval_cache_paths[split_name])
         with eval_cache_meta_path.open("w", encoding="utf-8") as fh:
             json.dump(
@@ -2275,6 +2354,20 @@ def _prepare_eval_context(
                 fh,
                 indent=2,
             )
+    else:
+        for split_name in eval_splits:
+            if split_name not in eval_samples:
+                eval_samples[split_name] = []
+            if split_name not in eval_materialization_stats:
+                n_queries = int(len(flat_query_splits.get(split_name, []) or []))
+                eval_materialization_stats[split_name] = {
+                    "n_queries": n_queries,
+                    "n_materialized_samples": int(len(eval_samples[split_name])),
+                    "n_failed_materialization": max(
+                        0,
+                        n_queries - int(len(eval_samples[split_name])),
+                    ),
+                }
 
     eval_batch_size = (
         int(args.eval_batch_size)
