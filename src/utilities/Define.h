@@ -1,6 +1,9 @@
 #pragma once
 
 #include <boost/dynamic_bitset.hpp>
+#include <climits>
+#include <cstddef>
+#include <limits>
 #include <list>
 #include <map>
 #include <memory>
@@ -8,9 +11,6 @@
 #include <set>
 #include <string>
 #include <vector>
-#include <limits>
-#include <cstddef>
-#include <climits>
 
 #include "VectorBisWrapper.h"
 
@@ -79,56 +79,46 @@ static constexpr size_t GOAL_ENCODING_BITS =
 ///< These constants are introduced to allow bitmask representation for
 ///< GNNs, and are only checked if GNN is used.
 
-
-
-
-
 // --- constexpr integer power of 10 ---
 constexpr std::size_t ipow10(std::size_t n) {
-    std::size_t result = 1;
-    for (std::size_t i = 0; i < n; ++i) {
-        // constexpr-friendly overflow check
-        if (result > std::numeric_limits<std::size_t>::max() / 10) {
-            // In constexpr context, this will fail compilation
-            throw "ipow10 overflow";
-        }
-        result *= 10;
+  std::size_t result = 1;
+  for (std::size_t i = 0; i < n; ++i) {
+    // constexpr-friendly overflow check
+    if (result > std::numeric_limits<std::size_t>::max() / 10) {
+      // In constexpr context, this will fail compilation
+      throw "ipow10 overflow";
     }
-    return result;
+    result *= 10;
+  }
+  return result;
 }
 
 // --- count decimal digits (no floating point) ---
 constexpr std::size_t count_digits(std::size_t x) {
-    std::size_t digits = 1;
-    while (x >= 10) {
-        x /= 10;
-        ++digits;
-    }
-    return digits;
+  std::size_t digits = 1;
+  while (x >= 10) {
+    x /= 10;
+    ++digits;
+  }
+  return digits;
 }
 
 // --- constants ---
 inline constexpr std::size_t BITMASK_DIM =
     MAX_REPETITION_BITS + MAX_FLUENT_NUMBER + GOAL_ENCODING_BITS;
 
-inline constexpr std::size_t digits_ushort =
-    count_digits(USHRT_MAX);
+inline constexpr std::size_t digits_ushort = count_digits(USHRT_MAX);
 
 // guard against underflow
 inline constexpr std::size_t REP_LIMIT_BITMASK =
-    (MAX_REPETITION_BITS > 0)
-        ? ipow10(MAX_REPETITION_BITS - 1) - 1
-        : 0;
+    (MAX_REPETITION_BITS > 0) ? ipow10(MAX_REPETITION_BITS - 1) - 1 : 0;
 
 inline constexpr std::size_t REP_LIMIT_USHORT =
-    (digits_ushort > 1)
-        ? ipow10(digits_ushort - 2) - 1
-        : 0;
+    (digits_ushort > 1) ? ipow10(digits_ushort - 2) - 1 : 0;
 
-inline constexpr std::size_t LIMIT_REP =
-    (REP_LIMIT_BITMASK < REP_LIMIT_USHORT)
-        ? REP_LIMIT_BITMASK
-        : REP_LIMIT_USHORT;
+inline constexpr std::size_t LIMIT_REP = (REP_LIMIT_BITMASK < REP_LIMIT_USHORT)
+                                             ? REP_LIMIT_BITMASK
+                                             : REP_LIMIT_USHORT;
 
 // runtime variable (this one is fine as non-constexpr)
 inline unsigned int USAGE_REP = 0;
