@@ -14,7 +14,6 @@
 #include "ArgumentParser.h"
 #include "Domain.h"
 #include "HelperPrint.h"
-#include "actions/Proposition.h"
 #include "utilities/ExitHandler.h"
 
 // Constructor
@@ -89,51 +88,35 @@ void Action::add_partially_observant(const Agent &partial,
       ObservabilitiesMap::value_type(partial, condition));
 }
 
-void Action::add_proposition(const Proposition &to_add) {
-  switch (to_add.get_type()) {
-  case PropositionType::ONTIC:
-    set_type(PropositionType::ONTIC);
-    add_effect(to_add.get_action_effect(),
-               BeliefFormula(to_add.get_executability_conditions()));
-    break;
-  case PropositionType::SENSING:
-    set_type(PropositionType::SENSING);
-    add_effect(to_add.get_action_effect(),
-               BeliefFormula(to_add.get_executability_conditions()));
-    break;
-  case PropositionType::ANNOUNCEMENT:
-    set_type(PropositionType::ANNOUNCEMENT);
-    add_effect(to_add.get_action_effect(),
-               BeliefFormula(to_add.get_executability_conditions()));
-    break;
-  case PropositionType::OBSERVANCE:
-    set_type(PropositionType::NOTSET);
-    add_fully_observant(to_add.get_agent(),
-                        BeliefFormula(to_add.get_observability_conditions()));
-    break;
-  case PropositionType::AWARENESS:
-    set_type(PropositionType::NOTSET);
-    add_partially_observant(
-        to_add.get_agent(),
-        BeliefFormula(to_add.get_observability_conditions()));
-    break;
+bool Action::operator<(const Action &act) const { return m_id < act.get_id(); }
+
+std::string Action::type_to_string(const PropositionType type) {
+  switch (type) {
   case PropositionType::EXECUTABILITY:
-    set_type(PropositionType::NOTSET);
-    add_executability(BeliefFormula(to_add.get_executability_conditions()));
-    break;
+    return "EXECUTABILITY";
+  case PropositionType::ONTIC:
+    return "ONTIC";
+  case PropositionType::SENSING:
+    return "SENSING";
+  case PropositionType::ANNOUNCEMENT:
+    return "ANNOUNCEMENT";
+  case PropositionType::OBSERVANCE:
+    return "OBSERVANCE";
+  case PropositionType::AWARENESS:
+    return "AWARENESS";
+  case PropositionType::NOTSET:
+    return "NOTSET";
   default:
-    break;
+    return "UNKNOWN";
   }
 }
-
-bool Action::operator<(const Action &act) const { return m_id < act.get_id(); }
 
 void Action::print() const {
   auto &os = ArgumentParser::get_instance().get_output_stream();
   const auto grounder = HelperPrint::get_instance().get_grounder();
   os << "\nAction " << get_name() << ":" << std::endl;
   os << "    ID: " << get_id() << ":" << std::endl;
-  os << "    Type: " << Proposition::type_to_string(get_type()) << std::endl;
+  os << "    Type: " << Action::type_to_string(get_type()) << std::endl;
 
   os << "    Executability:";
   for (const auto &exec : m_executability) {

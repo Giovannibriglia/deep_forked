@@ -11,6 +11,13 @@ endif()
 # === Options ===
 option(ENABLE_NEURALNETS "Enable use of ONNX Runtime" OFF)
 option(ENABLE_CUDA "Enable CUDA support for ONNX Runtime" OFF)
+# Use the legacy mA*-style flat-Action transition function. When ON (default),
+# the EPDDL parser populates deep's flat Action model and the existing
+# KripkeState::compute_successor handles ONTIC/SENSING/ANNOUNCEMENT. When OFF,
+# the new DEL transition function (which consumes plank's event-based
+# del::action directly) is selected. The OFF path is under active development;
+# leave ON unless you are working on the new engine.
+option(MASTAR "Use legacy mA* flat-Action transition function" ON)
 
 # === Use ccache if available ===
 find_program(CCACHE_PROGRAM ccache)
@@ -83,16 +90,6 @@ foreach(dir ${INCLUDE_DIRS})
     list(APPEND SOURCES ${TMP_SOURCES})
 endforeach()
 
-# === Flex and Bison ===
-find_package(FLEX REQUIRED)
-find_package(BISON REQUIRED)
-
-FLEX_TARGET(Lexer src/parse/lcp.lex ${BUILD_DIR}/lex.cpp)
-BISON_TARGET(Parser src/parse/lcp.y ${BUILD_DIR}/bison.cpp)
-ADD_FLEX_BISON_DEPENDENCY(Lexer Parser)
-
-list(APPEND SOURCES ${FLEX_Lexer_OUTPUTS} ${BISON_Parser_OUTPUTS})
-
 # Doxygen Documentation
 find_package(Doxygen OPTIONAL_COMPONENTS dot)
 
@@ -105,6 +102,23 @@ set(BUILD_SHARED_LIBS OFF)
 
 add_subdirectory(lib/CLI11)
 add_subdirectory(lib/xxHash/build/cmake ${CMAKE_BINARY_DIR}/xxhash_build EXCLUDE_FROM_ALL)
+
+# Boost must be found before plank's libraries are added — they use
+# boost::dynamic_bitset (header-only) in their own translation units.
+find_package(Boost CONFIG REQUIRED)
+
+# Plank EPDDL libraries (parser + grounder + DEL runtime). We deliberately
+# pull in just the two libraries (no plank frontends/tests).
+add_subdirectory(lib/plank/src/lib/del   ${CMAKE_BINARY_DIR}/plank_del_build)
+add_subdirectory(lib/plank/src/lib/epddl ${CMAKE_BINARY_DIR}/plank_epddl_build)
+target_link_libraries(del_lib   PUBLIC Boost::boost)
+target_link_libraries(epddl_lib PUBLIC Boost::boost)
+
+if(MASTAR)
+    message(STATUS "Transition engine: mA* (legacy flat-Action)")
+else()
+    message(STATUS "Transition engine: full DEL (new, work-in-progress)")
+endif()
 
 
 # === Precompiled Header ===
@@ -156,11 +170,14 @@ if(ENABLE_NEURALNETS)
 endif()
 
 # === Boost ===
-find_package(Boost CONFIG REQUIRED)
+# (already located above before plank's add_subdirectory)
 target_link_libraries(deep PRIVATE Boost::boost)
 
 # === Compiler flags ===
 target_compile_options(deep PRIVATE -Wall -Wextra -Wpedantic -Wfatal-errors -pthread -std=c++20)
+if(MASTAR)
+    target_compile_definitions(deep PRIVATE USE_MASTAR)
+endif()
 
 if(CMAKE_BUILD_TYPE MATCHES "^[Dd][Ee][Bb][Uu][Gg]$")
     message(STATUS "Building in Debug mode")
@@ -173,7 +190,7 @@ endif()
 
 # === Link libraries ===
 find_package(Threads REQUIRED)
-target_link_libraries(deep PRIVATE Threads::Threads CLI11::CLI11 xxHash::xxhash)
+target_link_libraries(deep PRIVATE Threads::Threads CLI11::CLI11 xxHash::xxhash epddl_lib del_lib)
 # librt exists only on Linux
 if(UNIX AND NOT APPLE)
     target_link_libraries(deep PRIVATE rt)

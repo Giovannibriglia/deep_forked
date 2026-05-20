@@ -37,9 +37,23 @@ public:
   void set_worlds(const KripkeWorldPointersSet &to_set);
 
   /** \brief Set the pointed world for this KripkeState.
+   *
+   *  Also resets the designated-worlds set to `{to_set}` so the multi-pointed
+   *  invariant (`m_pointed ∈ m_designated_worlds`, size == 1 in the
+   *  single-pointed default) holds. To install a true multi-pointed
+   *  designated set, call \ref set_designated_worlds instead.
    *  \param[in] to_set The KripkeWorld pointer to assign as pointed.
    */
   void set_pointed(const KripkeWorldPointer &to_set);
+
+  /** \brief Install a (possibly multi-pointed) designated-worlds set.
+   *
+   *  Sets `m_designated_worlds = to_set` and picks `m_pointed` as the
+   *  canonical element (the smallest by `KripkeWorldPointer::operator<`).
+   *  Asserts that `to_set` is non-empty.
+   *  \param[in] to_set The designated worlds.
+   */
+  void set_designated_worlds(const KripkeWorldPointersSet &to_set);
 
   /** \brief Set the beliefs map for this KripkeState.
    *  \param[in] to_set The beliefs map to assign.
@@ -67,10 +81,28 @@ public:
    */
   [[nodiscard]] const KripkeWorldPointersVec &get_worlds_vec() const noexcept;
 
-  /** \brief Get the pointed world in this KripkeState.
-   *  \return The pointed KripkeWorld pointer.
+  /** \brief Get the canonical pointed world in this KripkeState.
+   *
+   *  For single-pointed states this is the unique designated world; for
+   *  multi-pointed states it is the canonical pick (smallest by
+   *  `KripkeWorldPointer::operator<`) of \ref m_designated_worlds. Callers
+   *  that need the full set should use \ref get_designated_worlds.
+   *  \return The canonical pointed KripkeWorld pointer.
    */
   [[nodiscard]] const KripkeWorldPointer &get_pointed() const noexcept;
+
+  /** \brief Get the designated-worlds set.
+   *
+   *  Always contains \ref m_pointed. Size > 1 only after a DEL transition
+   *  whose action had multiple designated events applicable at the input
+   *  pointed (multi-pointed result).
+   *  \return The designated-worlds set.
+   */
+  [[nodiscard]] const KripkeWorldPointersSet &
+  get_designated_worlds() const noexcept;
+
+  /** \brief True if more than one designated world (i.e., multi-pointed). */
+  [[nodiscard]] bool is_multi_pointed() const noexcept;
 
   /** \brief Get the beliefs map in this KripkeState.
    *  \return The beliefs map.
@@ -94,6 +126,15 @@ public:
    *  \return The resulting KripkeState.
    */
   [[nodiscard]] KripkeState compute_successor(const Action &act) const;
+
+#ifndef USE_MASTAR
+  /** \brief Full-DEL applicability check used by State::is_executable when a
+   *  plank action is attached. Returns true iff some designated event of
+   *  `act.get_del_action()` has its precondition entailed at some designated
+   *  world of *this*.
+   */
+  [[nodiscard]] bool is_executable_del(const Action &act) const;
+#endif
 
   // --- Operators ---
   /** \brief Copy Assignment operator.*/
@@ -212,8 +253,15 @@ private:
   unsigned int m_max_depth = 0;
   /** \brief Set of pointers to each world in the structure. */
   KripkeWorldPointersSet m_worlds;
-  /** \brief Pointer to the pointed world. */
+  /** \brief Canonical pointed world. Always equals `*m_designated_worlds.begin()`.
+   *  Kept as a separate field so existing single-pointed code paths (mA* engine,
+   *  printing, heuristics) can read it directly without traversing the set. */
   KripkeWorldPointer m_pointed;
+  /** \brief Designated-worlds set. Invariant: non-empty after `set_pointed` /
+   *  `set_designated_worlds`, and always contains `m_pointed`. Size 1 in
+   *  single-pointed mode (default). Multi-pointed only after a DEL transition
+   *  with more than one applicable designated event. */
+  KripkeWorldPointersSet m_designated_worlds;
   /** \brief Beliefs of each agent in every world. */
   KripkeWorldPointersTransitiveMap m_beliefs;
 
@@ -367,6 +415,14 @@ private:
    *  \return The resulting KripkeState.
    */
   [[nodiscard]] KripkeState execute_announcement(const Action &act) const;
+
+#ifndef USE_MASTAR
+  /** \brief Full-DEL product update with a plank-grounded action carried by
+   *  `act.get_del_action()`. Implementation lives in KripkeState.cpp under
+   *  the same `!USE_MASTAR` guard.
+   */
+  [[nodiscard]] KripkeState compute_successor_del(const Action &act) const;
+#endif
 
   /*This is to allow bisimulation to reduce the size of the object*/
   friend class Bisimulation;

@@ -33,6 +33,18 @@
 #include "neuralnets/GraphNN.h"
 #endif
 
+#ifndef USE_MASTAR
+// Full-DEL transition path needs plank's grounded action + language types.
+#include "del/language/formulas.h"
+#include "del/language/language.h"
+#include "del/semantics/actions/action.h"
+#include "parse/PlankPipeline.h"
+#include <deque>
+#include <map>
+#include <type_traits>
+#include <variant>
+#endif
+
 // --- Setters ---
 
 void KripkeState::set_worlds(const KripkeWorldPointersSet &to_set) {
@@ -48,6 +60,21 @@ void KripkeState::set_worlds_vec() {
 
 void KripkeState::set_pointed(const KripkeWorldPointer &to_set) {
   m_pointed = to_set;
+  m_designated_worlds.clear();
+  m_designated_worlds.insert(to_set);
+}
+
+void KripkeState::set_designated_worlds(
+    const KripkeWorldPointersSet &to_set) {
+  if (to_set.empty()) {
+    ExitHandler::exit_with_message(
+        ExitHandler::ExitCode::ActionTypeConflict,
+        "KripkeState::set_designated_worlds called with an empty set.");
+  }
+  m_designated_worlds = to_set;
+  // Canonical pick: smallest by KripkeWorldPointer::operator< (std::set is
+  // already sorted, so begin() is smallest).
+  m_pointed = *m_designated_worlds.begin();
 }
 
 void KripkeState::set_beliefs(const KripkeWorldPointersTransitiveMap &to_set) {
@@ -83,6 +110,15 @@ KripkeState::get_pointed() const noexcept {
   return m_pointed;
 }
 
+[[nodiscard]] const KripkeWorldPointersSet &
+KripkeState::get_designated_worlds() const noexcept {
+  return m_designated_worlds;
+}
+
+[[nodiscard]] bool KripkeState::is_multi_pointed() const noexcept {
+  return m_designated_worlds.size() > 1;
+}
+
 [[nodiscard]] const KripkeWorldPointersTransitiveMap &
 KripkeState::get_beliefs() const noexcept {
   return m_beliefs;
@@ -103,7 +139,11 @@ KripkeState &KripkeState::operator=(const KripkeState &to_copy) {
   set_worlds(to_copy.get_worlds());
   set_beliefs(to_copy.get_beliefs());
   m_max_depth = to_copy.get_max_depth();
-  set_pointed(to_copy.get_pointed());
+  // Copy designated set directly so we preserve multi-pointed structure;
+  // set_pointed/set_designated_worlds would clobber it through the
+  // single-pointed setter path.
+  m_designated_worlds = to_copy.get_designated_worlds();
+  m_pointed = to_copy.get_pointed();
   return *this;
 }
 
@@ -197,6 +237,14 @@ void KripkeState::build_initial() {
   generate_initial_worlds(permutation, 0,
                           ini_conditions.get_initially_known_fluents());
   generate_initial_edges();
+  // add_initial_world assigns m_pointed directly (bypassing set_pointed) so
+  // the designated-worlds invariant has not been established yet. Restore it
+  // now: in the initial state we are single-pointed (the unique world matching
+  // the pointed-world conditions). Without this, multi-pointed entailment
+  // (KripkeEntailmentHelper::entails over an empty designated set) collapses
+  // to vacuously-true and every goal looks satisfied at the initial state.
+  m_designated_worlds.clear();
+  m_designated_worlds.insert(m_pointed);
 }
 
 void KripkeState::generate_initial_worlds(FluentsSet &permutation,
@@ -400,6 +448,23 @@ void KripkeState::compact_repetitions() {
         "Error: In Compacting the repetition found mismatch (2)");
   }
 
+  // Designated worlds — same remap as m_worlds. Without this, multi-pointed
+  // states leak stale repetition indices into m_designated_worlds and the
+  // entries no longer match m_worlds.
+  KripkeWorldPointersSet updated_d;
+  for (const auto &dw : m_designated_worlds) {
+    auto dw2 = dw;
+    if (auto itRem = remap.find(dw.get_repetition()); itRem != remap.end()) {
+      dw2.set_repetition(itRem->second);
+    } else {
+      ExitHandler::exit_with_message(
+          ExitHandler::ExitCode::GNNBitmaskRepetitionError,
+          "Error: In Compacting the repetition found mismatch (designated)");
+    }
+    updated_d.insert(dw2);
+  }
+  m_designated_worlds = std::move(updated_d);
+
   // Edges — Transitive map (copy-and-replace)
   KripkeWorldPointersTransitiveMap updated_b;
 
@@ -454,7 +519,287 @@ void KripkeState::compact_repetitions() {
 
 // --- Transition/Execution ---
 
+#ifndef USE_MASTAR
+namespace {
+namespace pd = plank::del;
+
+/// Lookup tables built once per transition: plank atom/agent ids → deep
+/// Fluent/Agent bitsets. Same indexing as plank's language object.
+struct DelCaches {
+  std::vector<Fluent> pos_fluent; ///< indexed by plank atom id
+  std::vector<Fluent> neg_fluent; ///< indexed by plank atom id
+  std::vector<Agent> agent;       ///< indexed by plank agent id
+};
+
+DelCaches build_caches(const pd::language &lang, const Grounder &g) {
+  DelCaches c;
+  const auto an = lang.get_atoms_number();
+  c.pos_fluent.reserve(an);
+  c.neg_fluent.reserve(an);
+  for (pd::atom a = 0; a < an; ++a) {
+    const auto &name = lang.get_atom_name(a);
+    c.pos_fluent.push_back(g.ground_fluent(name));
+    c.neg_fluent.push_back(g.ground_fluent(NEGATION_SYMBOL + name));
+  }
+  const auto agn = lang.get_agents_number();
+  c.agent.reserve(agn);
+  for (pd::agent ag = 0; ag < agn; ++ag) {
+    c.agent.push_back(g.ground_agent(lang.get_agent_name(ag)));
+  }
+  return c;
+}
+
+/// Recursively evaluate a plank grounded formula at a world inside a state.
+/// Modal operators traverse `S.get_beliefs()`; common knowledge does a BFS
+/// over the union of agent edges in the group.
+bool eval(const pd::formula_ptr &f, const KripkeWorldPointer &w,
+          const KripkeState &S, const DelCaches &c) {
+  return std::visit(
+      [&](auto &&ptr) -> bool {
+        using T = std::decay_t<decltype(ptr)>;
+        if constexpr (std::is_same_v<T, pd::true_formula_ptr>) {
+          return true;
+        } else if constexpr (std::is_same_v<T, pd::false_formula_ptr>) {
+          return false;
+        } else if constexpr (std::is_same_v<T, pd::atom_formula_ptr>) {
+          const auto &fs = w.get_fluent_set();
+          return fs.find(c.pos_fluent[ptr->get_atom()]) != fs.end();
+        } else if constexpr (std::is_same_v<T, pd::not_formula_ptr>) {
+          return !eval(ptr->get_formula(), w, S, c);
+        } else if constexpr (std::is_same_v<T, pd::and_formula_ptr>) {
+          for (const auto &sub : ptr->get_formulas())
+            if (!eval(sub, w, S, c)) return false;
+          return true;
+        } else if constexpr (std::is_same_v<T, pd::or_formula_ptr>) {
+          for (const auto &sub : ptr->get_formulas())
+            if (eval(sub, w, S, c)) return true;
+          return false;
+        } else if constexpr (std::is_same_v<T, pd::imply_formula_ptr>) {
+          return !eval(ptr->get_first_formula(), w, S, c) ||
+                 eval(ptr->get_second_formula(), w, S, c);
+        } else if constexpr (std::is_same_v<T, pd::box_formula_ptr> ||
+                             std::is_same_v<T, pd::diamond_formula_ptr>) {
+          const bool universal = std::is_same_v<T, pd::box_formula_ptr>;
+          const auto bit = S.get_beliefs().find(w);
+          if (bit == S.get_beliefs().end()) return universal;
+          for (auto ai : ptr->get_mod_index()) {
+            auto eit = bit->second.find(c.agent[ai]);
+            if (eit == bit->second.end()) continue;
+            for (const auto &wp : eit->second) {
+              const bool sub = eval(ptr->get_formula(), wp, S, c);
+              if (universal && !sub) return false;
+              if (!universal && sub) return true;
+            }
+          }
+          return universal;
+        } else if constexpr (std::is_same_v<T, pd::kw_box_formula_ptr> ||
+                             std::is_same_v<T, pd::kw_diamond_formula_ptr>) {
+          // Kw_G phi == [G] phi OR [G] !phi;  <Kw_G> phi == ![G]phi AND ![G]!phi
+          auto box_with_target = [&](bool tgt) {
+            const auto bit = S.get_beliefs().find(w);
+            if (bit == S.get_beliefs().end()) return true;
+            for (auto ai : ptr->get_mod_index()) {
+              auto eit = bit->second.find(c.agent[ai]);
+              if (eit == bit->second.end()) continue;
+              for (const auto &wp : eit->second)
+                if (eval(ptr->get_formula(), wp, S, c) != tgt) return false;
+            }
+            return true;
+          };
+          if constexpr (std::is_same_v<T, pd::kw_box_formula_ptr>)
+            return box_with_target(true) || box_with_target(false);
+          else
+            return !box_with_target(true) && !box_with_target(false);
+        } else if constexpr (std::is_same_v<T, pd::c_box_formula_ptr> ||
+                             std::is_same_v<T, pd::c_diamond_formula_ptr>) {
+          // BFS over the union of agent edges in the group; closed under
+          // reflexive-transitive S5 reachability (start from w).
+          AgentsSet ags;
+          for (auto ai : ptr->get_mod_index()) ags.insert(c.agent[ai]);
+          KripkeWorldPointersSet visited;
+          std::deque<KripkeWorldPointer> q;
+          visited.insert(w);
+          q.push_back(w);
+          while (!q.empty()) {
+            auto cur = q.front();
+            q.pop_front();
+            auto bit = S.get_beliefs().find(cur);
+            if (bit == S.get_beliefs().end()) continue;
+            for (const auto &ag : ags) {
+              auto eit = bit->second.find(ag);
+              if (eit == bit->second.end()) continue;
+              for (const auto &wp : eit->second) {
+                if (visited.insert(wp).second) q.push_back(wp);
+              }
+            }
+          }
+          if constexpr (std::is_same_v<T, pd::c_box_formula_ptr>) {
+            for (const auto &wp : visited)
+              if (!eval(ptr->get_formula(), wp, S, c)) return false;
+            return true;
+          } else {
+            for (const auto &wp : visited)
+              if (eval(ptr->get_formula(), wp, S, c)) return true;
+            return false;
+          }
+        }
+        return false;
+      },
+      f);
+}
+
+} // anonymous namespace
+
+KripkeState KripkeState::compute_successor_del(const Action &act) const {
+  const KripkeState &S = *this;
+  const pd::action &pa = *act.get_del_action();
+  // (Null check is performed by the caller — compute_successor.)
+
+  const auto *pipeline = Domain::get_instance().get_pipeline();
+  if (pipeline == nullptr) {
+    ExitHandler::exit_with_message(
+        ExitHandler::ExitCode::ActionTypeConflict,
+        "DEL transition requires Domain's PlankPipeline; build() must run "
+        "before any compute_successor call.");
+  }
+  const pd::language &lang = pipeline->language();
+  const Grounder &g = HelperPrint::get_instance().get_grounder();
+  const DelCaches caches = build_caches(lang, g);
+
+  const auto n_events = pa.get_events_number();
+  const auto n_agents = lang.get_agents_number();
+  const auto n_obs_types = pa.get_obs_types_number();
+
+  // 1. Build new worlds W' = { (w, e) | pre(e) holds at w }. Postconditions
+  //    are evaluated at the *input* world (DEL semantics).
+  using WEKey = std::pair<KripkeWorldId, pd::event_id>;
+  std::map<WEKey, KripkeWorldPointer> new_map;
+
+  KripkeState ret;
+  ret.set_max_depth(S.get_max_depth() + 1);
+
+  for (const auto &w : S.get_worlds()) {
+    for (pd::event_id e = 0; e < n_events; ++e) {
+      if (!eval(pa.get_precondition(e), w, S, caches)) continue;
+      FluentsSet new_fluents = w.get_fluent_set();
+      const auto &post = pa.get_postconditions(e);
+      for (const auto &[atom_id, value_formula] : post) {
+        const bool new_val = eval(value_formula, w, S, caches);
+        const Fluent &p_pos = caches.pos_fluent[atom_id];
+        const Fluent &p_neg = caches.neg_fluent[atom_id];
+        new_fluents.erase(p_pos);
+        new_fluents.erase(p_neg);
+        new_fluents.insert(new_val ? p_pos : p_neg);
+      }
+      KripkeWorldPointer new_p =
+          ret.add_rep_world(KripkeWorld(new_fluents), w.get_repetition());
+      new_map.emplace(WEKey{w.get_id(), e}, new_p);
+    }
+  }
+
+  // 2. Per-agent obs_type: evaluate obs_condition(i, t) at the original
+  //    pointed; pick the first applicable t. plank stores obs-conditions
+  //    sparsely (unordered_map<obs_type, formula>) — use the whole map and
+  //    `find` rather than `get_obs_condition(ai, t)` which calls `.at(t)`
+  //    and throws when the (agent, obs_type) pair is unmaterialized.
+  std::vector<long> agent_obs_type(n_agents, -1);
+  for (pd::agent ai = 0; ai < n_agents; ++ai) {
+    const auto &obs_map = pa.get_agent_obs_conditions(ai);
+    for (pd::obs_type t = 0; t < n_obs_types; ++t) {
+      const auto it = obs_map.find(t);
+      if (it == obs_map.end()) continue;
+      const auto &cond = it->second;
+      if (pd::formulas_utils::get_type(cond) == pd::formula_type::false_formula)
+        continue;
+      if (eval(cond, S.get_pointed(), S, caches)) {
+        agent_obs_type[ai] = static_cast<long>(t);
+        break;
+      }
+    }
+  }
+
+  // 3. New accessibility: ((w,e), (w',e')) ∈ R'_i iff
+  //    (w,w') ∈ R_i in S AND (e,e') ∈ R^A_t (where t = obs_type of i).
+  for (const auto &w : S.get_worlds()) {
+    auto bit = S.get_beliefs().find(w);
+    if (bit == S.get_beliefs().end()) continue;
+    for (pd::event_id e = 0; e < n_events; ++e) {
+      auto it_we = new_map.find({w.get_id(), e});
+      if (it_we == new_map.end()) continue;
+      for (pd::agent ai = 0; ai < n_agents; ++ai) {
+        if (agent_obs_type[ai] < 0) continue;
+        const auto t = static_cast<pd::obs_type>(agent_obs_type[ai]);
+        const Agent &dag = caches.agent[ai];
+        auto eit = bit->second.find(dag);
+        if (eit == bit->second.end()) continue;
+        for (const auto &wp : eit->second) {
+          for (pd::event_id ep = 0; ep < n_events; ++ep) {
+            if (!pa.has_edge(t, e, ep)) continue;
+            auto it_we2 = new_map.find({wp.get_id(), ep});
+            if (it_we2 == new_map.end()) continue;
+            ret.add_edge(it_we->second, it_we2->second, dag);
+          }
+        }
+      }
+    }
+  }
+
+  // 4. New designated worlds: for every designated event e in the action
+  //    whose precondition holds at one of the input designated worlds w,
+  //    add (w, e) to the result's designated set. For single-pointed input
+  //    + single applicable designated event (the mA* case), this collapses
+  //    to a single canonical pointed; otherwise the result is multi-pointed.
+  KripkeWorldPointersSet new_designated;
+  for (const auto &w_d : S.get_designated_worlds()) {
+    for (auto e : pa.get_designated_events()) {
+      if (!eval(pa.get_precondition(e), w_d, S, caches)) continue;
+      auto it = new_map.find({w_d.get_id(), e});
+      if (it != new_map.end()) new_designated.insert(it->second);
+    }
+  }
+  if (new_designated.empty()) {
+    ExitHandler::exit_with_message(
+        ExitHandler::ExitCode::ActionTypeConflict,
+        "DEL transition: no designated event of action '" + act.get_name() +
+            "' is applicable at any input designated world.");
+  }
+  ret.set_designated_worlds(new_designated);
+  return ret;
+}
+
+bool KripkeState::is_executable_del(const Action &act) const {
+  const pd::action *pa = act.get_del_action();
+  if (pa == nullptr) {
+    return false;
+  }
+  const auto *pipeline = Domain::get_instance().get_pipeline();
+  if (pipeline == nullptr) {
+    return false;
+  }
+  const pd::language &lang = pipeline->language();
+  const Grounder &g = HelperPrint::get_instance().get_grounder();
+  const DelCaches caches = build_caches(lang, g);
+
+  // Applicability under DEL: action is executable in S iff some designated
+  // event has its precondition satisfied at some designated world. This is
+  // exactly the condition that produces a non-empty new designated set in
+  // compute_successor_del, so the two stay consistent.
+  for (const auto &w_d : m_designated_worlds) {
+    for (auto e : pa->get_designated_events()) {
+      if (eval(pa->get_precondition(e), w_d, *this, caches)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+#endif // !USE_MASTAR
+
 KripkeState KripkeState::compute_successor(const Action &act) const {
+#ifdef USE_MASTAR
+  // Legacy mA* path: dispatch on the flat PropositionType built by
+  // PlankTranslator. Conditional postconditions / multi-event actions are
+  // rejected upstream so each Action falls into one of three categories.
   KripkeState ret;
   switch (act.get_type()) {
   case PropositionType::ONTIC:
@@ -473,8 +818,22 @@ KripkeState KripkeState::compute_successor(const Action &act) const {
   }
 
   ret.compact_repetitions();
-
   return ret;
+#else
+  // Full-DEL path: consume the grounded event-based action carried by `act`
+  // and run the standard DEL product update directly on this KripkeState.
+  const plank::del::action *pa = act.get_del_action();
+  if (pa == nullptr) {
+    ExitHandler::exit_with_message(
+        ExitHandler::ExitCode::ActionTypeConflict,
+        "Action '" + act.get_name() +
+            "' has no associated plank del::action; the DEL transition "
+            "function requires the EPDDL pipeline.");
+  }
+  KripkeState ret = compute_successor_del(act);
+  ret.compact_repetitions();
+  return ret;
+#endif
 }
 
 void KripkeState::maintain_oblivious_believed_worlds(
@@ -660,15 +1019,21 @@ KripkeState KripkeState::execute_announcement(const Action &act) const {
 }
 
 bool KripkeState::entails(const Fluent &to_check) const {
-  return KripkeEntailmentHelper::entails(to_check, get_pointed());
+  return std::ranges::all_of(m_designated_worlds, [&](const auto &w) {
+    return KripkeEntailmentHelper::entails(to_check, w);
+  });
 }
 
 bool KripkeState::entails(const FluentsSet &to_check) const {
-  return KripkeEntailmentHelper::entails(to_check, get_pointed());
+  return std::ranges::all_of(m_designated_worlds, [&](const auto &w) {
+    return KripkeEntailmentHelper::entails(to_check, w);
+  });
 }
 
 bool KripkeState::entails(const FluentFormula &to_check) const {
-  return KripkeEntailmentHelper::entails(to_check, get_pointed());
+  return std::ranges::all_of(m_designated_worlds, [&](const auto &w) {
+    return KripkeEntailmentHelper::entails(to_check, w);
+  });
 }
 
 bool KripkeState::entails(const BeliefFormula &to_check) const {
@@ -680,6 +1045,14 @@ bool KripkeState::entails(const FormulaeList &to_check) const {
 }
 
 void KripkeState::contract_with_bisimulation() {
+  // Ordering invariant: `compute_successor` runs `compact_repetitions` before
+  // returning, so a state reaching this point already has compacted repetition
+  // labels and m_designated_worlds remapped in lockstep with m_worlds. The
+  // bisimulation pass then rebuilds m_worlds / m_beliefs / m_designated_worlds
+  // from scratch via automaton_to_kstate, so the two passes do not interfere.
+  // Do not reorder: bisimulation must come AFTER compaction, or the contracted
+  // state would carry the pre-compaction repetition labels that no longer
+  // match other state slots.
   KripkeReachabilityHelper::clean_unreachable_worlds(*this);
   Bisimulation b;
   b.calc_min_bisimilar(*this);
@@ -709,5 +1082,7 @@ const GraphTensor &KripkeState::get_tensor_representation() {
 
 KripkeState::KripkeState(const KripkeState &other)
     : m_max_depth(other.m_max_depth), m_worlds(other.m_worlds),
-      m_pointed(other.m_pointed), m_beliefs(other.m_beliefs),
-      m_worlds_vec(other.m_worlds_vec), m_beliefs_vec(other.m_beliefs_vec) {}
+      m_pointed(other.m_pointed),
+      m_designated_worlds(other.m_designated_worlds),
+      m_beliefs(other.m_beliefs), m_worlds_vec(other.m_worlds_vec),
+      m_beliefs_vec(other.m_beliefs_vec) {}

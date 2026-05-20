@@ -1,53 +1,42 @@
 /**
  * \brief Implementation of \ref Domain.h.
  *
- * \copyright GNU Public License.
+ * Domain construction is now driven by plank's EPDDL pipeline:
+ *   1. Build PlankPipeline   (parse + type-check + ground via plank libs).
+ *   2. PlankTranslator copies the grounded data into deep's runtime objects
+ *      (agents, fluents, actions, initial description, goal description).
  *
- * \author Francesco Fabiano.
+ * \copyright GNU Public License.
+ * \author Francesco Fabiano
  * \date May 14, 2025
  */
 #include "Domain.h"
-#include <boost/dynamic_bitset.hpp>
+
+#include <filesystem>
 
 #include "ArgumentParser.h"
 #include "Configuration.h"
 #include "ExitHandler.h"
 #include "HelperPrint.h"
-#include "parse/Reader.h"
-#include "utilities/FormulaHelper.h"
+#include "parse/PlankPipeline.h"
+#include "parse/PlankTranslator.h"
 
 Domain::Domain() {
-  const auto &argument_parser = ArgumentParser::get_instance();
-  const std::string input_file = argument_parser.get_input_file();
-  const std::filesystem::path domain_path(input_file);
-  std::string last_component = domain_path.stem().string();
-  if (last_component == "Test" || last_component == "Training") {
-    // Use the name of the parent directory
-    m_name = domain_path.parent_path().stem().string();
+  const auto &args = ArgumentParser::get_instance();
+  const std::filesystem::path problem_path(args.get_problem_path());
+  // Use the problem file's stem as the domain identifier; fall back to its
+  // parent directory when the stem is a generic split-name like Test/Training.
+  std::string stem = problem_path.stem().string();
+  if (stem == "Test" || stem == "Training") {
+    m_name = problem_path.parent_path().stem().string();
   } else {
-    m_name = last_component;
+    m_name = stem;
   }
-
-  if (freopen(input_file.c_str(), "r", stdin) == nullptr) {
-    ExitHandler::exit_with_message(
-        ExitHandler::ExitCode::DomainFileOpenError,
-        "File " + input_file + " cannot be opened." +
-            std::string(ExitHandler::domain_file_error));
-    // Just to please the compiler
-    exit(static_cast<int>(ExitHandler::ExitCode::ExitForCompiler));
-  }
-
-  // Global declaration so it accessed by the bison parser
-  /// \todo Change this when new parser is added
-  domain_reader->read();
-
-  // Global declaration so it accessed by the bison parser
-  /// \todo Change this when new parser is added
-  if (ArgumentParser::get_instance().get_verbose())
-    domain_reader->print();
 
   build();
 }
+
+Domain::~Domain() = default;
 
 Domain &Domain::get_instance() {
   static Domain instance;
@@ -91,212 +80,56 @@ const FormulaeList &Domain::get_goal_description() const noexcept {
 }
 
 void Domain::build() {
-  auto &os = ArgumentParser::get_instance().get_output_stream();
-  if (ArgumentParser::get_instance().get_verbose()) {
+  const auto &args = ArgumentParser::get_instance();
+  auto &os = args.get_output_stream();
+  const bool verbose = args.get_verbose();
+
+  if (verbose) {
     os << "\n\n========== DOMAIN OUTPUT BEGIN ==========\n";
   }
 
+  m_pipeline = std::make_unique<PlankPipeline>(
+      args.get_problem_path(), args.get_domain_path(),
+      args.get_libraries_paths(), verbose);
+  PlankTranslator translator(*m_pipeline);
+
   Grounder grounder;
-  build_agents(grounder);
-  build_fluents(grounder);
-  build_actions(grounder);
-  build_initially();
-  build_goal();
-  if (ArgumentParser::get_instance().get_verbose()) {
-    os << "========== DOMAIN OUTPUT END ==========\n\n";
-  }
-}
 
-void Domain::build_agents(Grounder &grounder) {
-  AgentsMap domain_agent_map;
-  auto &os = ArgumentParser::get_instance().get_output_stream();
-  if (ArgumentParser::get_instance().get_verbose()) {
-    os << "Building agent list..." << std::endl;
-  }
-  int i = 0;
-  const int agents_length = FormulaHelper::length_to_power_two(
-      static_cast<int>(domain_reader->m_agents.size()));
+  if (verbose) os << "Building agent list..." << std::endl;
+  AgentsMap agent_map;
+  translator.build_agents(m_agents, agent_map);
+  grounder.set_agent_map(agent_map);
 
-  /////\todo This will be replaced by epddl parser. Reader needs to be changed
-  /// and make sure to have getter and setter
-  for (const auto &agent_name : domain_reader->m_agents) {
-    Agent agent(agents_length, i);
-    domain_agent_map.insert({agent_name, agent});
-    m_agents.insert(agent);
-    ++i;
+  if (verbose) os << "Building fluent literals..." << std::endl;
+  FluentMap fluent_map;
+  translator.build_fluents(m_fluents, m_positive_fluents, fluent_map);
+  grounder.set_fluent_map(fluent_map);
 
-    if (ArgumentParser::get_instance().get_verbose()) {
-      os << "Agent " << agent_name << " is " << agent << std::endl;
-    };
-  }
-  grounder.set_agent_map(domain_agent_map);
-}
-
-void Domain::build_fluents(Grounder &grounder) {
-  FluentMap domain_fluent_map;
-  auto &os = ArgumentParser::get_instance().get_output_stream();
-
-  if (ArgumentParser::get_instance().get_verbose()) {
-    os << "Building fluent literals..." << std::endl;
-  }
-  int i = 0;
-  const int bit_size = FormulaHelper::length_to_power_two(
-                           static_cast<int>(domain_reader->m_fluents.size())) +
-                       1;
-  // +1 for the negation bit
-
-  /////\todo This will be replaced by epddl parser. Reader needs to be changed
-  /// and make sure to have getter and setter
-  for (const auto &fluent_name : domain_reader->m_fluents) {
-    Fluent fluent_real(bit_size, i);
-    fluent_real.set(fluent_real.size() - 1, true);
-
-    domain_fluent_map.insert({fluent_name, fluent_real});
-    m_fluents.insert(fluent_real);
-    m_positive_fluents.push_back(fluent_real);
-
-    Fluent fluent_negate_real(bit_size, i);
-    // fluent_negate_real.set(fluent_negate_real.size() - 1, false); Do nothing
-    // since it is already false by default
-    domain_fluent_map.insert(
-        {NEGATION_SYMBOL + fluent_name, fluent_negate_real});
-    m_fluents.insert(fluent_negate_real);
-    ++i;
-
-    if (ArgumentParser::get_instance().get_verbose()) {
-      os << "Literal " << fluent_name << " is " << fluent_real << std::endl;
-      os << "Literal not " << fluent_name << " is " << fluent_negate_real
-         << std::endl;
-    }
-  }
-  grounder.set_fluent_map(domain_fluent_map);
-}
-
-void Domain::build_actions(Grounder &grounder) {
-  ActionNamesMap domain_action_name_map;
-  auto &os = ArgumentParser::get_instance().get_output_stream();
-
-  if (ArgumentParser::get_instance().get_verbose()) {
-    os << "Building action list..." << std::endl;
-  }
-  int i = 0;
-  int number_of_actions = static_cast<int>(domain_reader->m_actions.size());
-  int bit_size = FormulaHelper::length_to_power_two(number_of_actions);
-
-  /////\todo This will be replaced by epddl parser. Reader needs to be changed
-  /// and make sure to have getter and setter
-  for (const auto &action_name : domain_reader->m_actions) {
-    ActionId action_bitset(bit_size, i);
-    Action tmp_action(action_name, action_bitset);
-    domain_action_name_map.insert({action_name, action_bitset});
-    m_actions.insert(tmp_action);
-    ++i;
-
-    if (ArgumentParser::get_instance().get_verbose()) {
-      os << "Action " << tmp_action.get_name() << " is " << tmp_action.get_id()
-         << std::endl;
-    }
-  }
-
-  grounder.set_action_name_map(domain_action_name_map);
+  if (verbose) os << "Building action list..." << std::endl;
+  ActionNamesMap action_name_map;
+  translator.build_actions(m_actions, action_name_map);
+  grounder.set_action_name_map(action_name_map);
 
   HelperPrint::get_instance().set_grounder(grounder);
-  build_propositions();
 
-  if (ArgumentParser::get_instance().get_verbose()) {
+  if (verbose) os << "Populating action effects/observability..." << std::endl;
+  translator.populate_actions(m_actions, grounder);
+
+  if (verbose) {
     os << "\nPrinting complete action list..." << std::endl;
     for (const auto &action : m_actions) {
       action.print();
     }
   }
-}
 
-void Domain::build_propositions() {
-  auto &os = ArgumentParser::get_instance().get_output_stream();
-  if (ArgumentParser::get_instance().get_verbose()) {
-    os << "Adding propositions to actions..." << std::endl;
-  }
+  if (verbose) os << "Adding to pointed world and initial conditions..."
+                  << std::endl;
+  translator.build_initial(m_initial_description, grounder);
 
-  ////\todo This will be replaced by epddl parser. Reader needs to be changed
-  /// and make sure to have getter and setter
-  for (auto &prop : domain_reader->m_propositions) {
-    auto action_to_modify =
-        HelperPrint::get_instance().get_grounder().ground_action(
-            prop.get_action_name());
-    for (auto it = m_actions.begin(); it != m_actions.end(); ++it) {
-      ActionId actionTemp = action_to_modify;
-      actionTemp.set(actionTemp.size() - 1, false);
-      if (m_actions.size() > actionTemp.to_ulong() &&
-          it->get_id() == action_to_modify) {
-        Action tmp = *it;
-        tmp.add_proposition(prop);
-        m_actions.erase(it);
-        m_actions.insert(tmp);
-        break;
-      }
-    }
-  }
-}
+  if (verbose) os << "Adding to Goal..." << std::endl;
+  translator.build_goal(m_goal_description, grounder);
 
-void Domain::build_initially() {
-  auto &os = ArgumentParser::get_instance().get_output_stream();
-  if (ArgumentParser::get_instance().get_verbose()) {
-    os << "Adding to pointed world and initial conditions..." << std::endl;
-  }
-
-  ///\todo This will be replaced by epddl parser. Reader needs to be changed
-  /// and make sure to have getter and setter
-  for (auto &formula_parsed : domain_reader->m_bf_initially) {
-    const auto formula = BeliefFormula(formula_parsed);
-
-    switch (formula.get_formula_type()) {
-    case BeliefFormulaType::FLUENT_FORMULA: {
-      m_initial_description.add_pointed_condition(formula.get_fluent_formula());
-      if (ArgumentParser::get_instance().get_verbose()) {
-        os << "    Pointed world: ";
-        HelperPrint::get_instance().print_list(formula.get_fluent_formula());
-        os << std::endl;
-      }
-      break;
-    }
-    case BeliefFormulaType::C_FORMULA:
-    case BeliefFormulaType::PROPOSITIONAL_FORMULA:
-    case BeliefFormulaType::BELIEF_FORMULA:
-    case BeliefFormulaType::E_FORMULA: {
-      m_initial_description.add_initial_condition(formula);
-      if (ArgumentParser::get_instance().get_verbose()) {
-        os << "Added to initial conditions: ";
-        formula.print();
-        os << std::endl;
-      }
-      break;
-    }
-    case BeliefFormulaType::BF_EMPTY:
-      break;
-    default:
-      ExitHandler::exit_with_message(ExitHandler::ExitCode::DomainBuildError,
-                                     "Error in the 'initially' conditions.");
-    }
-  }
-
-  m_initial_description.set_ff_forS5();
-}
-
-void Domain::build_goal() {
-  auto &os = ArgumentParser::get_instance().get_output_stream();
-  if (ArgumentParser::get_instance().get_verbose()) {
-    os << "Adding to Goal..." << std::endl;
-  }
-
-  ////\todo This will be replaced by epddl parser. Reader needs to be changed
-  /// and make sure to have getter and setter
-  for (auto &formula_parsed : domain_reader->m_bf_goal) {
-    const auto formula = BeliefFormula(formula_parsed);
-    m_goal_description.push_back(formula);
-    if (ArgumentParser::get_instance().get_verbose()) {
-      os << "    ";
-      formula.print();
-      os << std::endl;
-    }
+  if (verbose) {
+    os << "========== DOMAIN OUTPUT END ==========\n\n";
   }
 }

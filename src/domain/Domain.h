@@ -3,7 +3,10 @@
 #include "InitialStateInformation.h"
 #include "actions/Action.h"
 #include "utilities/Define.h"
+#include <memory>
 #include <string>
+
+class PlankPipeline;
 
 /**
  * \class Domain
@@ -84,37 +87,25 @@ private:
       m_initial_description;       ///< The description of the initial State.
   FormulaeList m_goal_description; ///< The formula that describes the goal.
 
-  /**
-   * \brief Stores agent information from the input file.
-   * \param grounder The Grounder object being filled with agent information,
-   * which will later be assigned to the helper print.
-   */
-  void build_agents(Grounder &grounder);
+  /** \brief Held alive for the whole run: owns the grounded plank task,
+   * grounder_info, and AST. Action objects carry non-owning pointers into
+   * this pipeline's `task().actions` map (used by the non-mA* transition
+   * function). Heap-allocated so its plank-heavy headers don't leak into
+   * Domain's header. */
+  std::unique_ptr<PlankPipeline> m_pipeline;
 
-  /** \brief Function that stores the fluent information from the file.
-   * \param grounder The Grounder object being filled with agent information,
-   * which will later be assigned to the helper print.
-   */
-  void build_fluents(Grounder &grounder);
+public:
+  /** \brief Access to the grounded plank pipeline (kept alive on Domain).
+   * Will be null before \ref build() has populated it. */
+  [[nodiscard]] const PlankPipeline *get_pipeline() const noexcept {
+    return m_pipeline.get();
+  }
 
-  /** \brief Function that stores the action information (with effects,
-   * conditions, etc.) from the file. \param grounder The Grounder object being
-   * filled with agent information, which will later be assigned to the helper
-   * print.
-   */
-  void build_actions(Grounder &grounder);
-
-  /** \brief Function that adds each proposition to the correct action.
-   */
-  void build_propositions();
-
-  /** \brief Function that builds the initial state static description.
-   */
-  void build_initially();
-
-  /** \brief Function that builds the goal description.     */
-  void build_goal();
-
+private:
   /** Private constructor since it is a Singleton class. */
   Domain();
+  /** Defaulted destructor declared (not defined) here so the unique_ptr to the
+   * forward-declared PlankPipeline can be destroyed in a TU that sees the
+   * complete type. */
+  ~Domain();
 };

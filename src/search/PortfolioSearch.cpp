@@ -106,6 +106,7 @@ bool PortfolioSearch::run_portfolio_search() const {
     bool result = false;
     ActionIdsList actions_id;
 
+    try {
     switch (search_type) {
     case SearchType::BFS: {
       SpaceSearcher<KripkeState, BreadthFirst<KripkeState>> searcherBFS{
@@ -187,6 +188,19 @@ bool PortfolioSearch::run_portfolio_search() const {
       ExitHandler::exit_with_message(
           ExitHandler::ExitCode::PortfolioConfigError, "Unknown search type");
       break;
+    }
+    } catch (const std::exception &e) {
+      // Per-thread exception barrier: an uncaught std::exception in any thread
+      // calls std::terminate and brings down the whole process. Catch here so
+      // a crashing configuration just loses that slot and the remaining ones
+      // (and the main thread) can finish cleanly. The thread's result stays
+      // false / empty, so it cannot win the race for `found_goal`.
+      static std::mutex cerr_mutex;
+      std::lock_guard<std::mutex> lock(cerr_mutex);
+      std::cerr << "[Thread " << idx << " | "
+                << ArgumentParser::get_instance().get_problem_path()
+                << "] Exception in search: " << e.what() << std::endl;
+      result = false;
     }
     {
       std::lock_guard<std::mutex> lock(result_mutex);

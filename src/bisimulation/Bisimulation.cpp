@@ -5,6 +5,8 @@
 #include "Domain.h"
 #include "KripkeState.h"
 
+#include <algorithm>
+
 /***IO_FC2.cpp****/
 void Bisimulation::FillStructures(const BisAutomata &A) {
   X[0].prevXBlock = BIS_NIL;
@@ -230,11 +232,7 @@ void Bisimulation::print(const BisAutomata *A) {
   }
 }
 
-Bisimulation::Bisimulation() {
-  VectorBisWrapper<BisGraph> G{BisPreAllocatedIndex};
-  VectorBisWrapper<Bis_qPartition> Q{BisPreAllocatedIndex};
-  VectorBisWrapper<Bis_xPartition> X{BisPreAllocatedIndex};
-}
+Bisimulation::Bisimulation() = default;
 
 /**
  * @brief Builds the minimized automaton with labeled edges.
@@ -1768,35 +1766,49 @@ BisAutomata Bisimulation::kstate_to_automaton(
   BisLabelsMap label_map;
 
   const auto &worlds = kstate.get_worlds();
+  const auto &designated = kstate.get_designated_worlds();
   const auto &agents = Domain::get_instance().get_agents();
   int Nvertex = static_cast<int>(worlds.size());
   const int ag_set_size = static_cast<int>(agents.size());
 
   VectorBisWrapper<Bis_vElem> Vertex(Nvertex);
 
+  // Indexing policy: m_pointed at 0, the rest of the designated worlds at
+  // 1..|D|-1, non-designated worlds afterwards. MarkDeletedNodes keeps the
+  // lowest-indexed vertex per block as its representative, so this layout
+  // ensures that whenever a designated world is bisimilar to a non-designated
+  // one (or to another designated), the designated survives. Bisimilar
+  // designated worlds collapsing into a single representative is harmless
+  // under multi-pointed all_of(D) entailment — they always agree on every
+  // formula. Single-pointed states (the mA* default) reduce to the original
+  // layout: |D|=1, only m_pointed sits at index 0.
   const auto &pointed = kstate.get_pointed();
-  index_map[pointed] = 0;
-  pworld_vec.push_back(pointed);
-  compact_indices[static_cast<int>(pointed.get_internal_world_id())] = 0;
-
-  Vertex[0].ne = 0;
-
-  int idx = 1, compact_id = 1;
-
-  for (const auto &world : worlds) {
-    if (world != pointed) {
-      index_map[world] = idx;
-      pworld_vec.push_back(world);
-
-      if (compact_indices.insert({world.get_internal_world_id(), compact_id})
-              .second) {
-        compact_id++;
-      }
-
-      Vertex[idx].ne = 0;
-      ++idx;
+  int idx = 0;
+  int compact_id = 0;
+  auto add_world = [&](const KripkeWorldPointer &w) {
+    index_map[w] = idx;
+    pworld_vec.push_back(w);
+    if (compact_indices.insert({w.get_internal_world_id(), compact_id})
+            .second) {
+      compact_id++;
     }
+    Vertex[idx].ne = 0;
+    ++idx;
+  };
 
+  add_world(pointed);
+  for (const auto &w : designated) {
+    if (w == pointed) continue;
+    add_world(w);
+  }
+  for (const auto &w : worlds) {
+    if (designated.contains(w)) continue;
+    add_world(w);
+  }
+
+  // Self-loop label per world: atomic-proposition signature (compact_id
+  // offset by ag_set_size to keep agent labels disjoint).
+  for (const auto &world : worlds) {
     label_map[world][world].insert(
         compact_indices[static_cast<int>(world.get_internal_world_id())] +
         ag_set_size);
@@ -1804,11 +1816,15 @@ BisAutomata Bisimulation::kstate_to_automaton(
 
   int bhtabSize = ag_set_size + compact_id;
 
+  // .at() throws std::out_of_range if `source` (a belief edge endpoint) is
+  // missing from index_map — i.e., not in kstate.get_worlds(). The
+  // calc_min_bisimilar try/catch turns that into "skip bisim, keep state"
+  // rather than silent default-insertion that would corrupt Vertex[0].ne.
   for (const auto &[source, belief_map] : kstate.get_beliefs()) {
     for (const auto &[agent, targets] : belief_map) {
       for (const auto &target : targets) {
         label_map[source][target].insert(agent_to_label.at(agent));
-        Vertex[index_map[source]].ne++;
+        Vertex[index_map.at(source)].ne++;
       }
     }
   }
@@ -1819,11 +1835,11 @@ BisAutomata Bisimulation::kstate_to_automaton(
   }
 
   for (const auto &[from_world, edges] : label_map) {
-    int from = index_map[from_world];
+    int from = index_map.at(from_world);
     int j = 0;
 
     for (const auto &[to_world, labels] : edges) {
-      const int to = index_map[to_world];
+      const int to = index_map.at(to_world);
 
       for (const auto &label : labels) {
         Vertex[from].e[j].nbh = 1;
@@ -1847,13 +1863,27 @@ void Bisimulation::automaton_to_kstate(
     const BisAutomata &a, const VectorBisWrapper<KripkeWorldPointer> &world_vec,
     const std::map<BisLabel, Agent> &label_to_agent, KripkeState &kstate) {
   KripkeWorldPointersSet worlds;
+  // Snapshot before mutating: needed to recompute D' for the contracted state.
+  const KripkeWorldPointersSet original_designated =
+      kstate.get_designated_worlds();
+  const KripkeWorldPointer original_pointed = kstate.get_pointed();
+
   kstate.clear_beliefs();
 
   auto agents_size = Domain::get_instance().get_agents().size();
 
+  KripkeWorldPointersSet new_designated;
   for (int i = 0; i < a.Nvertex; i++) {
     if (a.Vertex[i].ne > 0) {
       worlds.insert(world_vec[i]);
+      // The kstate_to_automaton layout puts designated worlds first, so a
+      // designated world only ever loses to another designated world in
+      // block-representative selection — never to a non-designated one. The
+      // surviving vertex is therefore designated iff its world_vec entry was
+      // designated in the input.
+      if (original_designated.contains(world_vec[i])) {
+        new_designated.insert(world_vec[i]);
+      }
       for (int j = 0; j < a.Vertex[i].ne; j++) {
         for (int k = 0; k < a.Vertex[i].e[j].nbh; k++) {
           if (const int label = a.Vertex[i].e[j].bh[k];
@@ -1867,6 +1897,19 @@ void Bisimulation::automaton_to_kstate(
   }
 
   kstate.set_worlds(worlds);
+
+  if (new_designated.empty()) {
+    // Should be unreachable: m_pointed sits at index 0 and is always preserved
+    // by MarkDeletedNodes (lowest-indexed in its block becomes representative).
+    ExitHandler::exit_with_message(
+        ExitHandler::ExitCode::BisimulationFailed,
+        "Bisimulation contraction produced an empty designated set.");
+  }
+  kstate.set_designated_worlds(new_designated);
+  // Pin m_pointed to the original canonical pointed: it survives at index 0
+  // by construction, and set_designated_worlds would otherwise re-pick
+  // min(D'), which can shift the canonical when |D'| > 1.
+  kstate.m_pointed = original_pointed;
 }
 
 void Bisimulation::calc_min_bisimilar(KripkeState &kstate) {
@@ -1884,11 +1927,41 @@ void Bisimulation::calc_min_bisimilar(KripkeState &kstate) {
     agent_to_label[agent] = ag_label++;
   }
 
-  BisAutomata automaton =
-      kstate_to_automaton(pworld_vec, agent_to_label, kstate);
-
-  FillStructures(automaton);
-  Inverse();
+  // Pre-size every storage vector to the actual upper bound for this state so
+  // the PT algorithm never triggers VectorBisWrapper::operator[]'s slow
+  // non-geometric auto-grow path. Bounds derivation:
+  //   CreateG produces one node per (vertex, edge-label) pair; with `nbh = 1`
+  //   for every edge in our encoding, the total grows to
+  //     numberOfNodes_max = Nvertex + Σ_v Vertex[v].ne
+  //                       = Nvertex + (#belief_edges + Nvertex)
+  //                       = 2*Nvertex + #belief_edges
+  //   bhtabSize is at most ag_set_size + Nvertex (one label per unique
+  //   atomic-proposition signature, bounded by Nvertex).
+  // We resize to the max of the two so every storage vector covers both the
+  // node-index range (G, Q, B1, B_1, splitD, borderEdges) and the label-index
+  // range (X). resize() only grows the vector when it needs to — capacity
+  // accumulates across calls through the thread_local singleton, so steady
+  // state is one allocation per worst-case state size.
+  const int Nvertex = static_cast<int>(kstate.get_worlds().size());
+  int n_belief_edges = 0;
+  for (const auto &[src, m] : kstate.get_beliefs()) {
+    for (const auto &[ag, tgts] : m) {
+      n_belief_edges += static_cast<int>(tgts.size());
+    }
+  }
+  const int numberOfNodes_max = 2 * Nvertex + n_belief_edges;
+  const int bhtabSize_max = static_cast<int>(agents.size()) + Nvertex;
+  const auto storage_n =
+      static_cast<size_t>(std::max({numberOfNodes_max, bhtabSize_max, 1}));
+  auto &storage = BisimulationVectorStorage::get_instance();
+  if (G.size() < storage_n) G.resize(storage_n);
+  if (storage.Q.size() < storage_n) storage.Q.resize(storage_n);
+  if (storage.X.size() < storage_n) storage.X.resize(storage_n);
+  if (storage.B1.size() < storage_n) storage.B1.resize(storage_n);
+  if (storage.B_1.size() < storage_n) storage.B_1.resize(storage_n);
+  if (storage.splitD.size() < storage_n) storage.splitD.resize(storage_n);
+  if (storage.borderEdges.size() < storage_n)
+    storage.borderEdges.resize(storage_n);
 
   /*Removed check from configuration, is kinda of redundant
   if (!Configuration::get_instance().get_bisimulation())
@@ -1896,7 +1969,17 @@ void Bisimulation::calc_min_bisimilar(KripkeState &kstate) {
       return;
   }*/
 
+  // Try-catch wraps the full pipeline (conversion → PT → write-back). Any
+  // std::exception — including index_map.at() misses in kstate_to_automaton —
+  // is logged and the original kstate is preserved untouched, because
+  // automaton_to_kstate is the only step that mutates `kstate`.
   try {
+    BisAutomata automaton =
+        kstate_to_automaton(pworld_vec, agent_to_label, kstate);
+
+    FillStructures(automaton);
+    Inverse();
+
     const bool use_FB =
         Configuration::get_instance().get_bisimulation_type_bool();
     const bool success =

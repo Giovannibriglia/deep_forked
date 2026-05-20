@@ -4,9 +4,31 @@
 #include <string>
 #include <vector>
 
-#include "Proposition.h"
 #include "formulae/BeliefFormula.h"
 #include "utilities/Define.h"
+
+namespace plank::del {
+class action;
+}
+
+/**
+ * \enum PropositionType
+ * \brief Semantic category of an Action's effects/observability.
+ *
+ * Originally split between the parser's Proposition class and Action; now that
+ * the EPDDL parser populates Action directly, the enum lives with Action.
+ * EXECUTABILITY/OBSERVANCE/AWARENESS remain only as legacy NOTSET signals from
+ * the old parser path and are no longer used as Action::m_type values.
+ */
+enum class PropositionType {
+  EXECUTABILITY,
+  ONTIC,
+  SENSING,
+  ANNOUNCEMENT,
+  OBSERVANCE,
+  AWARENESS,
+  NOTSET
+};
 
 /**
  * \class Action
@@ -85,25 +107,47 @@ public:
 
   /** \brief Gets the partially observant agents and their conditions. */
   [[nodiscard]] const ObservabilitiesMap &get_partially_observants() const;
+
+  /** \brief Gets the non-owning pointer to the corresponding grounded plank
+   * action (only populated by PlankTranslator; null in legacy/test code
+   * paths). Used by the non-mA* transition function when full-DEL semantics
+   * are required. The pointee is owned by Domain's PlankPipeline. */
+  [[nodiscard]] const plank::del::action *get_del_action() const noexcept {
+    return m_del_action;
+  }
+
+  /** \brief Sets the non-owning del::action pointer. Called by
+   * PlankTranslator::populate_actions. */
+  void set_del_action(const plank::del::action *p) noexcept {
+    m_del_action = p;
+  }
+  ///@}
+
+  /// \name Population from translated input
+  ///@{
+  /** \brief Adds an executability condition (already converted). */
+  void add_executability(const BeliefFormula &to_add);
+
+  /** \brief Adds an effect with its condition (already grounded/converted). */
+  void add_effect(const FluentFormula &to_add, const BeliefFormula &condition);
+
+  /** \brief Marks an agent as fully observant under a condition. */
+  void add_fully_observant(const Agent &ag, const BeliefFormula &condition);
+
+  /** \brief Marks an agent as partially observant under a condition. */
+  void add_partially_observant(const Agent &ag, const BeliefFormula &condition);
   ///@}
 
   /// \name Main Methods
   ///@{
-  /**
-   * \brief Parses a proposition and adds its information to this action.
-   *
-   * Uses add_executability, add_effect, add_fully_observant, and
-   * add_partially_observant to add the appropriate behavior to this action.
-   * \param[in] to_add The proposition to add.
-   */
-  void add_proposition(const Proposition &to_add);
-
   /** \brief Prints this action.*/
   void print() const;
 
   /** \brief Operator < implemented to use Action in std::set. */
   bool operator<(const Action &) const;
 
+  /** \brief Human-readable string for a PropositionType. */
+  static std::string type_to_string(PropositionType type);
   ///@}
 
 private:
@@ -121,37 +165,10 @@ private:
   ObservabilitiesMap m_partially_observants; ///< Partially observant agents and
                                              ///< their conditions.
   EffectsMap m_effects;                      ///< Effects and their conditions.
-  ///@}
 
-  /// \name Private Methods
-  ///@{
-  /**
-   * \brief Adds an executability condition to this action.
-   * \param[in] to_add The belief_formula representing the executability
-   * condition to add.
-   */
-  void add_executability(const BeliefFormula &to_add);
-
-  /**
-   * \brief Adds an effect (with its conditions) to this action.
-   * \param[in] to_add The fluent_formula representing the effect to add.
-   * \param[in] condition The condition of to_add.
-   */
-  void add_effect(const FluentFormula &to_add, const BeliefFormula &condition);
-
-  /**
-   * \brief Adds a fully observant agent (with its conditions) to this action.
-   * \param[in] ag The agent that is fully observant if condition holds.
-   * \param[in] condition The condition for ag to be fully observant.
-   */
-  void add_fully_observant(const Agent &ag, const BeliefFormula &condition);
-
-  /**
-   * \brief Adds a partially observant agent (with its conditions) to this
-   * action. \param[in] ag The agent that is partially observant if condition
-   * holds. \param[in] condition The condition for ag to be partially observant.
-   */
-  void add_partially_observant(const Agent &ag, const BeliefFormula &condition);
+  /** Non-owning. Populated by PlankTranslator::populate_actions; alive for as
+   * long as Domain (which owns the PlankPipeline). */
+  const plank::del::action *m_del_action = nullptr;
   ///@}
 };
 

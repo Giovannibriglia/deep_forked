@@ -47,7 +47,7 @@ void ArgumentParser::parse(int argc, char **argv) {
     // After parsing, if log is enabled, generate the log file path using
     // HelperPrint
     if (m_log_enabled) {
-      m_log_file_path = HelperPrint::generate_log_file_path(m_input_file);
+      m_log_file_path = HelperPrint::generate_log_file_path(m_problem_path);
       m_log_ofstream.open(m_log_file_path);
       if (!m_log_ofstream.is_open()) {
         ExitHandler::exit_with_message(ExitHandler::ExitCode::ArgParseError,
@@ -170,10 +170,19 @@ void ArgumentParser::parse(int argc, char **argv) {
 }
 
 ArgumentParser::ArgumentParser() : app("deep") {
-  app.add_option("input_file", m_input_file,
-                 "Specify the input problem file (e.g., problem.txt). This "
-                 "file defines the planning problem.")
-      ->required();
+  app.add_option("--problem", m_problem_path,
+                 "Path to the EPDDL problem file (required).")
+      ->required()
+      ->check(CLI::ExistingFile);
+  app.add_option("--domain", m_domain_path,
+                 "Path to the EPDDL domain file (required).")
+      ->required()
+      ->check(CLI::ExistingFile);
+  app.add_option("--libraries", m_libraries_paths,
+                 "Paths to EPDDL action-type library files (optional, may be "
+                 "given multiple times). Most domains need basic.epddl.")
+      ->check(CLI::ExistingFile)
+      ->expected(0, -1);
 
   // Debug/logging group
   auto *debug_group = app.add_option_group("Debug/Logging");
@@ -428,8 +437,17 @@ ArgumentParser::~ArgumentParser() {
 }
 
 // Getters
-const std::string &ArgumentParser::get_input_file() const noexcept {
-  return m_input_file;
+const std::string &ArgumentParser::get_problem_path() const noexcept {
+  return m_problem_path;
+}
+
+const std::string &ArgumentParser::get_domain_path() const noexcept {
+  return m_domain_path;
+}
+
+const std::vector<std::string> &
+ArgumentParser::get_libraries_paths() const noexcept {
+  return m_libraries_paths;
 }
 
 bool ArgumentParser::get_verbose() const noexcept { return m_verbose; }

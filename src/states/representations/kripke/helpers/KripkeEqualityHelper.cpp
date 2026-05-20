@@ -184,8 +184,12 @@ bool KripkeEqualityHelper::internal_smaller(
 
 bool KripkeEqualityHelper::shallow_less_operator(
     const KripkeState &reference, const KripkeState &to_compare) {
-  if (reference.get_pointed() != to_compare.get_pointed())
-    return reference.get_pointed() < to_compare.get_pointed();
+  // Compare the full designated set, not just the canonical pointed: two
+  // multi-pointed states with the same canonical pointed but different
+  // designated sets are distinct states.
+  if (reference.get_designated_worlds() != to_compare.get_designated_worlds())
+    return reference.get_designated_worlds() <
+           to_compare.get_designated_worlds();
 
   if (reference.get_worlds() != to_compare.get_worlds())
     return reference.get_worlds() < to_compare.get_worlds();
@@ -230,6 +234,12 @@ bool KripkeEqualityHelper::strong_less_operator(const KripkeState &reference,
   if (!reference.get_pointed().internal_equal(to_compare.get_pointed())) {
     return reference.get_pointed().internal_smaller(to_compare.get_pointed());
   }
+  // Distinguish multi-pointed states whose canonical pointed coincides by
+  // comparing the full designated set (set<KripkeWorldPointer> has a
+  // lexicographic operator<).
+  if (reference.get_designated_worlds() != to_compare.get_designated_worlds())
+    return reference.get_designated_worlds() <
+           to_compare.get_designated_worlds();
 
   const auto ref_world = reference.get_worlds_vec();
   const auto to_compare_world = to_compare.get_worlds_vec();

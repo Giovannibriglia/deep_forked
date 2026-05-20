@@ -172,6 +172,16 @@ void State<StateRepr>::contract_with_bisimulation() {
 
 template <StateRepresentation StateRepr>
 bool State<StateRepr>::is_executable(const Action &act) const {
+#ifndef USE_MASTAR
+  // Under DEL, PlankTranslator does not populate `m_executability` — the
+  // deep-side action-type/observability machinery is bypassed and the plank
+  // action carries the full per-event preconditions. Route applicability
+  // through the representation, which evaluates the designated-event
+  // preconditions directly on its worlds.
+  if (act.get_del_action() != nullptr) {
+    return m_representation.is_executable_del(act);
+  }
+#endif
   return entails(act.get_executability());
 }
 

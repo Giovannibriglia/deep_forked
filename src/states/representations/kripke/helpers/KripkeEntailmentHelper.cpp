@@ -93,7 +93,11 @@ bool KripkeEntailmentHelper::entails(const BeliefFormula &to_check,
 
 bool KripkeEntailmentHelper::entails(const BeliefFormula &to_check,
                                      const KripkeState &kstate) {
-  return entails(to_check, kstate.get_pointed(), kstate);
+  // Multi-pointed DEL semantics: the state entails `to_check` iff every
+  // designated world entails it. For single-pointed states (the mA* engine
+  // default) the designated set is {m_pointed}, so this collapses to the
+  // legacy "entails at pointed" check with no behavioural change.
+  return entails(to_check, kstate.get_designated_worlds(), kstate);
 }
 
 /**

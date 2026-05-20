@@ -97,8 +97,6 @@ private:
 
   BisIndexType b1List = 0, b_1List = 0, dList = 0;
 
-  std::map<int, int> m_compact_indices;
-
   VectorBisWrapper<BisGraph> G{BisPreAllocatedIndex};
   // VectorBisWrapper<Bis_qPartition> Q{BisPreAllocatedIndex};
   // VectorBisWrapper<Bis_xPartition> X{BisPreAllocatedIndex};

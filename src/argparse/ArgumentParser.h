@@ -113,10 +113,23 @@ public:
   [[nodiscard]] const std::string &get_plan_file() const noexcept;
 
   /**
-   * \brief Retrieves the input file path.
-   * \return The input file path.
+   * \brief Retrieves the EPDDL problem file path.
+   * \return The problem file path.
    */
-  [[nodiscard]] const std::string &get_input_file() const noexcept;
+  [[nodiscard]] const std::string &get_problem_path() const noexcept;
+
+  /**
+   * \brief Retrieves the EPDDL domain file path.
+   * \return The domain file path.
+   */
+  [[nodiscard]] const std::string &get_domain_path() const noexcept;
+
+  /**
+   * \brief Retrieves the list of EPDDL action-type library file paths.
+   * \return The library file paths (may be empty).
+   */
+  [[nodiscard]] const std::vector<std::string> &
+  get_libraries_paths() const noexcept;
 
   /**
    * \brief Retrieves the sequence of actions to execute.
@@ -262,7 +275,10 @@ private:
   static ArgumentParser *instance; ///< Singleton instance of the class.
 
   // Option storage
-  std::string m_input_file;    ///< Input domain file path.
+  std::string m_problem_path;  ///< EPDDL problem file path.
+  std::string m_domain_path;   ///< EPDDL domain file path.
+  std::vector<std::string>
+      m_libraries_paths;       ///< EPDDL action-type library paths (optional).
   bool m_verbose = false;      ///< Verbose mode flag.
   bool m_bisimulation = false; ///< Bisimulation type (NONE by default).
   std::string m_bisimulation_type =
