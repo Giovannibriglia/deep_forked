@@ -422,6 +422,12 @@ private:
    *  the same `!USE_MASTAR` guard.
    */
   [[nodiscard]] KripkeState compute_successor_del(const Action &act) const;
+
+  /** \brief Populate worlds/edges/designated directly from plank's already-
+   *  grounded del::state. Used when the (:init …) was given as an explicit
+   *  Kripke structure (`:worlds … :relations … :labels … :designated …`),
+   *  bypassing deep's S5-permutation enumeration. */
+  void build_initial_from_plank_state();
 #endif
 
   /*This is to allow bisimulation to reduce the size of the object*/

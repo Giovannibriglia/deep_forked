@@ -37,6 +37,16 @@ BeliefFormula true_belief_formula() {
   return bf;
 }
 
+// Cap on the DNF clause count below which we keep collapsing. AND-distribution
+// multiplies clause counts, so deeply nested AND-of-OR-of-implications can blow
+// up exponentially (Selective-Communication's initial state, with O(rooms²·agents)
+// pairwise implications under one C(All, …), reaches millions of clauses before
+// the planner ever sees a state). Above the cap we bail out and let
+// convert_formula emit the propositional tree as-is; downstream entailment and
+// the S5 restriction check handle PROPOSITIONAL_FORMULA(BF_AND/BF_OR/BF_NOT,…)
+// natively, so this is purely a safety brake — not a semantic change.
+constexpr size_t kDnfCollapseClauseCap = 256;
+
 // Try to fold a BeliefFormula tree of FLUENT_FORMULA leaves and BF_AND/BF_OR
 // propositional nodes into a single FluentFormula (DNF). Returns the collapsed
 // FluentFormula when every leaf is FLUENT_FORMULA or BF_EMPTY and every
@@ -84,6 +94,7 @@ try_collapse_to_ff(const BeliefFormula &bf) {
             FluentsSet merged = a;
             merged.insert(FormulaHelper::negate_fluent(lit));
             next.insert(std::move(merged));
+            if (next.size() > kDnfCollapseClauseCap) return std::nullopt;
           }
         }
         acc = std::move(next);
@@ -99,19 +110,26 @@ try_collapse_to_ff(const BeliefFormula &bf) {
       // Empty FF on either side denotes `true`, which absorbs the OR.
       if (f1->empty() || f2->empty()) return FluentFormula{};
       FluentFormula out = *f1;
-      for (const auto &c : *f2) out.insert(c);
+      for (const auto &c : *f2) {
+        out.insert(c);
+        if (out.size() > kDnfCollapseClauseCap) return std::nullopt;
+      }
       return out;
     }
     // BF_AND: distribute. (C1) ∧ (C2) = { c1 ∪ c2 | c1 ∈ f1, c2 ∈ f2 }.
     // Empty FF on either side denotes `true` and is the identity for AND.
     if (f1->empty()) return f2;
     if (f2->empty()) return f1;
+    // Cheap upper-bound test before doing the cross-product: |f1| × |f2|.
+    if (f1->size() > kDnfCollapseClauseCap / std::max<size_t>(1, f2->size()))
+      return std::nullopt;
     FluentFormula out;
     for (const auto &c1 : *f1) {
       for (const auto &c2 : *f2) {
         FluentsSet merged = c1;
         merged.insert(c2.begin(), c2.end());
         out.insert(std::move(merged));
+        if (out.size() > kDnfCollapseClauseCap) return std::nullopt;
       }
     }
     return out;
@@ -663,10 +681,11 @@ void PlankTranslator::build_initial(InitialStateInformation &initial,
       if (!init) break;
       if (!std::holds_alternative<pl::epddl::ast::finitary_S5_theory>(
               init->get_state())) {
-        ExitHandler::exit_with_message(
-            ExitHandler::ExitCode::ParsingError,
-            "Initial state must be expressed as a (:init ...) finitary-S5 "
-            "theory; explicit Kripke initial states are not yet supported.");
+        // Explicit (:init :worlds … :relations … :labels … :designated …) is
+        // consumed downstream by KripkeState::build_initial, which reads
+        // plank's pre-grounded del::state directly. Nothing for the
+        // S5-enumeration path to populate here.
+        break;
       }
       const auto &theory = std::get<pl::epddl::ast::finitary_S5_theory>(
           init->get_state());

@@ -102,18 +102,60 @@ void InitialStateInformation::add_pointed_condition(
 
 void InitialStateInformation::add_initial_condition(
     const BeliefFormula &to_add) {
-  // Keep only bf_1, bf_2 and not (bf_1 AND bf_2)
+  // Top-level AND distributes into separate initial conditions.
   if (to_add.get_formula_type() == BeliefFormulaType::PROPOSITIONAL_FORMULA &&
       to_add.get_operator() == BeliefFormulaOperator::BF_AND) {
     add_initial_condition(to_add.get_bf1());
     add_initial_condition(to_add.get_bf2());
-  } else if (check_restriction(to_add)) {
-    m_bf_initial_conditions.push_back(to_add);
-  } else {
-    ExitHandler::exit_with_message(
-        ExitHandler::ExitCode::DomainInitialStateRestrictionError,
-        "ERROR: The initial state does not respect the required conditions.");
+    return;
   }
+
+  // Common-knowledge distributes over conjunction:
+  //   C(g, A ∧ B)  ≡  C(g, A) ∧ C(g, B)
+  // PlankTranslator's try_collapse_to_ff bails out of DNF distribution above a
+  // size cap, leaving large initial constraints like SC's positional-imply
+  // bundle as C(g, BF_AND(FF, BF_AND(FF, …))). Splitting them here lets each
+  // leaf go through check_restriction as its own C(g, FF), which is in the
+  // canonical accepted shape. (We don't distribute OR, since
+  // C(g, A ∨ B) ≢ C(g, A) ∨ C(g, B) under common knowledge.)
+  if (to_add.get_formula_type() == BeliefFormulaType::C_FORMULA) {
+    const BeliefFormula &body = to_add.get_bf1();
+    if (body.get_formula_type() == BeliefFormulaType::PROPOSITIONAL_FORMULA &&
+        body.get_operator() == BeliefFormulaOperator::BF_AND) {
+      BeliefFormula left, right;
+      left.set_formula_type(BeliefFormulaType::C_FORMULA);
+      left.set_group_agents(to_add.get_group_agents());
+      left.set_bf1(body.get_bf1());
+      right.set_formula_type(BeliefFormulaType::C_FORMULA);
+      right.set_group_agents(to_add.get_group_agents());
+      right.set_bf1(body.get_bf2());
+      add_initial_condition(left);
+      add_initial_condition(right);
+      return;
+    }
+  }
+
+  if (check_restriction(to_add)) {
+    m_bf_initial_conditions.push_back(to_add);
+    return;
+  }
+
+#ifndef USE_MASTAR
+  // Under DEL, the Kripke structure comes from plank's grounded del::state
+  // (see KripkeState::build_initial_from_plank_state). The S5 restriction
+  // check exists only to constrain what deep's naive enumeration path could
+  // handle. Partial-ignorance shapes like C(g, ¬B(ag, φ)) are realised in
+  // the grounded structure already, so we just store the formula (for the
+  // debug bisimulation-equivalence check in FormulaHelper) and skip the
+  // hard-exit. Note: we cannot consult Domain::get_instance() here because
+  // we are inside Domain's own initialisation, which would recurse.
+  m_bf_initial_conditions.push_back(to_add);
+  return;
+#else
+  ExitHandler::exit_with_message(
+      ExitHandler::ExitCode::DomainInitialStateRestrictionError,
+      "ERROR: The initial state does not respect the required conditions.");
+#endif
 }
 
 [[nodiscard]] const FluentFormula &

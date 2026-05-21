@@ -38,6 +38,9 @@
 #include "del/language/formulas.h"
 #include "del/language/language.h"
 #include "del/semantics/actions/action.h"
+#include "del/semantics/states/state.h"
+#include "epddl/ast/problems/init/initial_state_decl_ast.h"
+#include "epddl/ast/problems/init/explicit_initial_state_ast.h"
 #include "parse/PlankPipeline.h"
 #include <deque>
 #include <map>
@@ -231,6 +234,21 @@ void KripkeState::add_world_beliefs(const KripkeWorldPointer &world,
 }
 
 void KripkeState::build_initial() {
+#ifndef USE_MASTAR
+  // Under DEL, plank already grounded the (:init …) into task().initial_state
+  // regardless of whether it was a finitary-S5 theory or an explicit Kripke
+  // structure. Reuse that grounded state instead of redoing the enumeration
+  // on deep's side — deep's generate_initial_worlds is O(2^|unknown_fluents|)
+  // and blows up on any non-trivial domain (Selective-Communication has 46
+  // fluents → 2^37 permutations).
+  if (const auto *pipeline = Domain::get_instance().get_pipeline()) {
+    if (pipeline->task().initial_state != nullptr) {
+      build_initial_from_plank_state();
+      return;
+    }
+  }
+#endif
+
   FluentsSet permutation;
   const InitialStateInformation ini_conditions =
       Domain::get_instance().get_initial_description();
@@ -678,6 +696,18 @@ KripkeState KripkeState::compute_successor_del(const Action &act) const {
   KripkeState ret;
   ret.set_max_depth(S.get_max_depth() + 1);
 
+  // Repetition tags act as the world identity discriminator: a
+  // KripkeWorldPointer hashes (underlying fluent-id, repetition) into its
+  // own id, so two pointers with the same fluent valuation are equal iff
+  // they share a repetition. The DEL product (w, e) needs each (input world,
+  // event) pair to be distinct even when events have trivial postconditions
+  // (e.g. private-announcement's nil event leaves fluents untouched, so
+  // (w, e_tell) and (w, nil) end up with identical fluent sets). We encode
+  // the event index into the repetition so that any two (w, e) and (w, e')
+  // get different pointer identities — otherwise both collapse to the same
+  // m_worlds entry and the new accessibility relation cannot distinguish
+  // the "fully observant" stratum from the "oblivious" stratum, which
+  // silently drops every knowledge transfer.
   for (const auto &w : S.get_worlds()) {
     for (pd::event_id e = 0; e < n_events; ++e) {
       if (!eval(pa.get_precondition(e), w, S, caches)) continue;
@@ -691,8 +721,10 @@ KripkeState KripkeState::compute_successor_del(const Action &act) const {
         new_fluents.erase(p_neg);
         new_fluents.insert(new_val ? p_pos : p_neg);
       }
+      const auto event_rep =
+          static_cast<unsigned short>(w.get_repetition() * n_events + e);
       KripkeWorldPointer new_p =
-          ret.add_rep_world(KripkeWorld(new_fluents), w.get_repetition());
+          ret.add_rep_world(KripkeWorld(new_fluents), event_rep);
       new_map.emplace(WEKey{w.get_id(), e}, new_p);
     }
   }
@@ -792,6 +824,77 @@ bool KripkeState::is_executable_del(const Action &act) const {
     }
   }
   return false;
+}
+
+void KripkeState::build_initial_from_plank_state() {
+  const auto *pipeline = Domain::get_instance().get_pipeline();
+  if (pipeline == nullptr || pipeline->task().initial_state == nullptr) {
+    ExitHandler::exit_with_message(
+        ExitHandler::ExitCode::DomainInitialStateTypeError,
+        "build_initial_from_plank_state called without a grounded plank "
+        "initial state on the pipeline.");
+  }
+  const pd::state &s = *pipeline->task().initial_state;
+  const pd::language &lang = pipeline->language();
+  const Grounder &g = HelperPrint::get_instance().get_grounder();
+
+  // Build atom-id → positive Fluent and agent-id → deep Agent caches. These
+  // are the same caches build_caches() uses for the transition function; we
+  // inline the relevant subset here to avoid pulling in the DelCaches struct.
+  const auto an = lang.get_atoms_number();
+  std::vector<Fluent> pos_fluent;
+  std::vector<Fluent> neg_fluent;
+  pos_fluent.reserve(an);
+  neg_fluent.reserve(an);
+  for (pd::atom a = 0; a < an; ++a) {
+    const auto &name = lang.get_atom_name(a);
+    pos_fluent.push_back(g.ground_fluent(name));
+    neg_fluent.push_back(g.ground_fluent(NEGATION_SYMBOL + name));
+  }
+  const auto agn = lang.get_agents_number();
+  std::vector<Agent> agent;
+  agent.reserve(agn);
+  for (pd::agent ag = 0; ag < agn; ++ag) {
+    agent.push_back(g.ground_agent(lang.get_agent_name(ag)));
+  }
+
+  // Materialise one deep world per plank world, keyed by world_id so we can
+  // translate the accessibility relation in the second pass.
+  const auto worlds_n = s.get_worlds_number();
+  std::vector<KripkeWorldPointer> world_index;
+  world_index.reserve(static_cast<size_t>(worlds_n));
+  for (pd::world_id w = 0; w < worlds_n; ++w) {
+    FluentsSet fs;
+    const pd::label &lab = s.get_label(w);
+    for (pd::atom a = 0; a < an; ++a) {
+      fs.insert(lab[a] ? pos_fluent[a] : neg_fluent[a]);
+    }
+    // Initial worlds are at repetition 0 by convention (same as the S5 path).
+    KripkeWorldPointer wp = add_rep_world(KripkeWorld(fs), 0);
+    world_index.push_back(wp);
+  }
+
+  // Translate the accessibility relation: for every (agent, source) pair, the
+  // plank state exposes the bit-deque of reachable target world_ids.
+  for (pd::agent ai = 0; ai < agn; ++ai) {
+    for (pd::world_id w = 0; w < worlds_n; ++w) {
+      const auto &reachable = s.get_agent_possible_worlds(ai, w);
+      for (const auto target_w : reachable) {
+        add_edge(world_index[static_cast<size_t>(w)],
+                 world_index[static_cast<size_t>(target_w)], agent[ai]);
+      }
+    }
+  }
+
+  // Designated set comes verbatim from plank. set_designated_worlds picks the
+  // canonical pointed (min by KripkeWorldPointer::operator<) and enforces the
+  // non-empty invariant.
+  KripkeWorldPointersSet designated;
+  const auto &plank_designated = s.get_designated_worlds();
+  for (const auto target_w : plank_designated) {
+    designated.insert(world_index[static_cast<size_t>(target_w)]);
+  }
+  set_designated_worlds(designated);
 }
 #endif // !USE_MASTAR
 
